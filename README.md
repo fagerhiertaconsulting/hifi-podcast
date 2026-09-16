@@ -46,7 +46,7 @@ Tauri lägger appdata under `%LOCALAPPDATA%\consulting.fagerhierta.hifi-podcast\
 | `db.sqlite` | Prenumerationer, avsnitt, kö, transkript, jobb |
 | `media/<podcast_id>/<episode_id>.<ext>` | **Original** enclosure-filer |
 | `models/ggml-small.bin` | Whisper-modell (nedladdas av användaren) |
-| `bin/whisper-cli.exe` | whisper.cpp sidecar |
+| `bin/whisper-cli.exe` | whisper.cpp sidecar (Windows: Inställningar → Ladda ner whisper-cli) |
 
 Samma `media/`-root är avsiktligt delbar med en framtida UPnP/DLNA-server (Onkyo TX-RZ50). Se [docs/upnp-mediaserver.md](docs/upnp-mediaserver.md).
 

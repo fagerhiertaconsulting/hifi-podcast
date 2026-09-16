@@ -78,6 +78,8 @@ pub fn run() {
             commands::read_media_file,
             commands::asr_status,
             commands::download_asr_model,
+            commands::download_asr_cli,
+            commands::download_asr_setup,
             commands::enqueue_transcribe,
             commands::list_jobs,
             commands::get_transcript,

@@ -501,12 +501,36 @@ export default function App() {
             busy={busy}
             globalSkipSilence={globalSkipSilence}
             setGlobalSkipSilence={setGlobalSkipSilence}
+            onDownloadCli={async () => {
+              setBusy(true);
+              try {
+                setStatus("Laddar ner whisper-cli (Windows-zip från whisper.cpp)…");
+                setAsr(await api.downloadAsrCli());
+                setStatus("whisper-cli är nerladdad.");
+              } catch (err) {
+                setStatus(String(err));
+              } finally {
+                setBusy(false);
+              }
+            }}
             onDownloadModel={async () => {
               setBusy(true);
               try {
                 setStatus("Laddar ner ggml-small (ca 500 MB)…");
                 setAsr(await api.downloadAsrModel());
                 setStatus("Modellen är nerladdad.");
+              } catch (err) {
+                setStatus(String(err));
+              } finally {
+                setBusy(false);
+              }
+            }}
+            onDownloadAll={async () => {
+              setBusy(true);
+              try {
+                setStatus("Laddar ner whisper-cli och ggml-small…");
+                setAsr(await api.downloadAsrSetup());
+                setStatus("Whisper är redo.");
               } catch (err) {
                 setStatus(String(err));
               } finally {
@@ -972,6 +996,8 @@ function SettingsView(props: {
   globalSkipSilence: boolean;
   setGlobalSkipSilence: (v: boolean) => void;
   onDownloadModel: () => void;
+  onDownloadCli: () => void;
+  onDownloadAll: () => void;
   onSideload: () => void;
   onExport: () => void;
 }) {
@@ -995,7 +1021,9 @@ function SettingsView(props: {
       <AsrSettings
         status={props.asr}
         pathsBin={props.paths?.bin_dir}
+        onDownloadCli={props.onDownloadCli}
         onDownloadModel={props.onDownloadModel}
+        onDownloadAll={props.onDownloadAll}
         busy={props.busy}
       />
       {props.paths && (

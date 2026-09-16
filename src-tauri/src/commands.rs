@@ -325,6 +325,19 @@ pub async fn download_asr_model(state: State<'_, AppState>) -> AppResult<AsrStat
 }
 
 #[tauri::command]
+pub async fn download_asr_cli(state: State<'_, AppState>) -> AppResult<AsrStatus> {
+    asr::download_cli(&state.data_dir).await?;
+    Ok(asr::status(&state.data_dir))
+}
+
+#[tauri::command]
+pub async fn download_asr_setup(state: State<'_, AppState>) -> AppResult<AsrStatus> {
+    asr::download_cli(&state.data_dir).await?;
+    asr::download_model(&state.data_dir).await?;
+    Ok(asr::status(&state.data_dir))
+}
+
+#[tauri::command]
 pub fn enqueue_transcribe(state: State<AppState>, episode_id: i64) -> AppResult<Vec<JobRow>> {
     let conn = conn(&state);
     db::enqueue_job(&conn, "transcribe", episode_id, 10)?;

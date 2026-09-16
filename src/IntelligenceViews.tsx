@@ -206,6 +206,8 @@ export function AsrSettings(props: {
   status: AsrStatus | null;
   pathsBin?: string;
   onDownloadModel: () => void;
+  onDownloadCli: () => void;
+  onDownloadAll: () => void;
   busy: boolean;
 }) {
   return (
@@ -236,9 +238,17 @@ export function AsrSettings(props: {
           </dl>
         </>
       )}
-      <button disabled={props.busy} onClick={props.onDownloadModel}>
-        Ladda ner ggml-small
-      </button>
+      <div className="row-actions">
+        <button disabled={props.busy} onClick={props.onDownloadCli}>
+          Ladda ner whisper-cli
+        </button>
+        <button disabled={props.busy} onClick={props.onDownloadModel}>
+          Ladda ner ggml-small
+        </button>
+        <button disabled={props.busy} className="primary" onClick={props.onDownloadAll}>
+          Ladda ner allt
+        </button>
+      </div>
     </div>
   );
 }

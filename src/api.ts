@@ -55,6 +55,8 @@ export const api = {
     invoke<PlayerPayload>("episode_for_player", { episodeId }),
   asrStatus: () => invoke<AsrStatus>("asr_status"),
   downloadAsrModel: () => invoke<AsrStatus>("download_asr_model"),
+  downloadAsrCli: () => invoke<AsrStatus>("download_asr_cli"),
+  downloadAsrSetup: () => invoke<AsrStatus>("download_asr_setup"),
   enqueueTranscribe: (episodeId: number) =>
     invoke<JobRow[]>("enqueue_transcribe", { episodeId }),
   listJobs: () => invoke<JobRow[]>("list_jobs"),
