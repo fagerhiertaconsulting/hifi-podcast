@@ -590,6 +590,23 @@ pub fn claim_next_job(conn: &Connection) -> AppResult<Option<(i64, String, i64)>
     Ok(row)
 }
 
+pub fn requeue_running_jobs(conn: &Connection) -> AppResult<usize> {
+    let n = conn.execute(
+        "UPDATE job SET state = 'queued', error_msg = 'Omstart: jobbet låg kvar som running.', updated_at = ?1 WHERE state = 'running'",
+        params![now_rfc3339()],
+    )?;
+    Ok(n)
+}
+
+pub fn set_job_progress(conn: &Connection, id: i64, msg: &str) -> AppResult<()> {
+    let clipped: String = msg.chars().take(400).collect();
+    conn.execute(
+        "UPDATE job SET error_msg = ?1, updated_at = ?2 WHERE id = ?3 AND state = 'running'",
+        params![clipped, now_rfc3339(), id],
+    )?;
+    Ok(())
+}
+
 pub fn finish_job(conn: &Connection, id: i64, ok: bool, error: Option<&str>) -> AppResult<()> {
     conn.execute(
         "UPDATE job SET state = ?1, error_msg = ?2, updated_at = ?3 WHERE id = ?4",
@@ -969,5 +986,9 @@ mod tests {
             get_playback(&conn, eid).unwrap().unwrap().position_ms,
             1234
         );
+        enqueue_job(&conn, "transcribe", eid, 10).unwrap();
+        assert!(claim_next_job(&conn).unwrap().is_some());
+        assert_eq!(requeue_running_jobs(&conn).unwrap(), 1);
+        assert_eq!(list_jobs(&conn, 5).unwrap()[0].state, "queued");
     }
 }

@@ -4,7 +4,7 @@ use crate::error::AppResult;
 use crate::intel;
 use crate::AppState;
 use std::time::Duration;
-use tauri::{AppHandle, Manager};
+use tauri::{AppHandle, Emitter, Manager};
 
 pub async fn worker_loop(app: AppHandle) {
     loop {
@@ -14,7 +14,8 @@ pub async fn worker_loop(app: AppHandle) {
             db::claim_next_job(&conn).ok().flatten()
         };
         if let Some((job_id, job_type, episode_id)) = claimed {
-            let result = run_job(&app, &job_type, episode_id).await;
+            let _ = app.emit("jobs-changed", ());
+            let result = run_job(&app, job_id, &job_type, episode_id).await;
             let state = app.state::<AppState>();
             let conn = state.db.lock().expect("db");
             match result {
@@ -25,33 +26,88 @@ pub async fn worker_loop(app: AppHandle) {
                     let _ = db::finish_job(&conn, job_id, false, Some(&err.to_string()));
                 }
             }
+            drop(conn);
+            let _ = app.emit("jobs-changed", ());
         } else {
             tokio::time::sleep(Duration::from_millis(800)).await;
         }
     }
 }
 
-async fn run_job(app: &AppHandle, job_type: &str, episode_id: i64) -> AppResult<()> {
+async fn run_job(
+    app: &AppHandle,
+    job_id: i64,
+    job_type: &str,
+    episode_id: i64,
+) -> AppResult<()> {
     match job_type {
-        "transcribe" => transcribe(app, episode_id).await,
+        "transcribe" => transcribe(app, job_id, episode_id).await,
         "generate_chapters" => chapters(app, episode_id).await,
         "detect_ads" => ads(app, episode_id).await,
         other => Err(crate::error::AppError::msg(format!("okänd jobbtyp: {other}"))),
     }
 }
 
-async fn transcribe(app: &AppHandle, episode_id: i64) -> AppResult<()> {
+async fn transcribe(app: &AppHandle, job_id: i64, episode_id: i64) -> AppResult<()> {
     let (data_dir, audio, language) = {
         let state = app.state::<AppState>();
         let conn = state.db.lock().expect("db");
         let episode = db::get_episode(&conn, episode_id)?;
         let download = db::get_download(&conn, episode_id)?
-            .and_then(|d| d.file_path)
             .ok_or_else(|| crate::error::AppError::msg("Avsnittet är inte nedladdat."))?;
+        if download.state != "done" {
+            return Err(crate::error::AppError::msg(format!(
+                "Avsnittet är inte färdignedladdat (status: {}).",
+                download.state
+            )));
+        }
+        let path = download
+            .file_path
+            .ok_or_else(|| crate::error::AppError::msg("Avsnittet är inte nedladdat."))?;
+        if !std::path::Path::new(&path).is_file() {
+            return Err(crate::error::AppError::msg(format!(
+                "Ljudfilen saknas på disk: {path}"
+            )));
+        }
         let language = db::podcast_asr_language(&conn, episode.podcast_id)?;
-        (state.data_dir.clone(), std::path::PathBuf::from(download), language)
+        (state.data_dir.clone(), std::path::PathBuf::from(path), language)
     };
-    let (segments, lang) = asr::transcribe_file(&data_dir, &audio, &language).await?;
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let progress_app = app.clone();
+    let progress = tokio::spawn(async move {
+        let mut last = std::time::Instant::now()
+            .checked_sub(Duration::from_secs(2))
+            .unwrap_or_else(std::time::Instant::now);
+        while let Some(line) = rx.recv().await {
+            if last.elapsed() < Duration::from_millis(750) {
+                continue;
+            }
+            last = std::time::Instant::now();
+            {
+                let state = progress_app.state::<AppState>();
+                let locked = state.db.lock();
+                if let Ok(conn) = locked {
+                    let _ = db::set_job_progress(&conn, job_id, &line);
+                }
+            }
+            let _ = progress_app.emit("jobs-changed", ());
+        }
+    });
+    {
+        let state = app.state::<AppState>();
+        let locked = state.db.lock();
+        if let Ok(conn) = locked {
+            let _ = db::set_job_progress(
+                &conn,
+                job_id,
+                "Startar whisper-cli (CPU). Ett helt avsnitt kan ta många minuter…",
+            );
+        }
+        let _ = app.emit("jobs-changed", ());
+    }
+    let result = asr::transcribe_file(&data_dir, &audio, &language, Some(tx)).await;
+    let _ = progress.await;
+    let (segments, lang) = result?;
     {
         let state = app.state::<AppState>();
         let conn = state.db.lock().expect("db");

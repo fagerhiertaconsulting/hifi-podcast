@@ -143,6 +143,24 @@ export default function App() {
   }, [speed]);
 
   useEffect(() => {
+    const un = listen("jobs-changed", () => {
+      void refreshLibrary().catch((err) => setStatus(String(err)));
+    });
+    return () => {
+      void un.then((fn) => fn());
+    };
+  }, [refreshLibrary]);
+
+  useEffect(() => {
+    const active = jobs.some((j) => j.state === "queued" || j.state === "running");
+    if (!active) return;
+    const id = window.setInterval(() => {
+      void refreshLibrary().catch((err) => setStatus(String(err)));
+    }, 2500);
+    return () => window.clearInterval(id);
+  }, [jobs, refreshLibrary]);
+
+  useEffect(() => {
     const un = listen<string>("smtc", (event) => {
       const audio = audioRef.current;
       if (!audio) return;
@@ -428,9 +446,15 @@ export default function App() {
               setStatus("Tillagd i kön.");
             }}
             onTranscribe={async (id) => {
-              await api.enqueueTranscribe(id);
-              setStatus("Transkribering köad (lokal Whisper).");
-              await refreshLibrary();
+              try {
+                setJobs(await api.enqueueTranscribe(id));
+                setStatus(
+                  "Transkribering startad. Ett jobb i taget — följ status under Statistik eller i transkriptpanelen. CPU kan ta 15–60 min för ett helt avsnitt.",
+                );
+                await refreshLibrary();
+              } catch (err) {
+                setStatus(String(err));
+              }
             }}
             onSaveSettings={async () => {
               if (!selected) return;
@@ -565,6 +589,7 @@ export default function App() {
       <TranscriptPane
         episodeId={payload?.episode.id ?? null}
         positionMs={Math.floor(position * 1000)}
+        jobs={jobs}
         onSeekMs={(ms) => {
           if (audioRef.current) audioRef.current.currentTime = ms / 1000;
         }}

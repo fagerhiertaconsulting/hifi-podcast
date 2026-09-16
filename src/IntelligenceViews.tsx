@@ -23,11 +23,16 @@ export function TranscriptPane(props: {
   episodeId: number | null;
   positionMs: number;
   onSeekMs: (ms: number) => void;
+  jobs?: JobRow[];
 }) {
   const [segments, setSegments] = useState<TranscriptSegment[]>([]);
   const [chapters, setChapters] = useState<Chapter[]>([]);
   const [query, setQuery] = useState("");
   const [hits, setHits] = useState<TranscriptSegment[] | null>(null);
+
+  const job = props.jobs?.find(
+    (j) => j.episode_id === props.episodeId && j.job_type === "transcribe",
+  );
 
   useEffect(() => {
     if (props.episodeId == null) {
@@ -42,7 +47,23 @@ export function TranscriptPane(props: {
       setSegments(s);
       setChapters(c);
     });
-  }, [props.episodeId]);
+  }, [props.episodeId, job?.id, job?.state]);
+
+  const emptyHint = (() => {
+    if (props.episodeId == null) return "Spela ett avsnitt.";
+    if (job?.state === "running") {
+      return job.error_msg
+        ? `Transkriberar (lokal Whisper)… ${job.error_msg}`
+        : "Transkriberar med lokal Whisper. Ett 40-minutersavsnitt kan ta 15–60 minuter på CPU.";
+    }
+    if (job?.state === "queued") {
+      return "Transkribering väntar i kön. Ett jobb i taget — se Statistik → Jobbkö.";
+    }
+    if (job?.state === "error") {
+      return `Senaste Whisper-försöket misslyckades: ${job.error_msg ?? "okänt fel"}`;
+    }
+    return "Inget transkript ännu. Ladda ner avsnittet och tryck Transkribera.";
+  })();
 
   const activeId = useMemo(() => {
     const hit = segments.find(
@@ -99,7 +120,7 @@ export function TranscriptPane(props: {
       <ul className="segments">
         {props.episodeId == null && <li className="empty">Spela ett avsnitt.</li>}
         {props.episodeId != null && segments.length === 0 && (
-          <li className="empty">Inget transkript ännu. Köa Whisper från avsnittet.</li>
+          <li className="empty">{emptyHint}</li>
         )}
         {segments.map((seg) => (
           <li key={seg.id} className={seg.id === activeId ? "active" : ""}>
@@ -190,6 +211,11 @@ export function StatsView(props: {
         ))}
       </ul>
       <h2>Jobbkö</h2>
+      <p className="empty">
+        Ett Whisper-jobb i taget. <code>running</code> betyder att CPU:n arbetar — ofta
+        15–60 minuter för ett helt avsnitt. Äldre rader med error är tidigare försök
+        (saknad modell/CLI/fil).
+      </p>
       <ul className="hits">
         {props.jobs.slice(0, 12).map((j) => (
           <li key={j.id}>

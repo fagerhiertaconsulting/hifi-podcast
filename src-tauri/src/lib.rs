@@ -39,6 +39,7 @@ pub fn run() {
             let db_path = data_dir.join("db.sqlite");
             let conn = Connection::open(&db_path)?;
             db::initialize(&conn)?;
+            let _ = db::requeue_running_jobs(&conn);
             let smtc = smtc::init(app);
             app.manage(AppState {
                 db: Mutex::new(conn),

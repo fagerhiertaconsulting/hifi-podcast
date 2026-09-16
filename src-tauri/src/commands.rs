@@ -340,6 +340,31 @@ pub async fn download_asr_setup(state: State<'_, AppState>) -> AppResult<AsrStat
 #[tauri::command]
 pub fn enqueue_transcribe(state: State<AppState>, episode_id: i64) -> AppResult<Vec<JobRow>> {
     let conn = conn(&state);
+    let download = db::get_download(&conn, episode_id)?;
+    match download {
+        Some(d) if d.state == "done" => {
+            let path = d
+                .file_path
+                .as_deref()
+                .ok_or_else(|| crate::error::AppError::msg("Avsnittet är inte nedladdat."))?;
+            if !std::path::Path::new(path).is_file() {
+                return Err(crate::error::AppError::msg(format!(
+                    "Ljudfilen saknas på disk: {path}"
+                )));
+            }
+        }
+        Some(d) => {
+            return Err(crate::error::AppError::msg(format!(
+                "Avsnittet är inte färdignedladdat (status: {}).",
+                d.state
+            )));
+        }
+        None => {
+            return Err(crate::error::AppError::msg(
+                "Avsnittet är inte nedladdat. Tryck Ladda ner först.",
+            ));
+        }
+    }
     db::enqueue_job(&conn, "transcribe", episode_id, 10)?;
     db::list_jobs(&conn, 30)
 }

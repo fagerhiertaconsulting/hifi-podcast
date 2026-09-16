@@ -49,6 +49,10 @@ whisper-cli -m ggml-small.bin -f avsnitt.mp3 -l auto -oj -osrt -of …
 
 `-l` är `auto`, `sv` eller `en` från podcastinställningen.
 
+**CPU-tid:** `ggml-small` på ett 40-minutersavsnitt tar ofta **15–60 minuter**. Jobbet syns som `running` under Statistik → Jobbkö (inte bara “köad”). Logg: `%LOCALAPPDATA%\consulting.fagerhierta.hifi-podcast\logs\whisper-last.log`.
+
+Ett Whisper-jobb körs i taget. Om appen startas om medan ett jobb hänger som `running` läggs det tillbaka i kön.
+
 ## 3. Flöde
 
 1. Avsnitt laddas ner (originalfil).
