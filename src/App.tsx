@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { listen } from "@tauri-apps/api/event";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import { api } from "./api";
 import {
@@ -7,9 +8,21 @@ import {
   blobUrlForLocalFile,
   configureHiFiElement,
 } from "./audio/engine";
+import {
+  AsrSettings,
+  InboxView,
+  StatsView,
+  TranscriptPane,
+} from "./IntelligenceViews";
 import type {
+  AdSegment,
   AppPaths,
+  AsrStatus,
+  Bookmark,
   Episode,
+  InboxItem,
+  JobRow,
+  LibraryStats,
   PlayerPayload,
   Podcast,
   QueueItem,
@@ -45,6 +58,14 @@ export default function App() {
   const playingRef = useRef(false);
 
   const [view, setView] = useState<View>("library");
+  const [filter, setFilter] = useState("");
+  const [onlyDownloaded, setOnlyDownloaded] = useState(false);
+  const [inbox, setInbox] = useState<InboxItem[]>([]);
+  const [bookmarks, setBookmarks] = useState<Bookmark[]>([]);
+  const [jobs, setJobs] = useState<JobRow[]>([]);
+  const [stats, setStats] = useState<LibraryStats | null>(null);
+  const [asr, setAsr] = useState<AsrStatus | null>(null);
+  const adsRef = useRef<AdSegment[]>([]);
   const [status, setStatus] = useState("Redo.");
   const [busy, setBusy] = useState(false);
   const [feedUrl, setFeedUrl] = useState("");
@@ -78,14 +99,24 @@ export default function App() {
   const skipModeRef = useRef(skipSilenceActive);
 
   const refreshLibrary = useCallback(async () => {
-    const [list, q, p] = await Promise.all([
+    const [list, q, p, box, marks, jobList, st, asrStatus] = await Promise.all([
       api.listPodcasts(),
       api.listQueue(),
       api.appPaths(),
+      api.listInbox(),
+      api.listBookmarks(),
+      api.listJobs(),
+      api.libraryStats(),
+      api.asrStatus(),
     ]);
     setPodcasts(list);
     setQueue(q);
     setPaths(p);
+    setInbox(box);
+    setBookmarks(marks);
+    setJobs(jobList);
+    setStats(st);
+    setAsr(asrStatus);
     if (list.length && selectedId === null) {
       setSelectedId(list[0].id);
     }
@@ -110,6 +141,24 @@ export default function App() {
     if (!audio) return;
     configureHiFiElement(audio, speed);
   }, [speed]);
+
+  useEffect(() => {
+    const un = listen<string>("smtc", (event) => {
+      const audio = audioRef.current;
+      if (!audio) return;
+      if (event.payload === "toggle") {
+        if (audio.paused) void audio.play();
+        else audio.pause();
+      } else if (event.payload === "play") {
+        void audio.play();
+      } else if (event.payload === "pause") {
+        audio.pause();
+      }
+    });
+    return () => {
+      void un.then((fn) => fn());
+    };
+  }, []);
 
   useEffect(() => {
     if (sleepMode !== "minutes" || !sleepUntil) return;
@@ -213,6 +262,8 @@ export default function App() {
         const nextSpeed = next.playback?.speed || next.podcast.speed || 1;
         setSpeed(nextSpeed);
         setPayload(next);
+        adsRef.current = next.podcast.skip_ads ? next.ads.filter((a) => a.enabled) : [];
+        void api.smtcNowPlaying(next.episode.title, next.podcast.title, true);
         const useSkip = globalSkipSilence || next.podcast.skip_silence;
         skipModeRef.current = useSkip;
         filePathRef.current = filePath;
@@ -266,8 +317,14 @@ export default function App() {
           <button className={view === "library" ? "active" : ""} onClick={() => setView("library")}>
             Bibliotek
           </button>
+          <button className={view === "inbox" ? "active" : ""} onClick={() => setView("inbox")}>
+            Inkorg ({inbox.length})
+          </button>
           <button className={view === "queue" ? "active" : ""} onClick={() => setView("queue")}>
             Kö ({queue.length})
+          </button>
+          <button className={view === "stats" ? "active" : ""} onClick={() => setView("stats")}>
+            Statistik
           </button>
           <button className={view === "settings" ? "active" : ""} onClick={() => setView("settings")}>
             Inställningar
@@ -285,6 +342,10 @@ export default function App() {
             setFeedUrl={setFeedUrl}
             opmlText={opmlText}
             setOpmlText={setOpmlText}
+            filter={filter}
+            setFilter={setFilter}
+            onlyDownloaded={onlyDownloaded}
+            setOnlyDownloaded={setOnlyDownloaded}
             podcasts={podcasts}
             selected={selected}
             episodes={episodes}
@@ -363,7 +424,13 @@ export default function App() {
             onPlay={(id) => void playEpisode(id)}
             onEnqueue={async (id) => {
               setQueue(await api.enqueueEpisode(id));
+              await api.triageEpisode(id, false, false);
               setStatus("Tillagd i kön.");
+            }}
+            onTranscribe={async (id) => {
+              await api.enqueueTranscribe(id);
+              setStatus("Transkribering köad (lokal Whisper).");
+              await refreshLibrary();
             }}
             onSaveSettings={async () => {
               if (!selected) return;
@@ -373,6 +440,9 @@ export default function App() {
                 intro_skip_sec: selected.intro_skip_sec,
                 outro_skip_sec: selected.outro_skip_sec,
                 skip_silence: selected.skip_silence,
+                asr_language: selected.asr_language,
+                skip_ads: selected.skip_ads,
+                auto_transcribe: selected.auto_transcribe,
               });
               await refreshLibrary();
               setStatus("Podcastinställningar sparade.");
@@ -381,6 +451,22 @@ export default function App() {
               setPodcasts((current) =>
                 current.map((p) => (p.id === selected?.id ? { ...p, ...patch } : p)),
               );
+            }}
+          />
+        )}
+
+        {view === "inbox" && (
+          <InboxView
+            items={inbox}
+            onPlay={(id) => void playEpisode(id)}
+            onQueue={async (id) => {
+              setQueue(await api.enqueueEpisode(id));
+              await api.triageEpisode(id, false, false);
+              await refreshLibrary();
+            }}
+            onArchive={async (id) => {
+              await api.triageEpisode(id, false, true);
+              await refreshLibrary();
             }}
           />
         )}
@@ -394,11 +480,51 @@ export default function App() {
           />
         )}
 
+        {view === "stats" && (
+          <StatsView
+            stats={stats}
+            bookmarks={bookmarks}
+            jobs={jobs}
+            onSeekBookmark={(episodeId, ms) => {
+              void playEpisode(episodeId, false).then(() => {
+                if (audioRef.current) audioRef.current.currentTime = ms / 1000;
+              });
+            }}
+            onDeleteBookmark={async (id) => setBookmarks(await api.deleteBookmark(id))}
+          />
+        )}
+
         {view === "settings" && (
           <SettingsView
             paths={paths}
+            asr={asr}
+            busy={busy}
             globalSkipSilence={globalSkipSilence}
             setGlobalSkipSilence={setGlobalSkipSilence}
+            onDownloadModel={async () => {
+              setBusy(true);
+              try {
+                setStatus("Laddar ner ggml-small (ca 500 MB)…");
+                setAsr(await api.downloadAsrModel());
+                setStatus("Modellen är nerladdad.");
+              } catch (err) {
+                setStatus(String(err));
+              } finally {
+                setBusy(false);
+              }
+            }}
+            onSideload={async () => {
+              const path = await open({
+                multiple: false,
+                filters: [{ name: "Ljud", extensions: ["mp3", "m4a", "aac", "ogg", "opus", "flac", "wav"] }],
+              });
+              if (!path || Array.isArray(path)) return;
+              const ep = await api.sideloadFile(path);
+              setSelectedId(ep.podcast_id);
+              await refreshLibrary();
+              setView("library");
+              setStatus(`Importerade ${ep.title}`);
+            }}
             onExport={async () => {
               const path = await save({
                 defaultPath: "hifi-podcast.opml",
@@ -412,6 +538,14 @@ export default function App() {
         )}
       </main>
 
+      <TranscriptPane
+        episodeId={payload?.episode.id ?? null}
+        positionMs={Math.floor(position * 1000)}
+        onSeekMs={(ms) => {
+          if (audioRef.current) audioRef.current.currentTime = ms / 1000;
+        }}
+      />
+
       <footer className="player">
         <audio
           ref={audioRef}
@@ -421,6 +555,12 @@ export default function App() {
             positionRef.current = el.currentTime;
             setPosition(el.currentTime);
             setDuration(el.duration || 0);
+            const posMs = el.currentTime * 1000;
+            const ad = adsRef.current.find((a) => posMs >= a.start_ms && posMs < a.end_ms - 200);
+            if (ad) {
+              el.currentTime = ad.end_ms / 1000;
+              return;
+            }
             const outro = payload?.podcast.outro_skip_sec ?? 0;
             if (
               !outroFired.current &&
@@ -443,6 +583,9 @@ export default function App() {
           onPause={() => {
             setPlaying(false);
             void persistNow();
+            if (payload) {
+              void api.smtcNowPlaying(payload.episode.title, payload.podcast.title, false);
+            }
           }}
           onEnded={() => void onEnded()}
           onLoadedMetadata={(e) => setDuration(e.currentTarget.duration || 0)}
@@ -539,6 +682,18 @@ export default function App() {
             <option value="episode">Slut på avsnitt</option>
           </select>
         </label>
+          <button
+            disabled={!payload}
+            onClick={() => {
+              if (!payload) return;
+              const note = window.prompt("Anteckning (valfritt)") ?? "";
+              void api
+                .addBookmark(payload.episode.id, Math.floor(position * 1000), note)
+                .then(setBookmarks);
+            }}
+          >
+            Bokmärke
+          </button>
         <div className="status">{status}</div>
       </footer>
     </div>
@@ -555,6 +710,10 @@ function Library(props: {
   setFeedUrl: (v: string) => void;
   opmlText: string;
   setOpmlText: (v: string) => void;
+  filter: string;
+  setFilter: (v: string) => void;
+  onlyDownloaded: boolean;
+  setOnlyDownloaded: (v: boolean) => void;
   podcasts: Podcast[];
   selected: Podcast | null;
   episodes: Episode[];
@@ -567,10 +726,17 @@ function Library(props: {
   onDownload: (id: number) => void;
   onPlay: (id: number) => void;
   onEnqueue: (id: number) => void;
+  onTranscribe: (id: number) => void;
   onSaveSettings: () => void;
   onPatchSelected: (patch: Partial<Podcast>) => void;
 }) {
   const selected = props.selected;
+  const visible = props.episodes.filter((ep) => {
+    const q = props.filter.trim().toLowerCase();
+    if (q && !ep.title.toLowerCase().includes(q)) return false;
+    if (props.onlyDownloaded && ep.status !== "downloaded") return false;
+    return true;
+  });
   return (
     <section className="library">
       <header className="toolbar">
@@ -589,6 +755,21 @@ function Library(props: {
           Uppdatera flöde
         </button>
       </header>
+      <div className="toolbar">
+        <input
+          placeholder="Filtrera avsnitt"
+          value={props.filter}
+          onChange={(e) => props.setFilter(e.target.value)}
+        />
+        <label className="check">
+          <input
+            type="checkbox"
+            checked={props.onlyDownloaded}
+            onChange={(e) => props.setOnlyDownloaded(e.target.checked)}
+          />
+          Bara nedladdade
+        </label>
+      </div>
       <textarea
         placeholder="Klistra in OPML här och importera"
         value={props.opmlText}
@@ -681,19 +862,56 @@ function Library(props: {
                   />
                   Hoppa tystnad (opt-in)
                 </label>
+                <label className="check">
+                  <input
+                    type="checkbox"
+                    checked={selected.skip_ads}
+                    onChange={(e) =>
+                      props.onPatchSelected({ skip_ads: e.target.checked })
+                    }
+                  />
+                  Hoppa reklam (heuristik)
+                </label>
+                <label className="check">
+                  <input
+                    type="checkbox"
+                    checked={selected.auto_transcribe}
+                    onChange={(e) =>
+                      props.onPatchSelected({ auto_transcribe: e.target.checked })
+                    }
+                  />
+                  Auto-transkribera
+                </label>
+                <label>
+                  ASR-språk
+                  <select
+                    value={selected.asr_language ?? "auto"}
+                    onChange={(e) =>
+                      props.onPatchSelected({
+                        asr_language: e.target.value === "auto" ? "auto" : e.target.value,
+                      })
+                    }
+                  >
+                    <option value="auto">auto</option>
+                    <option value="sv">sv</option>
+                    <option value="en">en</option>
+                  </select>
+                </label>
                 <button onClick={props.onSaveSettings}>Spara inställningar</button>
               </div>
               <ul className="episodes">
-                {props.episodes.map((episode) => (
+                {visible.map((episode) => (
                   <li key={episode.id}>
                     <div>
                       <strong>{episode.title}</strong>
                       <span>
                         {formatDate(episode.publish_at)} · {episode.status}
+                        {episode.inbox ? " · inkorg" : ""}
                       </span>
                     </div>
                     <div className="ep-actions">
                       <button onClick={() => props.onDownload(episode.id)}>Ladda ner</button>
+                      <button onClick={() => props.onTranscribe(episode.id)}>Transkribera</button>
                       <button onClick={() => props.onEnqueue(episode.id)}>Köa</button>
                       <button className="primary" onClick={() => props.onPlay(episode.id)}>
                         Spela
@@ -749,8 +967,12 @@ function QueueView(props: {
 
 function SettingsView(props: {
   paths: AppPaths | null;
+  asr: AsrStatus | null;
+  busy: boolean;
   globalSkipSilence: boolean;
   setGlobalSkipSilence: (v: boolean) => void;
+  onDownloadModel: () => void;
+  onSideload: () => void;
   onExport: () => void;
 }) {
   return (
@@ -758,7 +980,7 @@ function SettingsView(props: {
       <h1>Inställningar</h1>
       <p>
         HIFI podcast är lokal-first. Ingen molnsynk, inga konton och ingen
-        omkodning av nedladdade original.
+        omkodning av nedladdade original. BYOK moln-ASR är avstängt.
       </p>
       <label className="check">
         <input
@@ -768,7 +990,14 @@ function SettingsView(props: {
         />
         Hoppa tystnad globalt (av som standard — påverkar inte dynamik)
       </label>
+      <button onClick={props.onSideload}>Importera ljudfil (sideload)…</button>
       <button onClick={props.onExport}>Exportera OPML…</button>
+      <AsrSettings
+        status={props.asr}
+        pathsBin={props.paths?.bin_dir}
+        onDownloadModel={props.onDownloadModel}
+        busy={props.busy}
+      />
       {props.paths && (
         <dl className="paths">
           <dt>Databas</dt>

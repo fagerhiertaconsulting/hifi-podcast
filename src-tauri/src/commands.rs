@@ -1,9 +1,11 @@
+use crate::asr;
 use crate::db;
 use crate::download;
 use crate::error::AppResult;
 use crate::feeds;
 use crate::models::{
-    AppPaths, Download, Episode, PlaybackState, Podcast, PodcastSettings, QueueItem,
+    AdSegment, AppPaths, AsrStatus, Bookmark, Chapter, Download, Episode, InboxItem, JobRow,
+    LibraryStats, PlaybackState, Podcast, PodcastSettings, QueueItem, Transcript, TranscriptSegment,
 };
 use crate::AppState;
 use tauri::State;
@@ -18,6 +20,8 @@ pub fn app_paths(state: State<AppState>) -> AppPaths {
         db_path: state.db_path.display().to_string(),
         media_root: state.media_root.display().to_string(),
         data_dir: state.data_dir.display().to_string(),
+        models_dir: crate::asr::models_dir(&state.data_dir).display().to_string(),
+        bin_dir: crate::asr::bin_dir(&state.data_dir).display().to_string(),
     }
 }
 
@@ -186,6 +190,9 @@ async fn download_episode_inner(state: &AppState, episode_id: i64) -> AppResult<
                 Some(&completed),
             )?;
             db::set_episode_status(&conn, episode_id, "downloaded")?;
+            if db::podcast_wants_transcribe(&conn, podcast_id).unwrap_or(false) {
+                let _ = db::enqueue_job(&conn, "transcribe", episode_id, 10);
+            }
         }
         Err(err) => {
             db::upsert_download_state(
@@ -263,11 +270,15 @@ pub fn episode_for_player(
     let podcast = db::get_podcast(&conn, episode.podcast_id)?;
     let download = db::get_download(&conn, episode_id)?;
     let playback = db::get_playback(&conn, episode_id)?;
+    let chapters = db::list_chapters(&conn, episode_id).unwrap_or_default();
+    let ads = db::list_ads(&conn, episode_id).unwrap_or_default();
     Ok(PlayerPayload {
         episode,
         podcast,
         download,
         playback,
+        chapters,
+        ads,
     })
 }
 
@@ -277,6 +288,8 @@ pub struct PlayerPayload {
     pub podcast: Podcast,
     pub download: Option<Download>,
     pub playback: Option<PlaybackState>,
+    pub chapters: Vec<Chapter>,
+    pub ads: Vec<AdSegment>,
 }
 
 /// Reads a downloaded original under media-root. Used only for opt-in skip-silence
@@ -298,6 +311,169 @@ pub(crate) fn read_media_file_from(
         return Err(crate::error::AppError::msg("Otillåten sökväg."));
     }
     Ok(std::fs::read(file)?)
+}
+
+#[tauri::command]
+pub fn asr_status(state: State<AppState>) -> AsrStatus {
+    asr::status(&state.data_dir)
+}
+
+#[tauri::command]
+pub async fn download_asr_model(state: State<'_, AppState>) -> AppResult<AsrStatus> {
+    asr::download_model(&state.data_dir).await?;
+    Ok(asr::status(&state.data_dir))
+}
+
+#[tauri::command]
+pub fn enqueue_transcribe(state: State<AppState>, episode_id: i64) -> AppResult<Vec<JobRow>> {
+    let conn = conn(&state);
+    db::enqueue_job(&conn, "transcribe", episode_id, 10)?;
+    db::list_jobs(&conn, 30)
+}
+
+#[tauri::command]
+pub fn list_jobs(state: State<AppState>) -> AppResult<Vec<JobRow>> {
+    db::list_jobs(&conn(&state), 40)
+}
+
+#[tauri::command]
+pub fn get_transcript(state: State<AppState>, episode_id: i64) -> AppResult<Option<Transcript>> {
+    db::get_transcript(&conn(&state), episode_id)
+}
+
+#[tauri::command]
+pub fn list_segments(state: State<AppState>, episode_id: i64) -> AppResult<Vec<TranscriptSegment>> {
+    db::list_segments(&conn(&state), episode_id)
+}
+
+#[tauri::command]
+pub fn search_transcripts(state: State<AppState>, query: String) -> AppResult<Vec<TranscriptSegment>> {
+    db::search_segments(&conn(&state), &query)
+}
+
+#[tauri::command]
+pub fn list_chapters(state: State<AppState>, episode_id: i64) -> AppResult<Vec<Chapter>> {
+    db::list_chapters(&conn(&state), episode_id)
+}
+
+#[tauri::command]
+pub fn list_ads(state: State<AppState>, episode_id: i64) -> AppResult<Vec<AdSegment>> {
+    db::list_ads(&conn(&state), episode_id)
+}
+
+#[tauri::command]
+pub fn add_bookmark(
+    state: State<AppState>,
+    episode_id: i64,
+    position_ms: i64,
+    note: String,
+) -> AppResult<Vec<Bookmark>> {
+    let conn = conn(&state);
+    db::add_bookmark(&conn, episode_id, position_ms, &note)?;
+    db::list_bookmarks(&conn)
+}
+
+#[tauri::command]
+pub fn list_bookmarks(state: State<AppState>) -> AppResult<Vec<Bookmark>> {
+    db::list_bookmarks(&conn(&state))
+}
+
+#[tauri::command]
+pub fn delete_bookmark(state: State<AppState>, id: i64) -> AppResult<Vec<Bookmark>> {
+    let conn = conn(&state);
+    db::delete_bookmark(&conn, id)?;
+    db::list_bookmarks(&conn)
+}
+
+#[tauri::command]
+pub fn list_inbox(state: State<AppState>) -> AppResult<Vec<InboxItem>> {
+    db::list_inbox(&conn(&state))
+}
+
+#[tauri::command]
+pub fn triage_episode(
+    state: State<AppState>,
+    episode_id: i64,
+    inbox: bool,
+    archived: bool,
+) -> AppResult<()> {
+    db::set_inbox(&conn(&state), episode_id, inbox, archived)
+}
+
+#[tauri::command]
+pub fn library_stats(state: State<AppState>) -> AppResult<LibraryStats> {
+    db::library_stats(&conn(&state))
+}
+
+#[tauri::command]
+pub fn sideload_file(state: State<AppState>, path: String) -> AppResult<Episode> {
+    let src = std::path::PathBuf::from(&path);
+    if !src.is_file() {
+        return Err(crate::error::AppError::msg("Filen finns inte."));
+    }
+    let episode_id = {
+        let dbconn = conn(&state);
+        let podcast_id = db::ensure_sideload_podcast(&dbconn)?;
+        let title = src
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("Importerat avsnitt")
+            .to_string();
+        let guid = format!("sideload:{}", path.replace('\\', "/"));
+        let id = db::upsert_episode(
+            &dbconn,
+            podcast_id,
+            &guid,
+            &title,
+            None,
+            Some(&format!("file://{}", path)),
+            None,
+            None,
+        )?;
+        (podcast_id, id)
+    };
+    let (podcast_id, episode_id) = episode_id;
+    let ext = src
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or("bin")
+        .to_ascii_lowercase();
+    let dest = state
+        .media_root
+        .join(podcast_id.to_string())
+        .join(format!("{episode_id}.{ext}"));
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::copy(&src, &dest)?;
+    let meta = std::fs::metadata(&dest)?;
+    let conn = conn(&state);
+    let completed = db::now_rfc3339();
+    db::upsert_download_state(
+        &conn,
+        episode_id,
+        "done",
+        Some(&dest.display().to_string()),
+        Some(meta.len() as i64),
+        None,
+        None,
+        Some(&completed),
+    )?;
+    db::set_episode_status(&conn, episode_id, "downloaded")?;
+    if db::podcast_wants_transcribe(&conn, podcast_id).unwrap_or(false) {
+        let _ = db::enqueue_job(&conn, "transcribe", episode_id, 10);
+    }
+    db::get_episode(&conn, episode_id)
+}
+
+#[tauri::command]
+pub fn smtc_now_playing(
+    state: State<AppState>,
+    title: String,
+    artist: String,
+    playing: bool,
+) {
+    crate::smtc::set_playing(&state.smtc, &title, &artist, playing);
 }
 
 #[cfg(test)]

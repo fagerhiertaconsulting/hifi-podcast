@@ -15,6 +15,9 @@ pub struct Podcast {
     pub outro_skip_sec: i64,
     pub skip_silence: bool,
     pub language: Option<String>,
+    pub asr_language: Option<String>,
+    pub skip_ads: bool,
+    pub auto_transcribe: bool,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -26,6 +29,9 @@ pub struct PodcastSettings {
     pub intro_skip_sec: i64,
     pub outro_skip_sec: i64,
     pub skip_silence: bool,
+    pub asr_language: Option<String>,
+    pub skip_ads: bool,
+    pub auto_transcribe: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -40,6 +46,8 @@ pub struct Episode {
     pub duration_ms: Option<i64>,
     pub episode_image_path: Option<String>,
     pub status: String,
+    pub inbox: bool,
+    pub archived: bool,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -82,4 +90,96 @@ pub struct AppPaths {
     pub db_path: String,
     pub media_root: String,
     pub data_dir: String,
+    pub models_dir: String,
+    pub bin_dir: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Transcript {
+    pub id: i64,
+    pub episode_id: i64,
+    pub source: String,
+    pub model: Option<String>,
+    pub language: Option<String>,
+    pub status: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TranscriptSegment {
+    pub id: i64,
+    pub transcript_id: i64,
+    pub start_ms: i64,
+    pub end_ms: i64,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Chapter {
+    pub id: i64,
+    pub episode_id: i64,
+    pub start_ms: i64,
+    pub end_ms: Option<i64>,
+    pub title: String,
+    pub source: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdSegment {
+    pub id: i64,
+    pub episode_id: i64,
+    pub start_ms: i64,
+    pub end_ms: i64,
+    pub confidence: f64,
+    pub method: String,
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Bookmark {
+    pub id: i64,
+    pub episode_id: i64,
+    pub position_ms: i64,
+    pub note: String,
+    pub created_at: String,
+    pub episode_title: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JobRow {
+    pub id: i64,
+    pub job_type: String,
+    pub episode_id: i64,
+    pub state: String,
+    pub error_msg: Option<String>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AsrStatus {
+    pub byok_enabled: bool,
+    pub model_name: String,
+    pub model_present: bool,
+    pub model_path: String,
+    pub cli_present: bool,
+    pub cli_path: Option<String>,
+    pub hint: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LibraryStats {
+    pub podcast_count: i64,
+    pub episode_count: i64,
+    pub downloaded_count: i64,
+    pub completed_count: i64,
+    pub inbox_count: i64,
+    pub bookmark_count: i64,
+    pub listened_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InboxItem {
+    pub episode: Episode,
+    pub podcast_title: String,
+    pub download_state: Option<String>,
 }
