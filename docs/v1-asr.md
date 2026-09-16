@@ -28,19 +28,46 @@ Zip hämtas från [ggml-org/whisper.cpp releases](https://github.com/ggml-org/wh
 
 `ggml-small` är stor och hämtas **inte** tyst i bakgrunden — den kräver knappen ovan.
 
-### PowerShell (manuellt, om GitHub är blockerat)
+### PowerShell (manuellt)
+
+Stäng `hifi-podcast` / `npm run tauri dev` först, annars är `whisper-cli.exe` låst.
+
+CUDA (NVIDIA, ~640 MB):
 
 ```powershell
+Get-Process hifi-podcast, whisper-cli -ErrorAction SilentlyContinue | Stop-Process -Force
+$bin = Join-Path $env:LOCALAPPDATA "consulting.fagerhierta.hifi-podcast\bin"
+New-Item -ItemType Directory -Force -Path $bin | Out-Null
+$zip = Join-Path $bin "whisper-cublas-12.4.0-bin-x64.zip"
+curl.exe -L --http1.1 -o $zip "https://github.com/ggml-org/whisper.cpp/releases/download/b5130/whisper-cublas-12.4.0-bin-x64.zip"
+Expand-Archive -Path $zip -DestinationPath $bin -Force
+Get-ChildItem -Path $bin -Recurse -File | Where-Object {
+  ($_.Name -ieq "whisper-cli.exe" -or $_.Extension -ieq ".dll") -and $_.DirectoryName -ne $bin
+} | ForEach-Object {
+  Copy-Item $_.FullName -Destination (Join-Path $bin $_.Name) -Force
+}
+Set-Content -Path (Join-Path $bin "hifi-backend.txt") -Value "cuda" -Encoding ascii
+Remove-Item $zip -ErrorAction SilentlyContinue
+Get-Item $bin\whisper-cli.exe, $bin\ggml-cuda.dll, $bin\cublas64_12.dll
+```
+
+CPU-only (om du inte har NVIDIA):
+
+```powershell
+Get-Process hifi-podcast, whisper-cli -ErrorAction SilentlyContinue | Stop-Process -Force
 $bin = Join-Path $env:LOCALAPPDATA "consulting.fagerhierta.hifi-podcast\bin"
 New-Item -ItemType Directory -Force -Path $bin | Out-Null
 $zip = Join-Path $bin "whisper-bin-x64.zip"
-Invoke-WebRequest -Uri "https://github.com/ggml-org/whisper.cpp/releases/download/b5130/whisper-bin-x64.zip" -OutFile $zip
+curl.exe -L --http1.1 -o $zip "https://github.com/ggml-org/whisper.cpp/releases/download/b5130/whisper-bin-x64.zip"
 Expand-Archive -Path $zip -DestinationPath $bin -Force
-Get-ChildItem -Path $bin -Recurse -Include whisper-cli.exe,*.dll | ForEach-Object {
+Get-ChildItem -Path $bin -Recurse -File | Where-Object {
+  ($_.Name -ieq "whisper-cli.exe" -or $_.Extension -ieq ".dll") -and $_.DirectoryName -ne $bin
+} | ForEach-Object {
   Copy-Item $_.FullName -Destination (Join-Path $bin $_.Name) -Force
 }
+Set-Content -Path (Join-Path $bin "hifi-backend.txt") -Value "cpu" -Encoding ascii
 Remove-Item $zip -ErrorAction SilentlyContinue
-Get-ChildItem $bin\whisper-cli.exe
+Get-Item $bin\whisper-cli.exe
 ```
 
 Körs ungefär:
