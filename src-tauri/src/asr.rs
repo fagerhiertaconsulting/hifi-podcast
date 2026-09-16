@@ -306,6 +306,7 @@ pub async fn transcribe_file(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
 
     #[test]
     fn picks_x64_zip_from_releases_json() {
@@ -314,5 +315,30 @@ mod tests {
             pick_release_asset_url(json, "whisper-bin-x64.zip").as_deref(),
             Some("https://github.com/ggml-org/whisper.cpp/releases/download/b5130/whisper-bin-x64.zip")
         );
+    }
+
+    #[test]
+    fn extracts_cli_from_nested_zip() {
+        let dir = tempfile::tempdir().unwrap();
+        let zip_path = dir.path().join("t.zip");
+        {
+            let file = std::fs::File::create(&zip_path).unwrap();
+            let mut zip = zip::ZipWriter::new(file);
+            let opts = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            zip.start_file("Release/whisper-cli.exe", opts).unwrap();
+            zip.write_all(b"fake-cli").unwrap();
+            zip.start_file("Release/ggml.dll", opts).unwrap();
+            zip.write_all(b"dll").unwrap();
+            zip.finish().unwrap();
+        }
+        let dest = bin_dir(dir.path());
+        extract_cli_zip(&zip_path, &dest).unwrap();
+        assert_eq!(
+            std::fs::read(dest.join("whisper-cli.exe")).unwrap(),
+            b"fake-cli"
+        );
+        assert!(dest.join("ggml.dll").is_file());
+        assert!(find_cli(dir.path()).is_some());
     }
 }
