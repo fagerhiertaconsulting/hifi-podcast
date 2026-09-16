@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<opml version="2.0">
+  <head>
+    <title>HIFI podcast — exempel</title>
+  </head>
+  <body>
+    <outline text="Exempel" title="Exempel">
+      <outline type="rss" text="This American Life" title="This American Life"
+        xmlUrl="https://www.thisamericanlife.org/podcast/rss.xml"/>
+    </outline>
+  </body>
+</opml>
