@@ -62,6 +62,7 @@ pub fn run() {
             commands::dequeue_item,
             commands::move_queue_item,
             commands::episode_for_player,
+            commands::read_media_file,
         ])
         .run(tauri::generate_context!())
         .expect("kunde inte starta HIFI podcast");

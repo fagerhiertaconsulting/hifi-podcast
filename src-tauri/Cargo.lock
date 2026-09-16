@@ -1681,7 +1681,6 @@ dependencies = [
  "chrono",
  "futures-util",
  "hex",
- "mime",
  "opml",
  "reqwest 0.12.28",
  "rss",

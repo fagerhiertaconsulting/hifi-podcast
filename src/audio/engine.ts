@@ -1,22 +1,66 @@
 /**
  * MVP-uppspelning via WebView2/Chromium.
- * - Originalfilen spelas som den är (ingen omkodning).
- * - preservesPitch = true (hastighet utan tonartsändring när motorn stöder det).
- * - Ingen dynamikkompression.
- * - Hoppa tystnad är opt-in och görs genom seek, inte genom att skriva ny fil.
+ *
+ * Default (alltid): HTMLMediaElement direkt till systemets mixer.
+ * createMediaElementSource() på asset.localhost ger tyst utgång
+ * ("MediaElementAudioSource outputs zeroes due to CORS").
+ *
+ * Hoppa tystnad (opt-in): same-origin blob: URL + Web Audio.
+ * crossOrigin måste sättas INNAN src.
  */
+
+import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 
 export type SkipSilenceHandle = {
   stop: () => void;
 };
 
 export function configureHiFiElement(audio: HTMLAudioElement, speed: number) {
+  audio.crossOrigin = "anonymous";
   audio.preservesPitch = true;
   if ("mozPreservesPitch" in audio) {
-    (audio as HTMLAudioElement & { mozPreservesPitch?: boolean }).mozPreservesPitch = true;
+    (audio as HTMLAudioElement & { mozPreservesPitch?: boolean }).mozPreservesPitch =
+      true;
   }
   audio.playbackRate = speed;
   audio.volume = 1;
+}
+
+export function mimeFromPath(path: string): string {
+  const ext = path.split(".").pop()?.toLowerCase() ?? "";
+  switch (ext) {
+    case "mp3":
+      return "audio/mpeg";
+    case "m4a":
+    case "m4b":
+    case "mp4":
+    case "aac":
+      return "audio/mp4";
+    case "ogg":
+    case "opus":
+      return "audio/ogg";
+    case "flac":
+      return "audio/flac";
+    case "wav":
+      return "audio/wav";
+    default:
+      return "application/octet-stream";
+  }
+}
+
+export async function blobUrlForLocalFile(filePath: string): Promise<string> {
+  const bytes = await invoke<number[] | Uint8Array>("read_media_file", {
+    path: filePath,
+  });
+  const data = bytes instanceof Uint8Array ? bytes : Uint8Array.from(bytes);
+  const copy = new Uint8Array(data.byteLength);
+  copy.set(data);
+  const blob = new Blob([copy], { type: mimeFromPath(filePath) });
+  return URL.createObjectURL(blob);
+}
+
+export function assetUrlForLocalFile(filePath: string): string {
+  return convertFileSrc(filePath);
 }
 
 const graphs = new WeakMap<
@@ -24,6 +68,10 @@ const graphs = new WeakMap<
   { ctx: AudioContext; analyser: AnalyserNode }
 >();
 
+/**
+ * Bind Web Audio only after a same-origin (blob:) src is assigned.
+ * Never call this for asset.localhost playback.
+ */
 export function attachSkipSilence(
   audio: HTMLAudioElement,
   isEnabled: () => boolean,
@@ -40,10 +88,9 @@ export function attachSkipSilence(
     source.connect(analyser);
     analyser.connect(gain);
     gain.connect(ctx.destination);
-    const resume = () => {
+    audio.addEventListener("play", () => {
       void ctx.resume();
-    };
-    audio.addEventListener("play", resume);
+    });
     graph = { ctx, analyser };
     graphs.set(audio, graph);
   }

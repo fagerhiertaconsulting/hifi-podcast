@@ -1,8 +1,12 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { convertFileSrc } from "@tauri-apps/api/core";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import { api } from "./api";
-import { attachSkipSilence, configureHiFiElement } from "./audio/engine";
+import {
+  attachSkipSilence,
+  assetUrlForLocalFile,
+  blobUrlForLocalFile,
+  configureHiFiElement,
+} from "./audio/engine";
 import type {
   AppPaths,
   Episode,
@@ -35,6 +39,10 @@ export default function App() {
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const skipRef = useRef<ReturnType<typeof attachSkipSilence> | null>(null);
   const persistTimer = useRef<number | null>(null);
+  const filePathRef = useRef<string | null>(null);
+  const blobUrlRef = useRef<string | null>(null);
+  const positionRef = useRef(0);
+  const playingRef = useRef(false);
 
   const [view, setView] = useState<View>("library");
   const [status, setStatus] = useState("Redo.");
@@ -48,6 +56,7 @@ export default function App() {
   const [paths, setPaths] = useState<AppPaths | null>(null);
   const [payload, setPayload] = useState<PlayerPayload | null>(null);
   const [playing, setPlaying] = useState(false);
+  playingRef.current = playing;
   const [position, setPosition] = useState(0);
   const [duration, setDuration] = useState(0);
   const [speed, setSpeed] = useState(1);
@@ -66,6 +75,7 @@ export default function App() {
     globalSkipSilence || Boolean(payload?.podcast.skip_silence);
   const skipEnabledRef = useRef(skipSilenceActive);
   skipEnabledRef.current = skipSilenceActive;
+  const skipModeRef = useRef(skipSilenceActive);
 
   const refreshLibrary = useCallback(async () => {
     const [list, q, p] = await Promise.all([
@@ -102,13 +112,6 @@ export default function App() {
   }, [speed]);
 
   useEffect(() => {
-    const audio = audioRef.current;
-    if (!audio) return;
-    skipRef.current = attachSkipSilence(audio, () => skipEnabledRef.current);
-    return () => skipRef.current?.stop();
-  }, []);
-
-  useEffect(() => {
     if (sleepMode !== "minutes" || !sleepUntil) return;
     const id = window.setInterval(() => {
       if (Date.now() >= sleepUntil) {
@@ -120,6 +123,56 @@ export default function App() {
     }, 1000);
     return () => window.clearInterval(id);
   }, [sleepMode, sleepUntil]);
+
+  const loadPlaybackSource = useCallback(
+    async (
+      audio: HTMLAudioElement,
+      filePath: string,
+      useSkipSilence: boolean,
+      speedValue: number,
+    ) => {
+      configureHiFiElement(audio, speedValue);
+      // Once Web Audio is bound to this element it must keep a same-origin
+      // (blob:) src. Never point a MediaElementSource at asset.localhost.
+      const mustUseBlob = useSkipSilence || skipRef.current !== null;
+      if (!mustUseBlob) {
+        if (blobUrlRef.current) {
+          URL.revokeObjectURL(blobUrlRef.current);
+          blobUrlRef.current = null;
+        }
+        audio.src = assetUrlForLocalFile(filePath);
+        return;
+      }
+      if (blobUrlRef.current) {
+        URL.revokeObjectURL(blobUrlRef.current);
+      }
+      const blobUrl = await blobUrlForLocalFile(filePath);
+      blobUrlRef.current = blobUrl;
+      audio.src = blobUrl;
+      if (!skipRef.current) {
+        skipRef.current = attachSkipSilence(audio, () => skipEnabledRef.current);
+      }
+    },
+    [],
+  );
+
+  useEffect(() => {
+    if (skipModeRef.current === skipSilenceActive) return;
+    skipModeRef.current = skipSilenceActive;
+    const audio = audioRef.current;
+    const path = filePathRef.current;
+    if (!audio || !path) return;
+    const pos = positionRef.current;
+    const wasPlaying = playingRef.current;
+    void loadPlaybackSource(audio, path, skipSilenceActive, speed)
+      .then(async () => {
+        audio.currentTime = pos;
+        if (wasPlaying) {
+          await audio.play();
+        }
+      })
+      .catch((err) => setStatus(String(err)));
+  }, [skipSilenceActive, loadPlaybackSource, speed]);
 
   const persistNow = useCallback(async () => {
     const audio = audioRef.current;
@@ -160,9 +213,10 @@ export default function App() {
         const nextSpeed = next.playback?.speed || next.podcast.speed || 1;
         setSpeed(nextSpeed);
         setPayload(next);
-        outroFired.current = false;
-        audio.src = convertFileSrc(filePath);
-        configureHiFiElement(audio, nextSpeed);
+        const useSkip = globalSkipSilence || next.podcast.skip_silence;
+        skipModeRef.current = useSkip;
+        filePathRef.current = filePath;
+        await loadPlaybackSource(audio, filePath, useSkip, nextSpeed);
         audio.currentTime = Math.max(0, startSec);
         await audio.play();
         setPlaying(true);
@@ -178,7 +232,7 @@ export default function App() {
         setBusy(false);
       }
     },
-    [loadEpisodes, refreshLibrary, selectedId],
+    [loadEpisodes, loadPlaybackSource, refreshLibrary, selectedId, globalSkipSilence],
   );
 
   const onEnded = useCallback(async () => {
@@ -361,8 +415,10 @@ export default function App() {
       <footer className="player">
         <audio
           ref={audioRef}
+          crossOrigin="anonymous"
           onTimeUpdate={(e) => {
             const el = e.currentTarget;
+            positionRef.current = el.currentTime;
             setPosition(el.currentTime);
             setDuration(el.duration || 0);
             const outro = payload?.podcast.outro_skip_sec ?? 0;

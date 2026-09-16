@@ -16,9 +16,9 @@ HIFI podcast ska låta som källan, inte som en “podcast-app” som normaliser
 | Del | Val | Varför |
 |-----|-----|--------|
 | Transport | HTTP → fil, SHA-256 | Bit-identisk källa; checksumma för integritet |
-| Decode/playback | WebView2 / Chromium `HTMLMediaElement` + Web Audio (unity gain) | Snabb, stabil Windows-MVP; Chromium avkodar MP3/M4A/AAC/OGG utan att vi skriver en andra fil |
+| Decode/playback | WebView2 `HTMLMediaElement` **direkt till systemets mixer** | Chromium avkodar MP3/M4A utan extra fil. **Inte** `createMediaElementSource` på `asset.localhost` — det ger tyst utgång (CORS nollar bufferten). |
 | Hastighet | `playbackRate` + `preservesPitch = true` | WebView2 är Chromium: time-stretch med bevarad pitch som default |
-| Skip silence | Opt-in RMS i `AnalyserNode`, seek framåt | Ingen omskrivning av media; av som default |
+| Skip silence | Opt-in: same-origin `blob:` + `AnalyserNode` | Default är av. Web Audio kopplas bara efter blob-URL, aldrig mot asset-protokollet. |
 | Output | Systemets delade läge (WASAPI shared via Chromium) | Tillräckligt för podcast-MVP; inte bit-perfect |
 
 **Begränsning att vara ärlig om:** Chromium-playern är inte foobar2000. Den gör intern decode till float (bra) men går via webbläsarens mixer, inte exclusive WASAPI. Gapless, DSD och bit-perfect är **inte** MVP.

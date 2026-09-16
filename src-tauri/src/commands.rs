@@ -278,3 +278,55 @@ pub struct PlayerPayload {
     pub download: Option<Download>,
     pub playback: Option<PlaybackState>,
 }
+
+/// Reads a downloaded original under media-root. Used only for opt-in skip-silence
+/// so playback can use a same-origin blob URL (Web Audio + asset.localhost CORS).
+#[tauri::command]
+pub fn read_media_file(state: State<AppState>, path: String) -> AppResult<Vec<u8>> {
+    read_media_file_from(state.media_root.as_path(), std::path::Path::new(&path))
+}
+
+pub(crate) fn read_media_file_from(
+    media_root: &std::path::Path,
+    path: &std::path::Path,
+) -> AppResult<Vec<u8>> {
+    let root = std::fs::canonicalize(media_root)?;
+    let file = std::fs::canonicalize(path).map_err(|_| {
+        crate::error::AppError::msg("Ljudfilen hittades inte under media-root.")
+    })?;
+    if !file.starts_with(&root) {
+        return Err(crate::error::AppError::msg("Otillåten sökväg."));
+    }
+    Ok(std::fs::read(file)?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::io::Write;
+
+    #[test]
+    fn rejects_path_outside_media_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let media = dir.path().join("media");
+        fs::create_dir_all(&media).unwrap();
+        let outside = dir.path().join("secret.bin");
+        fs::write(&outside, b"nope").unwrap();
+        let err = read_media_file_from(&media, &outside).unwrap_err();
+        assert!(err.to_string().contains("Otillåten"));
+    }
+
+    #[test]
+    fn reads_file_inside_media_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let media = dir.path().join("media");
+        fs::create_dir_all(media.join("1")).unwrap();
+        let file = media.join("1").join("1.mp3");
+        let mut f = fs::File::create(&file).unwrap();
+        f.write_all(b"ID3fake").unwrap();
+        drop(f);
+        let bytes = read_media_file_from(&media, &file).unwrap();
+        assert_eq!(bytes, b"ID3fake");
+    }
+}

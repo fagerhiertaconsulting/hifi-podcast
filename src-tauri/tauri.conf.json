@@ -21,10 +21,16 @@
       }
     ],
     "security": {
-      "csp": "default-src 'self'; img-src 'self' asset: http://asset.localhost data: blob: https:; media-src 'self' asset: http://asset.localhost blob:; style-src 'self' 'unsafe-inline'; connect-src ipc: http://ipc.localhost http://localhost:* ws://localhost:*",
+      "csp": "default-src 'self'; img-src 'self' asset: http://asset.localhost https://asset.localhost data: blob: https:; media-src 'self' asset: http://asset.localhost https://asset.localhost blob: data:; style-src 'self' 'unsafe-inline'; connect-src ipc: http://ipc.localhost http://localhost:* ws://localhost:* http://asset.localhost https://asset.localhost;",
       "assetProtocol": {
         "enable": true,
-        "scope": ["$LOCALDATA/**", "$APPDATA/**", "$TEMP/**", "$HOME/**"]
+        "scope": [
+          "$APPDATA/**",
+          "$LOCALDATA/**",
+          "$RESOURCE/**",
+          "$TEMP/**",
+          "$HOME/**"
+        ]
       }
     }
   },
