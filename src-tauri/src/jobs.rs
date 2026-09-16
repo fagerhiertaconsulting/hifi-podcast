@@ -100,7 +100,11 @@ async fn transcribe(app: &AppHandle, job_id: i64, episode_id: i64) -> AppResult<
             let _ = db::set_job_progress(
                 &conn,
                 job_id,
-                "Startar whisper-cli (CPU). Ett helt avsnitt kan ta många minuter…",
+                if asr::cli_backend(&data_dir) == "cuda" {
+                    "Startar whisper-cli på NVIDIA GPU…"
+                } else {
+                    "Startar whisper-cli (CPU). Ett helt avsnitt kan ta många minuter…"
+                },
             );
         }
         let _ = app.emit("jobs-changed", ());

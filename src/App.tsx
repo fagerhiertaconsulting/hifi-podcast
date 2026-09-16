@@ -528,7 +528,11 @@ export default function App() {
             onDownloadCli={async () => {
               setBusy(true);
               try {
-                setStatus("Laddar ner whisper-cli (Windows-zip från whisper.cpp)…");
+                setStatus(
+                  asr?.nvidia_present
+                    ? "Laddar ner whisper-cli CUDA (ca 640 MB)…"
+                    : "Laddar ner whisper-cli (Windows-zip från whisper.cpp)…",
+                );
                 setAsr(await api.downloadAsrCli());
                 setStatus("whisper-cli är nerladdad.");
               } catch (err) {

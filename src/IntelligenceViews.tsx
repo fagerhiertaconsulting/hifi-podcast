@@ -212,9 +212,9 @@ export function StatsView(props: {
       </ul>
       <h2>Jobbkö</h2>
       <p className="empty">
-        Ett Whisper-jobb i taget. <code>running</code> betyder att CPU:n arbetar — ofta
-        15–60 minuter för ett helt avsnitt. Äldre rader med error är tidigare försök
-        (saknad modell/CLI/fil).
+        Ett Whisper-jobb i taget. <code>running</code> betyder att Whisper
+        arbetar (GPU om CUDA är installerad, annars CPU). Äldre rader med error
+        är tidigare försök.
       </p>
       <ul className="hits">
         {props.jobs.slice(0, 12).map((j) => (
@@ -240,8 +240,8 @@ export function AsrSettings(props: {
     <div className="asr-box">
       <h2>Lokal ASR (whisper.cpp)</h2>
       <p>
-        Standardmodell: <code>ggml-small</code>. BYOK moln-ASR är avstängt. Språk kan
-        överstyras per podcast (auto / sv / en).
+        Standardmodell: <code>ggml-small</code>. BYOK moln-ASR är avstängt. På NVIDIA
+        hämtas CUDA-build av whisper-cli (~640 MB) i stället för CPU-zippen.
       </p>
       {props.status && (
         <>
@@ -255,6 +255,11 @@ export function AsrSettings(props: {
             <dd>
               {props.status.cli_present ? props.status.cli_path : "saknas"}
             </dd>
+            <dt>Backend</dt>
+            <dd>
+              {props.status.cli_backend}
+              {props.status.nvidia_present ? " · NVIDIA GPU hittad" : ""}
+            </dd>
             {props.pathsBin && (
               <>
                 <dt>Bin-mapp</dt>
@@ -266,7 +271,9 @@ export function AsrSettings(props: {
       )}
       <div className="row-actions">
         <button disabled={props.busy} onClick={props.onDownloadCli}>
-          Ladda ner whisper-cli
+          {props.status?.nvidia_present
+            ? "Ladda ner whisper-cli (CUDA)"
+            : "Ladda ner whisper-cli"}
         </button>
         <button disabled={props.busy} onClick={props.onDownloadModel}>
           Ladda ner ggml-small

@@ -22,7 +22,9 @@ På **Windows** laddas `whisper-cli` ner automatiskt:
 - Inställningar → **Ladda ner whisper-cli** (eller **Ladda ner allt**)
 - Första transkriberingen, om CLI saknas i `bin\` och `PATH`
 
-Zip hämtas från [ggml-org/whisper.cpp releases](https://github.com/ggml-org/whisper.cpp/releases) (`whisper-bin-x64.zip`). Exe och DLL packas ut i `bin\`.
+Om NVIDIA-GPU hittas (`nvcuda.dll`) hämtas **`whisper-cublas-12.4.0-bin-x64.zip`** (~640 MB, CUDA 12.4 + cuBLAS) i stället för CPU-zippen. CPU-build som redan ligger i `bin\` **uppgraderas inte av sig själv** — tryck på knappen igen.
+
+Zip hämtas från [ggml-org/whisper.cpp releases](https://github.com/ggml-org/whisper.cpp/releases). Exe och DLL packas ut i `bin\`.
 
 `ggml-small` är stor och hämtas **inte** tyst i bakgrunden — den kräver knappen ovan.
 
@@ -49,9 +51,11 @@ whisper-cli -m ggml-small.bin -f avsnitt.mp3 -l auto -oj -osrt -of …
 
 `-l` är `auto`, `sv` eller `en` från podcastinställningen.
 
-**CPU-tid:** `ggml-small` på ett 40-minutersavsnitt tar ofta **15–60 minuter**. Jobbet syns som `running` under Statistik → Jobbkö (inte bara “köad”). Logg: `%LOCALAPPDATA%\consulting.fagerhierta.hifi-podcast\logs\whisper-last.log`.
+**CPU-tid:** `ggml-small` på CPU för ett 40-minutersavsnitt tar ofta **15–60 minuter**. Med **CUDA** på RTX 40-serie är samma jobb ofta några minuter. I Aktivitetshanteraren: GPU-grafen **CUDA** (inte 3D) — 3D kan stå på 0 % medan CUDA arbetar.
 
-Ett Whisper-jobb körs i taget. Om appen startas om medan ett jobb hänger som `running` läggs det tillbaka i kön.
+Jobbet syns som `running` under Statistik → Jobbkö. Logg: `%LOCALAPPDATA%\consulting.fagerhierta.hifi-podcast\logs\whisper-last.log`.
+
+Ett Whisper-jobb körs i taget. Om appen startas om medan ett jobb hänger som `running` läggs det tillbaka i kön. Om CUDA-start misslyckas görs ett försök med CPU (`-ng`).
 
 ## 3. Flöde
 

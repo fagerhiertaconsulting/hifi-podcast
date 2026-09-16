@@ -139,6 +139,8 @@ export type AsrStatus = {
   model_path: string;
   cli_present: boolean;
   cli_path: string | null;
+  cli_backend: string;
+  nvidia_present: boolean;
   hint: string;
 };
 

@@ -21,6 +21,42 @@ pub fn model_path(data_dir: &Path) -> PathBuf {
     models_dir(data_dir).join(MODEL_NAME)
 }
 
+pub fn nvidia_gpu_present() -> bool {
+    #[cfg(windows)]
+    {
+        std::path::Path::new(r"C:\Windows\System32\nvcuda.dll").is_file()
+            || which::which("nvidia-smi").is_ok()
+    }
+    #[cfg(not(windows))]
+    {
+        which::which("nvidia-smi").is_ok()
+    }
+}
+
+pub fn cli_backend(data_dir: &Path) -> String {
+    let dir = bin_dir(data_dir);
+    if find_cli(data_dir).is_none() {
+        return "saknas".into();
+    }
+    let cuda_markers = [
+        "ggml-cuda.dll",
+        "cublas64_12.dll",
+        "cublas64_11.dll",
+        "cudart64_12.dll",
+        "cudart64_110.dll",
+    ];
+    if cuda_markers.iter().any(|n| dir.join(n).is_file()) {
+        return "cuda".into();
+    }
+    if let Ok(s) = std::fs::read_to_string(dir.join("hifi-backend.txt")) {
+        let t = s.trim().to_ascii_lowercase();
+        if t == "cuda" || t == "cpu" {
+            return t;
+        }
+    }
+    "cpu".into()
+}
+
 pub fn find_cli(data_dir: &Path) -> Option<PathBuf> {
     let dir = bin_dir(data_dir);
     let local_names = [
@@ -53,13 +89,30 @@ pub fn status(data_dir: &Path) -> AsrStatus {
     let cli = find_cli(data_dir);
     let model_present = model.is_file();
     let cli_present = cli.is_some();
-    let hint = match (model_present, cli_present) {
-        (true, true) => "Whisper är redo. Transkribering körs lokalt (BYOK av).".into(),
-        (false, true) => "Ladda ner ggml-small via Inställningar.".into(),
-        (true, false) => {
+    let nvidia_present = nvidia_gpu_present();
+    let backend = cli_backend(data_dir);
+    let hint = match (model_present, cli_present, backend.as_str(), nvidia_present) {
+        (true, true, "cuda", _) => {
+            "Whisper är redo med NVIDIA CUDA. Transkribering körs lokalt (BYOK av).".into()
+        }
+        (true, true, _, true) => {
+            "Whisper är redo på CPU. NVIDIA GPU hittad — Ladda ner whisper-cli igen för CUDA (~640 MB)."
+                .into()
+        }
+        (true, true, _, false) => {
+            "Whisper är redo (CPU). Transkribering körs lokalt (BYOK av).".into()
+        }
+        (false, true, _, _) => "Ladda ner ggml-small via Inställningar.".into(),
+        (true, false, _, true) => {
+            "whisper-cli saknas. Ladda ner whisper-cli (CUDA) via Inställningar.".into()
+        }
+        (true, false, _, false) => {
             "whisper-cli saknas. Använd Inställningar → Ladda ner whisper-cli.".into()
         }
-        (false, false) => {
+        (false, false, _, true) => {
+            "Ladda ner whisper-cli (CUDA) och ggml-small via Inställningar.".into()
+        }
+        (false, false, _, false) => {
             "Ladda ner whisper-cli och ggml-small via Inställningar.".into()
         }
     };
@@ -70,6 +123,8 @@ pub fn status(data_dir: &Path) -> AsrStatus {
         model_path: model.display().to_string(),
         cli_present,
         cli_path: cli.map(|p| p.display().to_string()),
+        cli_backend: backend,
+        nvidia_present,
         hint,
     }
 }
@@ -108,29 +163,43 @@ const GITHUB_RELEASES: &str =
     "https://api.github.com/repos/ggml-org/whisper.cpp/releases?per_page=20";
 const FALLBACK_WIN_X64: &str =
     "https://github.com/ggml-org/whisper.cpp/releases/download/b5130/whisper-bin-x64.zip";
+const FALLBACK_WIN_CUDA: &str =
+    "https://github.com/ggml-org/whisper.cpp/releases/download/b5130/whisper-cublas-12.4.0-bin-x64.zip";
 
-fn preferred_cli_asset() -> &'static str {
-    if cfg!(all(windows, target_arch = "aarch64")) {
-        "whisper-bin-win-cpu-arm64.zip"
+fn preferred_cli_assets() -> Vec<&'static str> {
+    if nvidia_gpu_present() {
+        vec![
+            "whisper-cublas-12.4.0-bin-x64.zip",
+            "whisper-cublas-11.8.0-bin-x64.zip",
+            "whisper-bin-x64.zip",
+        ]
+    } else if cfg!(all(windows, target_arch = "aarch64")) {
+        vec!["whisper-bin-win-cpu-arm64.zip"]
     } else {
-        "whisper-bin-x64.zip"
+        vec!["whisper-bin-x64.zip"]
     }
 }
 
 pub fn pick_release_asset_url(json: &str, asset_name: &str) -> Option<String> {
+    pick_first_asset_url(json, &[asset_name])
+}
+
+pub fn pick_first_asset_url(json: &str, asset_names: &[&str]) -> Option<String> {
     let releases: serde_json::Value = serde_json::from_str(json).ok()?;
     let items = releases.as_array()?;
-    for rel in items {
-        let Some(assets) = rel.get("assets").and_then(|a| a.as_array()) else {
-            continue;
-        };
-        for asset in assets {
-            if asset.get("name").and_then(|n| n.as_str()) == Some(asset_name) {
-                if let Some(url) = asset
-                    .get("browser_download_url")
-                    .and_then(|u| u.as_str())
-                {
-                    return Some(url.to_string());
+    for name in asset_names {
+        for rel in items {
+            let Some(assets) = rel.get("assets").and_then(|a| a.as_array()) else {
+                continue;
+            };
+            for asset in assets {
+                if asset.get("name").and_then(|n| n.as_str()) == Some(*name) {
+                    if let Some(url) = asset
+                        .get("browser_download_url")
+                        .and_then(|u| u.as_str())
+                    {
+                        return Some(url.to_string());
+                    }
                 }
             }
         }
@@ -221,19 +290,30 @@ pub async fn download_cli(data_dir: &Path) -> AppResult<PathBuf> {
     }
     let dest_dir = bin_dir(data_dir);
     tokio::fs::create_dir_all(&dest_dir).await?;
+    let names = preferred_cli_assets();
+    let fallback = if nvidia_gpu_present() {
+        FALLBACK_WIN_CUDA
+    } else {
+        FALLBACK_WIN_X64
+    };
     let client = http_client().await?;
     let url = match client.get(GITHUB_RELEASES).send().await {
         Ok(resp) if resp.status().is_success() => {
             let body = resp.text().await.unwrap_or_default();
-            pick_release_asset_url(&body, preferred_cli_asset())
-                .unwrap_or_else(|| FALLBACK_WIN_X64.to_string())
+            pick_first_asset_url(&body, &names).unwrap_or_else(|| fallback.to_string())
         }
-        _ => FALLBACK_WIN_X64.to_string(),
+        _ => fallback.to_string(),
     };
     let zip_path = dest_dir.join("whisper-cli-download.zip");
     download_to_file(&url, &zip_path).await?;
     extract_cli_zip(&zip_path, &dest_dir)?;
     let _ = tokio::fs::remove_file(&zip_path).await;
+    let backend = if url.contains("cublas") || url.contains("cuda") {
+        "cuda"
+    } else {
+        "cpu"
+    };
+    let _ = tokio::fs::write(dest_dir.join("hifi-backend.txt"), backend).await;
     find_cli(data_dir).ok_or_else(|| {
         AppError::msg("whisper-cli.exe hittades inte efter uppackning.")
     })
@@ -244,6 +324,80 @@ pub async fn ensure_cli(data_dir: &Path) -> AppResult<PathBuf> {
         return Ok(existing);
     }
     download_cli(data_dir).await
+}
+
+async fn run_whisper_cli(
+    cli: &Path,
+    data_dir: &Path,
+    model: &Path,
+    audio: &Path,
+    lang: &str,
+    prefix: &Path,
+    use_gpu: bool,
+    progress: &Option<tokio::sync::mpsc::UnboundedSender<String>>,
+    log: &mut tokio::fs::File,
+) -> AppResult<std::process::ExitStatus> {
+    let mut cmd = tokio::process::Command::new(cli);
+    cmd.current_dir(bin_dir(data_dir))
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .arg("-m")
+        .arg(model)
+        .arg("-f")
+        .arg(audio)
+        .arg("-l")
+        .arg(lang);
+    if !use_gpu {
+        cmd.arg("-ng");
+    }
+    cmd.arg("-pp")
+        .arg("-oj")
+        .arg("-osrt")
+        .arg("-of")
+        .arg(prefix)
+        .kill_on_drop(true);
+    #[cfg(windows)]
+    {
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    let mut child = cmd.spawn().map_err(|e| {
+        AppError::msg(format!(
+            "Kunde inte starta whisper-cli ({e}). Kontrollera att DLL-filer ligger i {}.",
+            bin_dir(data_dir).display()
+        ))
+    })?;
+    if let Some(out) = child.stdout.take() {
+        tokio::spawn(async move {
+            use tokio::io::AsyncReadExt;
+            let mut r = out;
+            let mut buf = [0u8; 8192];
+            loop {
+                match r.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {}
+                }
+            }
+        });
+    }
+    if let Some(err) = child.stderr.take() {
+        use tokio::io::AsyncBufReadExt;
+        let mut lines = tokio::io::BufReader::new(err).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            let _ = log.write_all(line.as_bytes()).await;
+            let _ = log.write_all(b"\n").await;
+            if let Some(tx) = progress {
+                if line_looks_useful(&line) {
+                    let _ = tx.send(line);
+                }
+            }
+        }
+    }
+    child
+        .wait()
+        .await
+        .map_err(|e| AppError::msg(format!("whisper-cli avbröts: {e}")))
 }
 
 pub async fn transcribe_file(
@@ -278,73 +432,49 @@ pub async fn transcribe_file(
     tokio::fs::create_dir_all(&logs).await?;
     let log_path = logs.join("whisper-last.log");
     let mut log = tokio::fs::File::create(&log_path).await?;
+    let want_gpu = cli_backend(data_dir) == "cuda";
     let header = format!(
-        "cli={} model={} audio={}\n",
+        "cli={} model={} audio={} backend={} gpu={}\n",
         cli.display(),
         model.display(),
-        audio.display()
+        audio.display(),
+        cli_backend(data_dir),
+        want_gpu
     );
     log.write_all(header.as_bytes()).await?;
 
-    let mut cmd = tokio::process::Command::new(&cli);
-    cmd.current_dir(bin_dir(data_dir))
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .env("GGML_VK_VISIBLE_DEVICES", "")
-        .arg("-m")
-        .arg(&model)
-        .arg("-f")
-        .arg(audio)
-        .arg("-l")
-        .arg(lang)
-        .arg("-ng")
-        .arg("-pp")
-        .arg("-oj")
-        .arg("-osrt")
-        .arg("-of")
-        .arg(&prefix)
-        .kill_on_drop(true);
-    #[cfg(windows)]
-    {
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        cmd.creation_flags(CREATE_NO_WINDOW);
-    }
-    let mut child = cmd.spawn().map_err(|e| {
-        AppError::msg(format!(
-            "Kunde inte starta whisper-cli ({e}). Kontrollera att DLL-filer ligger i {}.",
-            bin_dir(data_dir).display()
-        ))
-    })?;
-    if let Some(out) = child.stdout.take() {
-        tokio::spawn(async move {
-            use tokio::io::AsyncReadExt;
-            let mut r = out;
-            let mut buf = [0u8; 8192];
-            loop {
-                match r.read(&mut buf).await {
-                    Ok(0) | Err(_) => break,
-                    Ok(_) => {}
-                }
-            }
-        });
-    }
-    if let Some(err) = child.stderr.take() {
-        use tokio::io::AsyncBufReadExt;
-        let mut lines = tokio::io::BufReader::new(err).lines();
-        while let Ok(Some(line)) = lines.next_line().await {
-            let _ = log.write_all(line.as_bytes()).await;
-            let _ = log.write_all(b"\n").await;
-            if let Some(tx) = &progress {
-                if line_looks_useful(&line) {
-                    let _ = tx.send(line);
-                }
-            }
+    let mut status = run_whisper_cli(
+        &cli,
+        data_dir,
+        &model,
+        audio,
+        lang,
+        &prefix,
+        want_gpu,
+        &progress,
+        &mut log,
+    )
+    .await?;
+    if !status.success() && want_gpu {
+        let _ = log
+            .write_all(b"\n--- GPU failed, retrying CPU (-ng) ---\n")
+            .await;
+        if let Some(tx) = &progress {
+            let _ = tx.send("GPU misslyckades, faller tillbaka till CPU…".into());
         }
+        status = run_whisper_cli(
+            &cli,
+            data_dir,
+            &model,
+            audio,
+            lang,
+            &prefix,
+            false,
+            &progress,
+            &mut log,
+        )
+        .await?;
     }
-    let status = child.wait().await.map_err(|e| {
-        AppError::msg(format!("whisper-cli avbröts: {e}"))
-    })?;
     drop(progress);
     if !status.success() {
         let tail = tokio::fs::read_to_string(&log_path)
@@ -381,7 +511,9 @@ fn line_looks_useful(line: &str) -> bool {
         || l.contains("whisper_")
         || l.contains("system_info")
         || l.contains("error")
-        || l.contains("n_len")
+        || l.contains("cuda")
+        || l.contains("gpu")
+        || l.contains("device")
 }
 
 async fn read_whisper_outputs(
@@ -448,6 +580,25 @@ mod tests {
         assert_eq!(
             pick_release_asset_url(json, "whisper-bin-x64.zip").as_deref(),
             Some("https://github.com/ggml-org/whisper.cpp/releases/download/b5130/whisper-bin-x64.zip")
+        );
+    }
+
+    #[test]
+    fn prefers_cublas_zip_when_listed_first() {
+        let json = r#"[{"assets":[
+            {"name":"whisper-bin-x64.zip","browser_download_url":"https://cpu"},
+            {"name":"whisper-cublas-12.4.0-bin-x64.zip","browser_download_url":"https://cuda"}
+        ]}]"#;
+        assert_eq!(
+            pick_first_asset_url(
+                json,
+                &[
+                    "whisper-cublas-12.4.0-bin-x64.zip",
+                    "whisper-bin-x64.zip"
+                ]
+            )
+            .as_deref(),
+            Some("https://cuda")
         );
     }
 

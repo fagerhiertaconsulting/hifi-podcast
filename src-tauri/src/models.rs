@@ -163,6 +163,8 @@ pub struct AsrStatus {
     pub model_path: String,
     pub cli_present: bool,
     pub cli_path: Option<String>,
+    pub cli_backend: String,
+    pub nvidia_present: bool,
     pub hint: String,
 }
 
