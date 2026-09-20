@@ -42,27 +42,43 @@ pub fn from_content_type(content_type: &str, fallback_path: Option<&std::path::P
         .trim()
         .to_ascii_lowercase();
     if primary.starts_with("audio/") {
-        return normalize_audio_mime(&primary);
+        let normalized = normalize_audio_mime(&primary);
+        if is_allowed_media_mime(&normalized) {
+            return normalized;
+        }
     }
     if primary == "video/mp4" || primary == "application/mp4" {
         return "audio/mp4".into();
     }
-    if let Some(path) = fallback_path {
-        let from_ext = from_path(path);
-        if from_ext != "application/octet-stream" {
-            return from_ext.to_string();
+    fallback_path
+        .map(from_path)
+        .unwrap_or("application/octet-stream")
+        .to_string()
+}
+
+/// MIME we will store/serve from `download.mime` (plus octet-stream fallback).
+pub fn is_allowed_media_mime(mime: &str) -> bool {
+    is_known_renderer_audio(mime)
+}
+
+pub fn for_serving(stored: Option<&str>, path: &std::path::Path) -> String {
+    if let Some(mime) = stored
+        .map(str::trim)
+        .filter(|m| !m.is_empty())
+        .map(|m| m.to_ascii_lowercase())
+    {
+        if is_allowed_media_mime(&mime) {
+            return mime;
+        }
+        if mime == "application/octet-stream" || mime == "binary/octet-stream" {
+            let from_ext = from_path(path);
+            if from_ext != "application/octet-stream" {
+                return from_ext.to_string();
+            }
+            return "application/octet-stream".into();
         }
     }
-    if primary.is_empty()
-        || primary == "application/octet-stream"
-        || primary == "binary/octet-stream"
-    {
-        return fallback_path
-            .map(from_path)
-            .unwrap_or("application/octet-stream")
-            .to_string();
-    }
-    primary
+    from_path(path).to_string()
 }
 
 fn normalize_audio_mime(mime: &str) -> String {
@@ -141,6 +157,22 @@ mod tests {
             "audio/flac"
         );
         assert_eq!(from_content_type("audio/x-m4a", None), "audio/mp4");
+        assert_eq!(
+            from_content_type("text/html", Some(Path::new("ep.mp3"))),
+            "audio/mpeg"
+        );
+        assert_eq!(
+            from_content_type("application/javascript", None),
+            "application/octet-stream"
+        );
+        assert_eq!(
+            for_serving(Some("text/html"), Path::new("ep.flac")),
+            "audio/flac"
+        );
+        assert_eq!(
+            for_serving(Some("audio/mpeg"), Path::new("ep.flac")),
+            "audio/mpeg"
+        );
     }
 
     #[test]

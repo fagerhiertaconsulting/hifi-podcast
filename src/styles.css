@@ -305,3 +305,8 @@ textarea {
 .upnp-panel input {
   min-width: 16rem;
 }
+
+.upnp-warn {
+  color: var(--danger) !important;
+  font-size: 0.9rem;
+}

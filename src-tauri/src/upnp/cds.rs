@@ -85,10 +85,7 @@ fn container_xml(id: &str, parent: &str, title: &str, child_count: i64, class: &
 }
 
 pub fn episode_mime(ep: &UpnpEpisode) -> String {
-    if let Some(mime) = ep.mime.as_deref().filter(|m| !m.is_empty()) {
-        return mime.to_string();
-    }
-    media_mime::from_path(Path::new(&ep.file_path)).to_string()
+    media_mime::for_serving(ep.mime.as_deref(), Path::new(&ep.file_path))
 }
 
 fn item_xml(ep: &UpnpEpisode, public_base: &str) -> String {

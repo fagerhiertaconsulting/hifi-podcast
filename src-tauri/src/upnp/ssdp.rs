@@ -65,9 +65,10 @@ pub fn parse_msearch(buf: &[u8]) -> Option<MSearch> {
             man_ok = true;
         }
     }
-    let st = st?;
-    let _ = man_ok;
-    Some(MSearch { st })
+    if !man_ok {
+        return None;
+    }
+    Some(MSearch { st: st? })
 }
 
 /// True when this MediaServer should answer `st`.
@@ -123,6 +124,7 @@ pub async fn run_ssdp(
     location: String,
     uuid: String,
     lan_ip: Ipv4Addr,
+    ssdp_listen: Ipv4Addr,
     mut shutdown: watch::Receiver<bool>,
 ) {
     let send_sock = match UdpSocket::bind(SocketAddr::from((lan_ip, 0))).await {
@@ -135,7 +137,7 @@ pub async fn run_ssdp(
     let _ = send_sock.set_broadcast(true);
     let _ = send_sock.join_multicast_v4(SSDP_HOST, lan_ip);
 
-    let recv_sock = bind_ssdp_listener(lan_ip).await;
+    let recv_sock = bind_ssdp_listener(ssdp_listen, lan_ip).await;
     for _ in 0..3 {
         send_notifies(&send_sock, &location, &uuid, "ssdp:alive").await;
         time::sleep(Duration::from_millis(400)).await;
@@ -177,8 +179,8 @@ pub async fn run_ssdp(
     }
 }
 
-async fn bind_ssdp_listener(lan_ip: Ipv4Addr) -> Option<UdpSocket> {
-    let addr = SocketAddr::from((Ipv4Addr::UNSPECIFIED, SSDP_PORT));
+async fn bind_ssdp_listener(ssdp_listen: Ipv4Addr, lan_ip: Ipv4Addr) -> Option<UdpSocket> {
+    let addr = SocketAddr::from((ssdp_listen, SSDP_PORT));
     let socket = socket2::Socket::new(
         socket2::Domain::IPV4,
         socket2::Type::DGRAM,
@@ -246,5 +248,14 @@ mod tests {
     #[test]
     fn ignores_non_search() {
         assert!(parse_msearch(b"NOTIFY * HTTP/1.1\r\nNT: upnp:rootdevice\r\n\r\n").is_none());
+    }
+
+    #[test]
+    fn ignores_msearch_without_ssdp_discover_man() {
+        let missing =
+            b"M-SEARCH * HTTP/1.1\r\nHOST: 239.255.255.250:1900\r\nMX: 3\r\nST: ssdp:all\r\n\r\n";
+        assert!(parse_msearch(missing).is_none());
+        let wrong = b"M-SEARCH * HTTP/1.1\r\nMAN: \"ssdp:alive\"\r\nST: ssdp:all\r\n\r\n";
+        assert!(parse_msearch(wrong).is_none());
     }
 }

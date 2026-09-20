@@ -270,11 +270,7 @@ async fn serve_episode(
         _ => return StatusCode::NOT_FOUND.into_response(),
     };
     let file_len = meta.len();
-    let mime = episode
-        .mime
-        .clone()
-        .filter(|m| !m.is_empty())
-        .unwrap_or_else(|| media_mime::from_path(&path).to_string());
+    let mime = media_mime::for_serving(episode.mime.as_deref(), &path);
 
     let range_header = headers
         .get(header::RANGE)

@@ -224,4 +224,20 @@ mod tests {
                     .unwrap_or(true)
         );
     }
+
+    #[test]
+    fn skips_move_when_destination_already_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let media = dir.path().join("media");
+        let old = media.join("4");
+        std::fs::create_dir_all(&old).unwrap();
+        std::fs::write(old.join("8.mp3"), b"OLD").unwrap();
+        let dest = media.join("podcasts").join("4");
+        std::fs::create_dir_all(&dest).unwrap();
+        std::fs::write(dest.join("8.mp3"), b"KEEP").unwrap();
+        let moved = ensure_media_layout(&media).unwrap();
+        assert!(moved.is_empty());
+        assert_eq!(std::fs::read(old.join("8.mp3")).unwrap(), b"OLD");
+        assert_eq!(std::fs::read(dest.join("8.mp3")).unwrap(), b"KEEP");
+    }
 }

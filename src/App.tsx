@@ -1175,6 +1175,12 @@ function UpnpSettingsPanel(props: { onStatus: (s: string) => void }) {
   };
 
   const start = async () => {
+    if (bind.trim() === "0.0.0.0") {
+      const ok = window.confirm(
+        "Du har valt 0.0.0.0. Mediaservern lyssnar då på alla nätverksgränssnitt och biblioteket kan nås utanför LAN om nätverket tillåter det. Fortsätt?",
+      );
+      if (!ok) return;
+    }
     setBusy(true);
     try {
       await api.saveUpnpSettings({ bind: bind.trim(), port });
@@ -1214,13 +1220,19 @@ function UpnpSettingsPanel(props: { onStatus: (s: string) => void }) {
         <strong>Podcasts</strong> och spelar originalfilerna. Mappen{" "}
         <strong>Music</strong> är tom tills musikmodulen finns. Ingen omkodning.
       </p>
+      <p className="upnp-warn">
+        Servern är bara för ett <strong>betrott hemmanät (LAN)</strong>. SOAP, katalog
+        och mediafiler har ingen inloggning (normalt för DLNA). Starta den bara när
+        receivern ska spela, och stoppa den efteråt. Den lyssnar inte på internet som
+        standard.
+      </p>
       <div className="settings-grid">
         <label>
           Bindningsadress
           <input
             value={bind}
             onChange={(e) => setBind(e.target.value)}
-            placeholder="Tom = LAN-gränssnitt (0.0.0.0)"
+            placeholder="Tom = upptäckt LAN-IPv4"
             spellCheck={false}
           />
         </label>
@@ -1235,6 +1247,19 @@ function UpnpSettingsPanel(props: { onStatus: (s: string) => void }) {
           />
         </label>
       </div>
+      {bind.trim() === "0.0.0.0" ? (
+        <p className="upnp-warn">
+          Du har valt <strong>0.0.0.0</strong> (alla nätverksgränssnitt). Biblioteket
+          kan då nås även utanför LAN om brandvägg eller routing tillåter det. Använd
+          det bara medvetet. Lämna fältet tomt för att binda enbart till upptäckt
+          LAN-IPv4.
+        </p>
+      ) : (
+        <p className="sidebar-note">
+          Tom bindningsadress = HTTP och SSDP (UDP 1900) på upptäckt LAN-IPv4, inte
+          0.0.0.0. Skriv 0.0.0.0 bara om du medvetet vill lyssna på alla gränssnitt.
+        </p>
+      )}
       <div className="row-actions">
         <button onClick={() => void save()} disabled={busy}>
           Spara
@@ -1250,7 +1275,7 @@ function UpnpSettingsPanel(props: { onStatus: (s: string) => void }) {
         {status?.running
           ? `Igång på ${status.location ?? `${status.bind}:${status.port}`}${
               status.lan_ip ? ` (LAN ${status.lan_ip})` : ""
-            }.`
+            } — lyssnar på ${status.bind}:${status.port}.`
           : `Stoppad. Standardport 8200. Upptäckt LAN: ${status?.lan_ip ?? "okänt"}.`}
         {status?.error ? ` Fel: ${status.error}` : ""}
       </p>

@@ -166,6 +166,15 @@ pub fn rewrite_legacy_download_paths(
     let mut n = 0u64;
     for (episode_id, path) in rows {
         if let Some(mapped) = crate::download::remap_legacy_file_path(media_root, &path) {
+            let old_exists = std::path::Path::new(&path).is_file();
+            let mapped_exists = std::path::Path::new(&mapped).is_file();
+            // Collision or skipped move: keep the path that still has the file.
+            if old_exists && mapped_exists {
+                continue;
+            }
+            if old_exists && !mapped_exists {
+                continue;
+            }
             conn.execute(
                 "UPDATE download SET file_path = ?1 WHERE episode_id = ?2",
                 params![mapped, episode_id],
@@ -1467,6 +1476,43 @@ mod tests {
             get_download(&conn, eid).unwrap().unwrap().mime.as_deref(),
             Some("audio/mp4")
         );
+    }
+
+    #[test]
+    fn rewrite_skips_when_legacy_file_was_not_moved() {
+        let dir = tempfile::tempdir().unwrap();
+        let media = dir.path().join("media");
+        let dest_dir = media.join("podcasts").join("1");
+        std::fs::create_dir_all(media.join("1")).unwrap();
+        std::fs::create_dir_all(&dest_dir).unwrap();
+        let legacy = media.join("1").join("1.mp3");
+        std::fs::write(&legacy, b"OLD").unwrap();
+        std::fs::write(dest_dir.join("1.mp3"), b"NEW").unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        initialize(&conn).unwrap();
+        let pid = upsert_podcast(&conn, "https://e/x", "S", None, None, None, None).unwrap();
+        let eid = upsert_episode(&conn, pid, "g", "E", None, None, None, None).unwrap();
+        upsert_download_state(
+            &conn,
+            eid,
+            "done",
+            Some(&legacy.display().to_string()),
+            Some(1),
+            None,
+            None,
+            Some("t"),
+            Some("audio/mpeg"),
+        )
+        .unwrap();
+        assert_eq!(rewrite_legacy_download_paths(&conn, &media).unwrap(), 0);
+        let kept = get_download(&conn, eid)
+            .unwrap()
+            .unwrap()
+            .file_path
+            .unwrap();
+        assert_eq!(kept, legacy.display().to_string());
+        assert!(!kept.contains("podcasts"));
     }
 
     #[test]

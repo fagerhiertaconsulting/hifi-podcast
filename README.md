@@ -66,7 +66,7 @@ v1 (lokal intelligens) finns i appen: se [docs/v1-asr.md](docs/v1-asr.md).
 
 ### UPnP/DLNA-mediaserver (Windows + Onkyo)
 
-Inställningar → **UPnP/DLNA-mediaserver** → **Starta mediaserver** (port 8200). Receivern ska se **HIFI podcast** och bläddra `Podcasts`. Originalfiler streamas med HTTP Range; ingen omkodning.
+Inställningar → **UPnP/DLNA-mediaserver** → **Starta mediaserver** (port 8200). Tom bind = upptäckt LAN-IPv4, inte `0.0.0.0`. Ingen autentisering (DLNA); bara för betrott LAN. Receivern ska se **HIFI podcast** och bläddra `Podcasts`. Originalfiler streamas med HTTP Range; ingen omkodning.
 
 **Brandvägg:** tillåt appen på privat nätverk när Windows frågar (inget admin-krav för att starta servern). Om Onkyo inte hittar den: inbound **TCP 8200** (eller vald port) och **UDP 1900** (SSDP) på den privata profilen. Steg-för-steg: [docs/upnp-mediaserver.md](docs/upnp-mediaserver.md).
 

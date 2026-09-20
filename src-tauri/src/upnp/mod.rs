@@ -74,13 +74,12 @@ impl Handle {
         }
 
         let lan = resolve_lan_ip(&settings.bind)?;
-        let listen_ip: IpAddr = if settings.bind.trim().is_empty() {
-            IpAddr::V4(Ipv4Addr::UNSPECIFIED)
-        } else {
-            settings
-                .bind
-                .parse()
-                .map_err(|_| AppError::msg("Ogiltig bindningsadress."))?
+        let listen_ip = listen_ip_for_bind(&settings.bind, lan)?;
+        let ssdp_listen = match listen_ip {
+            IpAddr::V4(ip) => ip,
+            IpAddr::V6(_) => {
+                return Err(AppError::msg("Endast IPv4 stöds i den här versionen."));
+            }
         };
         let addr = SocketAddr::new(listen_ip, settings.port);
         let public_base = format!("http://{lan}:{}", settings.port);
@@ -112,16 +111,12 @@ impl Handle {
         let loc = location.clone();
         let uuid_ssdp = uuid.clone();
         tauri::async_runtime::spawn(async move {
-            ssdp::run_ssdp(loc, uuid_ssdp, lan, rx_ssdp).await;
+            ssdp::run_ssdp(loc, uuid_ssdp, lan, ssdp_listen, rx_ssdp).await;
         });
 
         let status = UpnpStatus {
             running: true,
-            bind: if settings.bind.trim().is_empty() {
-                "0.0.0.0".into()
-            } else {
-                settings.bind.clone()
-            },
+            bind: listen_ip.to_string(),
             port: settings.port,
             location: Some(location),
             lan_ip: Some(lan.to_string()),
@@ -150,7 +145,7 @@ pub fn default_lan_ipv4() -> Option<Ipv4Addr> {
 
 fn resolve_lan_ip(bind: &str) -> AppResult<Ipv4Addr> {
     let trimmed = bind.trim();
-    if trimmed.is_empty() || trimmed == "0.0.0.0" {
+    if trimmed.is_empty() || is_unspecified_v4(trimmed) {
         return default_lan_ipv4().ok_or_else(|| {
             AppError::msg(
                 "Kunde inte avgöra LAN-adress. Ange bindningsadress manuellt (PC:ns IPv4).",
@@ -164,6 +159,27 @@ fn resolve_lan_ip(bind: &str) -> AppResult<Ipv4Addr> {
     }
 }
 
+/// Empty/default bind listens only on the detected LAN IPv4.
+/// `0.0.0.0` is all interfaces and must be requested explicitly.
+fn listen_ip_for_bind(bind: &str, lan: Ipv4Addr) -> AppResult<IpAddr> {
+    let trimmed = bind.trim();
+    if trimmed.is_empty() {
+        return Ok(IpAddr::V4(lan));
+    }
+    if is_unspecified_v4(trimmed) {
+        return Ok(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+    }
+    match trimmed.parse::<IpAddr>() {
+        Ok(IpAddr::V4(ip)) => Ok(IpAddr::V4(ip)),
+        Ok(IpAddr::V6(_)) => Err(AppError::msg("Endast IPv4 stöds i den här versionen.")),
+        Err(_) => Err(AppError::msg("Ogiltig bindningsadress.")),
+    }
+}
+
+fn is_unspecified_v4(bind: &str) -> bool {
+    matches!(bind.parse::<IpAddr>(), Ok(IpAddr::V4(ip)) if ip.is_unspecified())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -172,5 +188,25 @@ mod tests {
     fn rejects_ipv6_bind() {
         let err = resolve_lan_ip("::1").unwrap_err();
         assert!(err.to_string().contains("IPv4"));
+    }
+
+    #[test]
+    fn empty_bind_listens_on_lan_not_all_interfaces() {
+        let lan = Ipv4Addr::new(192, 168, 1, 9);
+        assert_eq!(listen_ip_for_bind("", lan).unwrap(), IpAddr::V4(lan));
+        assert_eq!(listen_ip_for_bind("  ", lan).unwrap(), IpAddr::V4(lan));
+    }
+
+    #[test]
+    fn unspecified_bind_is_opt_in() {
+        let lan = Ipv4Addr::new(10, 0, 0, 4);
+        assert_eq!(
+            listen_ip_for_bind("0.0.0.0", lan).unwrap(),
+            IpAddr::V4(Ipv4Addr::UNSPECIFIED)
+        );
+        assert_eq!(
+            listen_ip_for_bind("192.168.1.20", lan).unwrap(),
+            IpAddr::V4(Ipv4Addr::new(192, 168, 1, 20))
+        );
     }
 }
