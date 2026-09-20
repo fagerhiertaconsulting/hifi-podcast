@@ -185,3 +185,15 @@ pub struct InboxItem {
     pub podcast_title: String,
     pub download_state: Option<String>,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubscribeOutcome {
+    pub podcast: Podcast,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImportOutcome {
+    pub podcasts: Vec<Podcast>,
+    pub warnings: Vec<String>,
+}

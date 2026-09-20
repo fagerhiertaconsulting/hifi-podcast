@@ -17,16 +17,18 @@ Appen letar i denna ordning:
 1. `%LOCALAPPDATA%\consulting.fagerhierta.hifi-podcast\bin\whisper-cli.exe`
 2. `whisper-cli` / `whisper-cli.exe` i `PATH`
 
-På **Windows** laddas `whisper-cli` ner automatiskt:
+På **Windows** hämtas `whisper-cli` **bara** via Inställningar:
 
-- Inställningar → **Ladda ner whisper-cli** (eller **Ladda ner allt**)
-- Första transkriberingen, om CLI saknas i `bin\` och `PATH`
+- Inställningar → **Ladda ner whisper-cli** (eller **Ladda ner allt**), efter bekräftelse
+- CUDA-zippen (~640 MB) laddas **aldrig** ner i bakgrunden vid prenumeration, avsnittsnedladdning eller transkribering
 
-Om NVIDIA-GPU hittas (`nvcuda.dll`) hämtas **`whisper-cublas-12.4.0-bin-x64.zip`** (~640 MB, CUDA 12.4 + cuBLAS) i stället för CPU-zippen. CPU-build som redan ligger i `bin\` **uppgraderas inte av sig själv** — tryck på knappen igen.
+Om NVIDIA-GPU hittas (`nvcuda.dll`) hämtas **`whisper-cublas-12.4.0-bin-x64.zip`** (~640 MB, CUDA 12.4 + cuBLAS) i stället för CPU-zippen när du trycker på knappen. CPU-build som redan ligger i `bin\` **uppgraderas inte av sig själv** — tryck på knappen igen.
 
 Zip hämtas från [ggml-org/whisper.cpp releases](https://github.com/ggml-org/whisper.cpp/releases). Exe och DLL packas ut i `bin\`.
 
-`ggml-small` är stor och hämtas **inte** tyst i bakgrunden — den kräver knappen ovan.
+`ggml-small` (~466 MB) hämtas **inte** tyst. SHA-256 verifieras mot Hugging Face-digest; vid mismatch raderas filen och nedladdningen misslyckas.
+
+**Auto-transkribera** är avstängd som standard för nya podcasts.
 
 ### PowerShell (manuellt)
 
@@ -97,4 +99,4 @@ Först inbäddade ID3-kapitel. Annars genererade från transkriptluckor / ~6 min
 
 ## 5. Reklam
 
-Frasheuristik + tystnadsluckor. **Skip** under playback. Cut-läge är v2.
+Frasheuristik (specifika sponsorfraser, t.ex. «sponsrad av», «i samarbete med», «this podcast is sponsored») plus tystnadsluckor. Den ensamma frasen «reklam» matchas **inte**, för att undvika falska träffar i vanligt tal. **Skip** under playback. Cut-läge är v2.

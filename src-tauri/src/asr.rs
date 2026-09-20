@@ -8,6 +8,9 @@ use tokio::io::AsyncWriteExt;
 pub const MODEL_NAME: &str = "ggml-small.bin";
 pub const MODEL_URL: &str =
     "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.bin";
+/// Hugging Face LFS SHA-256 for ggml-small.bin (ggerganov/whisper.cpp).
+pub const MODEL_SHA256: &str =
+    "1be3a9b2063867b937e64e2ec7483364a79917e157fa98c5d94b5c1fffea987b";
 
 pub fn models_dir(data_dir: &Path) -> PathBuf {
     data_dir.join("models")
@@ -132,31 +135,46 @@ pub fn status(data_dir: &Path) -> AsrStatus {
 pub async fn download_model(data_dir: &Path) -> AppResult<PathBuf> {
     let dest = model_path(data_dir);
     tokio::fs::create_dir_all(models_dir(data_dir)).await?;
-    let tmp = dest.with_extension("bin.part");
-    let client = reqwest::Client::builder()
-        .user_agent("HIFI-podcast/0.1")
-        .build()?;
-    let response = client.get(MODEL_URL).send().await?;
-    if !response.status().is_success() {
-        return Err(AppError::msg(format!(
-            "Kunde inte hämta modell (HTTP {}).",
-            response.status()
-        )));
+    if dest.is_file() {
+        match verify_file_sha256(&dest, MODEL_SHA256).await {
+            Ok(()) => return Ok(dest),
+            Err(_) => {
+                tokio::fs::remove_file(&dest).await.ok();
+            }
+        }
     }
+    let client = crate::net::http_client()?;
     let mut hasher = Sha256::new();
-    let mut file = tokio::fs::File::create(&tmp).await?;
-    use futures_util::StreamExt;
-    let mut stream = response.bytes_stream();
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk?;
-        hasher.update(&chunk);
-        file.write_all(&chunk).await?;
+    crate::net::download_to_path(
+        &client,
+        MODEL_URL,
+        &dest,
+        crate::net::MAX_MODEL_BYTES,
+        Some(&mut hasher),
+    )
+    .await?;
+    let digest = hex::encode(hasher.finalize());
+    if let Err(err) = verify_digest(&digest, MODEL_SHA256) {
+        let _ = tokio::fs::remove_file(&dest).await;
+        return Err(err);
     }
-    file.flush().await?;
-    drop(file);
-    let _digest = hex::encode(hasher.finalize());
-    tokio::fs::rename(&tmp, &dest).await?;
     Ok(dest)
+}
+
+pub fn verify_digest(digest: &str, expected: &str) -> AppResult<()> {
+    if digest.eq_ignore_ascii_case(expected) {
+        Ok(())
+    } else {
+        Err(AppError::msg(format!(
+            "SHA-256 stämmer inte för {MODEL_NAME}. Förväntat {expected}, fick {digest}. Filen raderas. Försök ladda ner igen."
+        )))
+    }
+}
+
+async fn verify_file_sha256(path: &Path, expected: &str) -> AppResult<()> {
+    let data = tokio::fs::read(path).await?;
+    let digest = hex::encode(Sha256::digest(&data));
+    verify_digest(&digest, expected)
 }
 
 const GITHUB_RELEASES: &str =
@@ -208,34 +226,12 @@ pub fn pick_first_asset_url(json: &str, asset_names: &[&str]) -> Option<String> 
 }
 
 async fn http_client() -> AppResult<reqwest::Client> {
-    Ok(reqwest::Client::builder()
-        .user_agent("HIFI-podcast/0.1 (+https://github.com/fagerhiertaconsulting/hifi-podcast)")
-        .redirect(reqwest::redirect::Policy::limited(10))
-        .build()?)
+    crate::net::http_client()
 }
 
 async fn download_to_file(url: &str, dest: &Path) -> AppResult<()> {
-    if let Some(parent) = dest.parent() {
-        tokio::fs::create_dir_all(parent).await?;
-    }
     let client = http_client().await?;
-    let response = client.get(url).send().await?;
-    if !response.status().is_success() {
-        return Err(AppError::msg(format!(
-            "Nedladdning misslyckades (HTTP {}) för {url}",
-            response.status()
-        )));
-    }
-    let tmp = dest.with_extension("part");
-    let mut file = tokio::fs::File::create(&tmp).await?;
-    use futures_util::StreamExt;
-    let mut stream = response.bytes_stream();
-    while let Some(chunk) = stream.next().await {
-        file.write_all(&chunk?).await?;
-    }
-    file.flush().await?;
-    drop(file);
-    tokio::fs::rename(tmp, dest).await?;
+    crate::net::download_to_path(&client, url, dest, crate::net::MAX_MODEL_BYTES, None).await?;
     Ok(())
 }
 
@@ -297,12 +293,14 @@ pub async fn download_cli(data_dir: &Path) -> AppResult<PathBuf> {
         FALLBACK_WIN_X64
     };
     let client = http_client().await?;
-    let url = match client.get(GITHUB_RELEASES).send().await {
-        Ok(resp) if resp.status().is_success() => {
-            let body = resp.text().await.unwrap_or_default();
+    let url = match crate::net::get_limited(&client, GITHUB_RELEASES, crate::net::MAX_FEED_BYTES)
+        .await
+    {
+        Ok(body) => {
+            let body = String::from_utf8_lossy(&body);
             pick_first_asset_url(&body, &names).unwrap_or_else(|| fallback.to_string())
         }
-        _ => fallback.to_string(),
+        Err(_) => fallback.to_string(),
     };
     let zip_path = dest_dir.join("whisper-cli-download.zip");
     download_to_file(&url, &zip_path).await?;
@@ -319,11 +317,12 @@ pub async fn download_cli(data_dir: &Path) -> AppResult<PathBuf> {
     })
 }
 
-pub async fn ensure_cli(data_dir: &Path) -> AppResult<PathBuf> {
-    if let Some(existing) = find_cli(data_dir) {
-        return Ok(existing);
-    }
-    download_cli(data_dir).await
+pub fn require_cli(data_dir: &Path) -> AppResult<PathBuf> {
+    find_cli(data_dir).ok_or_else(|| {
+        AppError::msg(
+            "whisper-cli saknas. Ladda ner den via Inställningar (CUDA-zip är ca 640 MB). Appen hämtar den aldrig automatiskt.",
+        )
+    })
 }
 
 async fn run_whisper_cli(
@@ -406,7 +405,7 @@ pub async fn transcribe_file(
     language: &str,
     progress: Option<tokio::sync::mpsc::UnboundedSender<String>>,
 ) -> AppResult<(Vec<Segment>, String)> {
-    let cli = ensure_cli(data_dir).await?;
+    let cli = require_cli(data_dir)?;
     let model = model_path(data_dir);
     if !model.is_file() {
         return Err(AppError::msg("ggml-small.bin saknas. Ladda ner modellen först."));
@@ -625,5 +624,12 @@ mod tests {
         );
         assert!(dest.join("ggml.dll").is_file());
         assert!(find_cli(dir.path()).is_some());
+    }
+
+    #[test]
+    fn sha256_fails_closed_on_mismatch() {
+        let err = verify_digest("abcd", MODEL_SHA256).unwrap_err();
+        assert!(err.to_string().contains("SHA-256"));
+        assert!(verify_digest(MODEL_SHA256, MODEL_SHA256).is_ok());
     }
 }

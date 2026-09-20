@@ -25,6 +25,9 @@ pub fn initialize(conn: &Connection) -> AppResult<()> {
           outro_skip_sec INTEGER NOT NULL DEFAULT 0,
           skip_silence INTEGER NOT NULL DEFAULT 0,
           language TEXT,
+          asr_language TEXT,
+          skip_ads INTEGER NOT NULL DEFAULT 0,
+          auto_transcribe INTEGER NOT NULL DEFAULT 0,
           created_at TEXT NOT NULL,
           updated_at TEXT NOT NULL
         );
@@ -32,7 +35,7 @@ pub fn initialize(conn: &Connection) -> AppResult<()> {
         CREATE TABLE IF NOT EXISTS episode (
           id INTEGER PRIMARY KEY,
           podcast_id INTEGER NOT NULL REFERENCES podcast(id) ON DELETE CASCADE,
-          guid TEXT NOT NULL UNIQUE,
+          guid TEXT NOT NULL,
           title TEXT NOT NULL,
           description TEXT,
           audio_url TEXT,
@@ -41,7 +44,8 @@ pub fn initialize(conn: &Connection) -> AppResult<()> {
           episode_image_path TEXT,
           status TEXT NOT NULL DEFAULT 'new',
           created_at TEXT NOT NULL,
-          updated_at TEXT NOT NULL
+          updated_at TEXT NOT NULL,
+          UNIQUE(podcast_id, guid)
         );
 
         CREATE INDEX IF NOT EXISTS idx_episode_podcast_pub
@@ -75,6 +79,7 @@ pub fn initialize(conn: &Connection) -> AppResult<()> {
         "#,
     )?;
     migrate_v1(conn)?;
+    migrate_episode_guid_scope(conn)?;
     Ok(())
 }
 
@@ -82,7 +87,7 @@ fn migrate_v1(conn: &Connection) -> AppResult<()> {
     for sql in [
         "ALTER TABLE podcast ADD COLUMN asr_language TEXT",
         "ALTER TABLE podcast ADD COLUMN skip_ads INTEGER NOT NULL DEFAULT 0",
-        "ALTER TABLE podcast ADD COLUMN auto_transcribe INTEGER NOT NULL DEFAULT 1",
+        "ALTER TABLE podcast ADD COLUMN auto_transcribe INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE episode ADD COLUMN inbox INTEGER NOT NULL DEFAULT 1",
         "ALTER TABLE episode ADD COLUMN archived INTEGER NOT NULL DEFAULT 0",
     ] {
@@ -150,6 +155,69 @@ fn migrate_v1(conn: &Connection) -> AppResult<()> {
     Ok(())
 }
 
+/// Older DBs had UNIQUE(guid) globally. Rebuild so the same GUID can exist
+/// on two podcasts, and ON CONFLICT(podcast_id, guid) works after upgrade.
+fn migrate_episode_guid_scope(conn: &Connection) -> AppResult<()> {
+    if !episode_guid_is_globally_unique(conn) {
+        return Ok(());
+    }
+    conn.execute_batch(
+        r#"
+        PRAGMA foreign_keys = OFF;
+        CREATE TABLE episode_new (
+          id INTEGER PRIMARY KEY,
+          podcast_id INTEGER NOT NULL REFERENCES podcast(id) ON DELETE CASCADE,
+          guid TEXT NOT NULL,
+          title TEXT NOT NULL,
+          description TEXT,
+          audio_url TEXT,
+          publish_at TEXT,
+          duration_ms INTEGER,
+          episode_image_path TEXT,
+          status TEXT NOT NULL DEFAULT 'new',
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          inbox INTEGER NOT NULL DEFAULT 1,
+          archived INTEGER NOT NULL DEFAULT 0,
+          UNIQUE(podcast_id, guid)
+        );
+        INSERT INTO episode_new (
+          id, podcast_id, guid, title, description, audio_url, publish_at, duration_ms,
+          episode_image_path, status, created_at, updated_at, inbox, archived
+        )
+        SELECT
+          id, podcast_id, guid, title, description, audio_url, publish_at, duration_ms,
+          episode_image_path, status, created_at, updated_at, inbox, archived
+        FROM episode;
+        DROP TABLE episode;
+        ALTER TABLE episode_new RENAME TO episode;
+        CREATE INDEX IF NOT EXISTS idx_episode_podcast_pub
+          ON episode(podcast_id, publish_at);
+        PRAGMA foreign_keys = ON;
+        "#,
+    )?;
+    Ok(())
+}
+
+fn episode_guid_is_globally_unique(conn: &Connection) -> bool {
+    let sql: Option<String> = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'episode'",
+            [],
+            |row| row.get(0),
+        )
+        .ok();
+    let Some(sql) = sql else {
+        return false;
+    };
+    let compact: String = sql
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect::<String>()
+        .to_ascii_lowercase();
+    compact.contains("guidtextnotnullunique") && !compact.contains("unique(podcast_id,guid)")
+}
+
 pub fn now_rfc3339() -> String {
     chrono::Utc::now().to_rfc3339()
 }
@@ -166,8 +234,8 @@ pub fn upsert_podcast(
     let ts = now_rfc3339();
     conn.execute(
         r#"
-        INSERT INTO podcast (guid, title, author, feed_url, description, language, created_at, updated_at)
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)
+        INSERT INTO podcast (guid, title, author, feed_url, description, language, auto_transcribe, created_at, updated_at)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, ?7, ?7)
         ON CONFLICT(feed_url) DO UPDATE SET
           title = excluded.title,
           author = COALESCE(excluded.author, podcast.author),
@@ -286,7 +354,7 @@ pub fn upsert_episode(
         r#"
         INSERT INTO episode (podcast_id, guid, title, description, audio_url, publish_at, duration_ms, status, created_at, updated_at)
         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'new', ?8, ?8)
-        ON CONFLICT(guid) DO UPDATE SET
+        ON CONFLICT(podcast_id, guid) DO UPDATE SET
           title = excluded.title,
           description = COALESCE(excluded.description, episode.description),
           audio_url = COALESCE(excluded.audio_url, episode.audio_url),
@@ -306,8 +374,8 @@ pub fn upsert_episode(
         ],
     )?;
     let id: i64 = conn.query_row(
-        "SELECT id FROM episode WHERE guid = ?1",
-        params![guid],
+        "SELECT id FROM episode WHERE podcast_id = ?1 AND guid = ?2",
+        params![podcast_id, guid],
         |row| row.get(0),
     )?;
     Ok(id)
@@ -939,6 +1007,10 @@ pub fn podcast_asr_language(conn: &Connection, podcast_id: i64) -> AppResult<Str
     Ok(v.unwrap_or_else(|| "auto".into()))
 }
 
+pub fn download_is_done(conn: &Connection, episode_id: i64) -> bool {
+    matches!(get_download(conn, episode_id), Ok(Some(d)) if d.state == "done")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -990,5 +1062,90 @@ mod tests {
         assert!(claim_next_job(&conn).unwrap().is_some());
         assert_eq!(requeue_running_jobs(&conn).unwrap(), 1);
         assert_eq!(list_jobs(&conn, 5).unwrap()[0].state, "queued");
+        assert!(!get_podcast(&conn, pid).unwrap().auto_transcribe);
+    }
+
+    #[test]
+    fn episode_guid_unique_per_podcast_not_global() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize(&conn).unwrap();
+        let a = upsert_podcast(&conn, "https://a.example/feed.xml", "A", None, None, None, None)
+            .unwrap();
+        let b = upsert_podcast(&conn, "https://b.example/feed.xml", "B", None, None, None, None)
+            .unwrap();
+        let e1 = upsert_episode(&conn, a, "same-guid", "Ep A", None, None, None, None).unwrap();
+        let e2 = upsert_episode(&conn, b, "same-guid", "Ep B", None, None, None, None).unwrap();
+        assert_ne!(e1, e2);
+        let e1b = upsert_episode(&conn, a, "same-guid", "Ep A uppdaterad", None, None, None, None)
+            .unwrap();
+        assert_eq!(e1, e1b);
+        assert_eq!(get_episode(&conn, e1).unwrap().title, "Ep A uppdaterad");
+    }
+
+    #[test]
+    fn upgrades_global_guid_unique_without_losing_rows() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            r#"
+            CREATE TABLE podcast (
+              id INTEGER PRIMARY KEY,
+              guid TEXT,
+              title TEXT NOT NULL,
+              author TEXT,
+              feed_url TEXT NOT NULL UNIQUE,
+              artwork_path TEXT,
+              description TEXT,
+              auto_download INTEGER NOT NULL DEFAULT 0,
+              speed REAL NOT NULL DEFAULT 1.0,
+              intro_skip_sec INTEGER NOT NULL DEFAULT 0,
+              outro_skip_sec INTEGER NOT NULL DEFAULT 0,
+              skip_silence INTEGER NOT NULL DEFAULT 0,
+              language TEXT,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL
+            );
+            CREATE TABLE episode (
+              id INTEGER PRIMARY KEY,
+              podcast_id INTEGER NOT NULL REFERENCES podcast(id) ON DELETE CASCADE,
+              guid TEXT NOT NULL UNIQUE,
+              title TEXT NOT NULL,
+              description TEXT,
+              audio_url TEXT,
+              publish_at TEXT,
+              duration_ms INTEGER,
+              episode_image_path TEXT,
+              status TEXT NOT NULL DEFAULT 'new',
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL
+            );
+            "#,
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO podcast (title, feed_url, created_at, updated_at) VALUES ('P','https://old.example/feed', 't','t')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO episode (podcast_id, guid, title, status, created_at, updated_at)
+             VALUES (1, 'g1', 'E1', 'new', 't', 't')",
+            [],
+        )
+        .unwrap();
+        initialize(&conn).unwrap();
+        let other = upsert_podcast(
+            &conn,
+            "https://other.example/feed.xml",
+            "Other",
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let id = upsert_episode(&conn, other, "g1", "Same guid other show", None, None, None, None)
+            .unwrap();
+        assert!(id > 0);
+        assert_eq!(get_episode(&conn, 1).unwrap().title, "E1");
     }
 }

@@ -161,24 +161,6 @@ export default function App() {
   }, [jobs, refreshLibrary]);
 
   useEffect(() => {
-    const un = listen<string>("smtc", (event) => {
-      const audio = audioRef.current;
-      if (!audio) return;
-      if (event.payload === "toggle") {
-        if (audio.paused) void audio.play();
-        else audio.pause();
-      } else if (event.payload === "play") {
-        void audio.play();
-      } else if (event.payload === "pause") {
-        audio.pause();
-      }
-    });
-    return () => {
-      void un.then((fn) => fn());
-    };
-  }, []);
-
-  useEffect(() => {
     if (sleepMode !== "minutes" || !sleepUntil) return;
     const id = window.setInterval(() => {
       if (Date.now() >= sleepUntil) {
@@ -321,6 +303,58 @@ export default function App() {
     }
   }, [persistNow, playEpisode, payload, queue, sleepMode]);
 
+  const playEpisodeRef = useRef(playEpisode);
+  playEpisodeRef.current = playEpisode;
+  const queueRef = useRef(queue);
+  queueRef.current = queue;
+  const payloadRef = useRef(payload);
+  payloadRef.current = payload;
+
+  useEffect(() => {
+    const un = listen<string>("smtc", (event) => {
+      const audio = audioRef.current;
+      const cmd = event.payload;
+      if (cmd === "toggle") {
+        if (!audio) return;
+        if (audio.paused) void audio.play();
+        else audio.pause();
+      } else if (cmd === "play") {
+        if (!audio) return;
+        void audio.play();
+      } else if (cmd === "pause") {
+        audio?.pause();
+      } else if (cmd === "next") {
+        const q = queueRef.current;
+        const currentId = payloadRef.current?.episode.id;
+        const idx = q.findIndex((item) => item.episode_id === currentId);
+        const nextItem = idx >= 0 ? q[idx + 1] : q[0];
+        if (nextItem && nextItem.episode_id !== currentId) {
+          void playEpisodeRef.current(nextItem.episode_id, false);
+        } else {
+          console.info("SMTC next: ingen nästa post i kön.");
+        }
+      } else if (cmd === "previous") {
+        if (audio && audio.currentTime > 3) {
+          audio.currentTime = 0;
+          return;
+        }
+        const q = queueRef.current;
+        const currentId = payloadRef.current?.episode.id;
+        const idx = q.findIndex((item) => item.episode_id === currentId);
+        if (idx > 0) {
+          void playEpisodeRef.current(q[idx - 1].episode_id, false);
+        } else if (audio) {
+          audio.currentTime = 0;
+        } else {
+          console.info("SMTC previous: ingen föregående post i kön.");
+        }
+      }
+    });
+    return () => {
+      void un.then((fn) => fn());
+    };
+  }, []);
+
   return (
     <div className="app">
       <aside className="sidebar">
@@ -372,12 +406,17 @@ export default function App() {
             onAddFeed={async () => {
               setBusy(true);
               try {
-                const podcast = await api.addFeed(feedUrl.trim());
+                const result = await api.addFeed(feedUrl.trim());
                 setFeedUrl("");
-                setSelectedId(podcast.id);
+                setSelectedId(result.podcast.id);
                 await refreshLibrary();
-                setStatus(`Prenumererar på ${podcast.title}`);
+                setStatus(
+                  result.warnings.length
+                    ? `Prenumererar på ${result.podcast.title}. Varningar: ${result.warnings.join(" ")}`
+                    : `Prenumererar på ${result.podcast.title}`,
+                );
               } catch (err) {
+                await refreshLibrary().catch(() => undefined);
                 setStatus(String(err));
               } finally {
                 setBusy(false);
@@ -389,7 +428,11 @@ export default function App() {
                 const imported = await api.importOpml(opmlText);
                 setOpmlText("");
                 await refreshLibrary();
-                setStatus(`Importerade ${imported.length} flöden från OPML.`);
+                setStatus(
+                  imported.warnings.length
+                    ? `Importerade ${imported.podcasts.length} flöden. Varningar: ${imported.warnings.join(" ")}`
+                    : `Importerade ${imported.podcasts.length} flöden från OPML.`,
+                );
               } catch (err) {
                 setStatus(String(err));
               } finally {
@@ -406,7 +449,11 @@ export default function App() {
               try {
                 const imported = await api.importOpmlFile(path);
                 await refreshLibrary();
-                setStatus(`Importerade ${imported.length} flöden.`);
+                setStatus(
+                  imported.warnings.length
+                    ? `Importerade ${imported.podcasts.length} flöden. Varningar: ${imported.warnings.join(" ")}`
+                    : `Importerade ${imported.podcasts.length} flöden.`,
+                );
               } catch (err) {
                 setStatus(String(err));
               } finally {
@@ -417,10 +464,14 @@ export default function App() {
               if (!selected) return;
               setBusy(true);
               try {
-                await api.refreshFeed(selected.id);
+                const result = await api.refreshFeed(selected.id);
                 await loadEpisodes(selected.id);
                 await refreshLibrary();
-                setStatus("Flödet uppdaterades.");
+                setStatus(
+                  result.warnings.length
+                    ? `Flödet uppdaterades. Varningar: ${result.warnings.join(" ")}`
+                    : "Flödet uppdaterades.",
+                );
               } catch (err) {
                 setStatus(String(err));
               } finally {
@@ -526,10 +577,17 @@ export default function App() {
             globalSkipSilence={globalSkipSilence}
             setGlobalSkipSilence={setGlobalSkipSilence}
             onDownloadCli={async () => {
+              const cuda = Boolean(asr?.nvidia_present);
+              const ok = window.confirm(
+                cuda
+                  ? "Detta hämtar whisper-cli med CUDA, ca 640 MB. Nedladdningen startar bara om du bekräftar. Fortsätt?"
+                  : "Detta hämtar whisper-cli (Windows-zip från whisper.cpp). Fortsätt?",
+              );
+              if (!ok) return;
               setBusy(true);
               try {
                 setStatus(
-                  asr?.nvidia_present
+                  cuda
                     ? "Laddar ner whisper-cli CUDA (ca 640 MB)…"
                     : "Laddar ner whisper-cli (Windows-zip från whisper.cpp)…",
                 );
@@ -542,6 +600,10 @@ export default function App() {
               }
             }}
             onDownloadModel={async () => {
+              const ok = window.confirm(
+                "Detta hämtar ggml-small (ca 466 MB) från Hugging Face. SHA-256 kontrolleras. Fortsätt?",
+              );
+              if (!ok) return;
               setBusy(true);
               try {
                 setStatus("Laddar ner ggml-small (ca 500 MB)…");
@@ -554,6 +616,13 @@ export default function App() {
               }
             }}
             onDownloadAll={async () => {
+              const cuda = Boolean(asr?.nvidia_present);
+              const ok = window.confirm(
+                cuda
+                  ? "Detta hämtar whisper-cli CUDA (ca 640 MB) och ggml-small (ca 466 MB). Startas bara efter bekräftelse. Fortsätt?"
+                  : "Detta hämtar whisper-cli och ggml-small (hundratals MB). Fortsätt?",
+              );
+              if (!ok) return;
               setBusy(true);
               try {
                 setStatus("Laddar ner whisper-cli och ggml-small…");
@@ -933,7 +1002,7 @@ function Library(props: {
                       props.onPatchSelected({ auto_transcribe: e.target.checked })
                     }
                   />
-                  Auto-transkribera
+                  Auto-transkribera (av som standard; kräver whisper-cli + modell)
                 </label>
                 <label>
                   ASR-språk

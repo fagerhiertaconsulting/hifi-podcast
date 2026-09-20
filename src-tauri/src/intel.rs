@@ -202,13 +202,13 @@ const AD_PHRASES: &[&str] = &[
     "use code",
     "promo code",
     "i samarbete med",
-    "i samarbete med",
-    "reklam",
     "sponsrad av",
-    "sponsor",
+    "sponsored by",
+    "our sponsor",
     "midroll",
     "kod för rabatt",
-    "annons",
+    "reklaminslag",
+    "reklampaus",
 ];
 
 pub fn detect_ads(segments: &[Segment]) -> Vec<AdDraft> {
@@ -279,6 +279,18 @@ mod tests {
         assert!(chapters.len() >= 2);
         let ads = detect_ads(&segs);
         assert!(ads.iter().any(|a| a.method == "phrase"));
+        let false_pos = vec![Segment {
+            start_ms: 0,
+            end_ms: 1000,
+            text: "Det var ingen reklam i slutet av samtalet".into(),
+        }];
+        assert!(detect_ads(&false_pos).is_empty());
+        let sponsor = vec![Segment {
+            start_ms: 0,
+            end_ms: 1000,
+            text: "Avsnittet är sponsrad av Acme".into(),
+        }];
+        assert!(!detect_ads(&sponsor).is_empty());
     }
 
     #[test]

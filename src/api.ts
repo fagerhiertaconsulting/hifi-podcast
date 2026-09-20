@@ -7,6 +7,7 @@ import type {
   Chapter,
   Download,
   Episode,
+  ImportOutcome,
   InboxItem,
   JobRow,
   LibraryStats,
@@ -15,6 +16,7 @@ import type {
   Podcast,
   PodcastSettings,
   QueueItem,
+  SubscribeOutcome,
   Transcript,
   TranscriptSegment,
 } from "./types";
@@ -28,12 +30,12 @@ export const api = {
     invoke<Podcast>("get_podcast", { podcastId }),
   updatePodcastSettings: (podcastId: number, settings: PodcastSettings) =>
     invoke<Podcast>("update_podcast_settings", { podcastId, settings }),
-  addFeed: (url: string) => invoke<Podcast>("add_feed", { url }),
+  addFeed: (url: string) => invoke<SubscribeOutcome>("add_feed", { url }),
   refreshFeed: (podcastId: number) =>
-    invoke<Podcast>("refresh_feed", { podcastId }),
-  importOpml: (xml: string) => invoke<Podcast[]>("import_opml", { xml }),
+    invoke<SubscribeOutcome>("refresh_feed", { podcastId }),
+  importOpml: (xml: string) => invoke<ImportOutcome>("import_opml", { xml }),
   importOpmlFile: (path: string) =>
-    invoke<Podcast[]>("import_opml_file", { path }),
+    invoke<ImportOutcome>("import_opml_file", { path }),
   exportOpml: () => invoke<string>("export_opml"),
   exportOpmlFile: (path: string) => invoke<void>("export_opml_file", { path }),
   downloadEpisode: (episodeId: number) =>

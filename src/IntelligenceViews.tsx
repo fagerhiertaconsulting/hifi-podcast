@@ -240,8 +240,9 @@ export function AsrSettings(props: {
     <div className="asr-box">
       <h2>Lokal ASR (whisper.cpp)</h2>
       <p>
-        Standardmodell: <code>ggml-small</code>. BYOK moln-ASR är avstängt. På NVIDIA
-        hämtas CUDA-build av whisper-cli (~640 MB) i stället för CPU-zippen.
+        Standardmodell: <code>ggml-small</code>. BYOK moln-ASR är avstängt. CUDA-zippen
+        (~640 MB) och modellen hämtas <strong>bara</strong> när du trycker på knapparna
+        nedan — aldrig tyst vid prenumeration eller avsnittsnedladdning.
       </p>
       {props.status && (
         <>

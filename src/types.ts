@@ -178,3 +178,13 @@ export type AppPaths = {
 };
 
 export type View = "library" | "inbox" | "queue" | "stats" | "settings";
+
+export type SubscribeOutcome = {
+  podcast: Podcast;
+  warnings: string[];
+};
+
+export type ImportOutcome = {
+  podcasts: Podcast[];
+  warnings: string[];
+};

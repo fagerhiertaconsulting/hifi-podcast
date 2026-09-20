@@ -7,6 +7,7 @@ mod feeds;
 mod intel;
 mod jobs;
 mod models;
+mod net;
 mod smtc;
 
 use rusqlite::Connection;
@@ -53,7 +54,25 @@ pub fn run() {
             tauri::async_runtime::spawn(async move {
                 jobs::worker_loop(handle).await;
             });
+            let bind_app = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                for ms in [50_u64, 150, 400, 1000, 2500, 5000] {
+                    tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+                    let app_ref = bind_app.clone();
+                    let _ = bind_app.run_on_main_thread(move || {
+                        if let Some(state) = app_ref.try_state::<AppState>() {
+                            let _ = smtc::try_bind(&app_ref, &state.smtc);
+                        }
+                    });
+                }
+            });
             Ok(())
+        })
+        .on_page_load(|window, _payload| {
+            let app = window.app_handle().clone();
+            if let Some(state) = app.try_state::<AppState>() {
+                let _ = smtc::try_bind(&app, &state.smtc);
+            }
         })
         .invoke_handler(tauri::generate_handler![
             commands::app_paths,

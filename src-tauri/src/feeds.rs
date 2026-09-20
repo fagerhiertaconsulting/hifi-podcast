@@ -103,17 +103,12 @@ fn parse_itunes_duration(raw: &str) -> Option<i64> {
 }
 
 pub async fn fetch_text(url: &str) -> AppResult<String> {
-    let client = reqwest::Client::builder()
-        .user_agent("HIFI-podcast/0.1 (+https://github.com/fagerhiertaconsulting/hifi-podcast)")
-        .build()?;
-    let response = client.get(url).send().await?;
-    if !response.status().is_success() {
-        return Err(AppError::msg(format!(
-            "Kunde inte hämta feed (HTTP {}).",
-            response.status()
-        )));
-    }
-    Ok(response.text().await?)
+    crate::net::validate_http_url(url)?;
+    let client = crate::net::http_client()?;
+    let bytes = crate::net::get_limited(&client, url, crate::net::MAX_FEED_BYTES).await?;
+    String::from_utf8(bytes).map_err(|_| {
+        AppError::msg("Feeden är inte giltig text (förväntade UTF-8).")
+    })
 }
 
 pub fn import_opml_urls(xml: &str) -> AppResult<Vec<String>> {
