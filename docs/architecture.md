@@ -7,7 +7,7 @@
 | **MVP** | Lokal podcatcher + hi-fi-policy | Ja (skal) |
 | **v1** | Lokal ASR, kapitel, reklam-skip | Roadmap |
 | **Musik** | Separat modul, foobar2000-ambition | Roadmap |
-| **UPnP** | Media Server mot Onkyo TX-RZ50 | Roadmap; media-root redan isolerad |
+| **UPnP** | Media Server mot Onkyo TX-RZ50 | PR #3: SSDP + CDS + HTTP Range; `Music/` stub |
 
 ## Process
 
@@ -25,7 +25,7 @@ UI ska inte avkoda feeds eller skriva SQLite direkt.
 ## Lagring
 
 - DB: app local data `db.sqlite`
-- Media-root: `media/<library>/<id>/…`
+- Media-root: `media/podcasts/<id>/…` och `media/music/` (migrering från `media/<id>/`)
 
 **Podcast-library** använder `media/<podcast_id>/<episode_id>.<ext>` i MVP. När musikmodulen kommer:
 

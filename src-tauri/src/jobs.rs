@@ -34,17 +34,14 @@ pub async fn worker_loop(app: AppHandle) {
     }
 }
 
-async fn run_job(
-    app: &AppHandle,
-    job_id: i64,
-    job_type: &str,
-    episode_id: i64,
-) -> AppResult<()> {
+async fn run_job(app: &AppHandle, job_id: i64, job_type: &str, episode_id: i64) -> AppResult<()> {
     match job_type {
         "transcribe" => transcribe(app, job_id, episode_id).await,
         "generate_chapters" => chapters(app, episode_id).await,
         "detect_ads" => ads(app, episode_id).await,
-        other => Err(crate::error::AppError::msg(format!("okänd jobbtyp: {other}"))),
+        other => Err(crate::error::AppError::msg(format!(
+            "okänd jobbtyp: {other}"
+        ))),
     }
 }
 
@@ -70,7 +67,11 @@ async fn transcribe(app: &AppHandle, job_id: i64, episode_id: i64) -> AppResult<
             )));
         }
         let language = db::podcast_asr_language(&conn, episode.podcast_id)?;
-        (state.data_dir.clone(), std::path::PathBuf::from(path), language)
+        (
+            state.data_dir.clone(),
+            std::path::PathBuf::from(path),
+            language,
+        )
     };
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
     let progress_app = app.clone();

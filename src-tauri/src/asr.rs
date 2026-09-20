@@ -9,8 +9,7 @@ pub const MODEL_NAME: &str = "ggml-small.bin";
 pub const MODEL_URL: &str =
     "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.bin";
 /// Hugging Face LFS SHA-256 for ggml-small.bin (ggerganov/whisper.cpp).
-pub const MODEL_SHA256: &str =
-    "1be3a9b2063867b937e64e2ec7483364a79917e157fa98c5d94b5c1fffea987b";
+pub const MODEL_SHA256: &str = "1be3a9b2063867b937e64e2ec7483364a79917e157fa98c5d94b5c1fffea987b";
 
 pub fn models_dir(data_dir: &Path) -> PathBuf {
     data_dir.join("models")
@@ -62,12 +61,7 @@ pub fn cli_backend(data_dir: &Path) -> String {
 
 pub fn find_cli(data_dir: &Path) -> Option<PathBuf> {
     let dir = bin_dir(data_dir);
-    let local_names = [
-        "whisper-cli.exe",
-        "whisper-cli",
-        "main.exe",
-        "whisper.exe",
-    ];
+    let local_names = ["whisper-cli.exe", "whisper-cli", "main.exe", "whisper.exe"];
     for name in local_names {
         let candidate = dir.join(name);
         if candidate.is_file() {
@@ -212,10 +206,7 @@ pub fn pick_first_asset_url(json: &str, asset_names: &[&str]) -> Option<String> 
             };
             for asset in assets {
                 if asset.get("name").and_then(|n| n.as_str()) == Some(*name) {
-                    if let Some(url) = asset
-                        .get("browser_download_url")
-                        .and_then(|u| u.as_str())
-                    {
+                    if let Some(url) = asset.get("browser_download_url").and_then(|u| u.as_str()) {
                         return Some(url.to_string());
                     }
                 }
@@ -249,7 +240,10 @@ fn extract_cli_zip(zip_path: &Path, dest_dir: &Path) -> AppResult<()> {
             continue;
         }
         let name = PathBuf::from(entry.name());
-        if name.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
+        if name
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
             continue;
         }
         let file_name = match name.file_name().and_then(|s| s.to_str()) {
@@ -293,15 +287,14 @@ pub async fn download_cli(data_dir: &Path) -> AppResult<PathBuf> {
         FALLBACK_WIN_X64
     };
     let client = http_client().await?;
-    let url = match crate::net::get_limited(&client, GITHUB_RELEASES, crate::net::MAX_FEED_BYTES)
-        .await
-    {
-        Ok(body) => {
-            let body = String::from_utf8_lossy(&body);
-            pick_first_asset_url(&body, &names).unwrap_or_else(|| fallback.to_string())
-        }
-        Err(_) => fallback.to_string(),
-    };
+    let url =
+        match crate::net::get_limited(&client, GITHUB_RELEASES, crate::net::MAX_FEED_BYTES).await {
+            Ok(body) => {
+                let body = String::from_utf8_lossy(&body);
+                pick_first_asset_url(&body, &names).unwrap_or_else(|| fallback.to_string())
+            }
+            Err(_) => fallback.to_string(),
+        };
     let zip_path = dest_dir.join("whisper-cli-download.zip");
     download_to_file(&url, &zip_path).await?;
     extract_cli_zip(&zip_path, &dest_dir)?;
@@ -312,9 +305,8 @@ pub async fn download_cli(data_dir: &Path) -> AppResult<PathBuf> {
         "cpu"
     };
     let _ = tokio::fs::write(dest_dir.join("hifi-backend.txt"), backend).await;
-    find_cli(data_dir).ok_or_else(|| {
-        AppError::msg("whisper-cli.exe hittades inte efter uppackning.")
-    })
+    find_cli(data_dir)
+        .ok_or_else(|| AppError::msg("whisper-cli.exe hittades inte efter uppackning."))
 }
 
 pub fn require_cli(data_dir: &Path) -> AppResult<PathBuf> {
@@ -408,7 +400,9 @@ pub async fn transcribe_file(
     let cli = require_cli(data_dir)?;
     let model = model_path(data_dir);
     if !model.is_file() {
-        return Err(AppError::msg("ggml-small.bin saknas. Ladda ner modellen först."));
+        return Err(AppError::msg(
+            "ggml-small.bin saknas. Ladda ner modellen först.",
+        ));
     }
     if !audio.is_file() {
         return Err(AppError::msg(format!(
@@ -443,15 +437,7 @@ pub async fn transcribe_file(
     log.write_all(header.as_bytes()).await?;
 
     let mut status = run_whisper_cli(
-        &cli,
-        data_dir,
-        &model,
-        audio,
-        lang,
-        &prefix,
-        want_gpu,
-        &progress,
-        &mut log,
+        &cli, data_dir, &model, audio, lang, &prefix, want_gpu, &progress, &mut log,
     )
     .await?;
     if !status.success() && want_gpu {
@@ -462,15 +448,7 @@ pub async fn transcribe_file(
             let _ = tx.send("GPU misslyckades, faller tillbaka till CPU…".into());
         }
         status = run_whisper_cli(
-            &cli,
-            data_dir,
-            &model,
-            audio,
-            lang,
-            &prefix,
-            false,
-            &progress,
-            &mut log,
+            &cli, data_dir, &model, audio, lang, &prefix, false, &progress, &mut log,
         )
         .await?;
     }
@@ -494,7 +472,9 @@ pub async fn transcribe_file(
             snippet
         )));
     }
-    if let Some((segments, used)) = read_whisper_outputs(&prefix, audio, out_dir, &stem, lang).await? {
+    if let Some((segments, used)) =
+        read_whisper_outputs(&prefix, audio, out_dir, &stem, lang).await?
+    {
         return Ok((segments, used));
     }
     Err(AppError::msg(format!(
@@ -591,10 +571,7 @@ mod tests {
         assert_eq!(
             pick_first_asset_url(
                 json,
-                &[
-                    "whisper-cublas-12.4.0-bin-x64.zip",
-                    "whisper-bin-x64.zip"
-                ]
+                &["whisper-cublas-12.4.0-bin-x64.zip", "whisper-bin-x64.zip"]
             )
             .as_deref(),
             Some("https://cuda")

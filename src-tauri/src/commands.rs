@@ -6,7 +6,7 @@ use crate::feeds;
 use crate::models::{
     AdSegment, AppPaths, AsrStatus, Bookmark, Chapter, Download, Episode, ImportOutcome, InboxItem,
     JobRow, LibraryStats, PlaybackState, Podcast, PodcastSettings, QueueItem, SubscribeOutcome,
-    Transcript, TranscriptSegment,
+    Transcript, TranscriptSegment, UpnpSettings, UpnpStatus,
 };
 use crate::AppState;
 use tauri::State;
@@ -21,7 +21,9 @@ pub fn app_paths(state: State<AppState>) -> AppPaths {
         db_path: state.db_path.display().to_string(),
         media_root: state.media_root.display().to_string(),
         data_dir: state.data_dir.display().to_string(),
-        models_dir: crate::asr::models_dir(&state.data_dir).display().to_string(),
+        models_dir: crate::asr::models_dir(&state.data_dir)
+            .display()
+            .to_string(),
         bin_dir: crate::asr::bin_dir(&state.data_dir).display().to_string(),
     }
 }
@@ -103,7 +105,10 @@ pub async fn add_feed(state: State<'_, AppState>, url: String) -> AppResult<Subs
 }
 
 #[tauri::command]
-pub async fn refresh_feed(state: State<'_, AppState>, podcast_id: i64) -> AppResult<SubscribeOutcome> {
+pub async fn refresh_feed(
+    state: State<'_, AppState>,
+    podcast_id: i64,
+) -> AppResult<SubscribeOutcome> {
     let feed_url = db::get_podcast(&conn(&state), podcast_id)?.feed_url;
     subscribe_url(&state, &feed_url).await
 }
@@ -114,7 +119,10 @@ pub async fn import_opml(state: State<'_, AppState>, xml: String) -> AppResult<I
 }
 
 #[tauri::command]
-pub async fn import_opml_file(state: State<'_, AppState>, path: String) -> AppResult<ImportOutcome> {
+pub async fn import_opml_file(
+    state: State<'_, AppState>,
+    path: String,
+) -> AppResult<ImportOutcome> {
     let xml = tokio::fs::read_to_string(path).await?;
     import_urls(&state, feeds::import_opml_urls(&xml)?).await
 }
@@ -192,6 +200,7 @@ async fn download_episode_inner(state: &AppState, episode_id: i64) -> AppResult<
             None,
             None,
             None,
+            None,
         )?;
         (episode.podcast_id, url)
     };
@@ -201,8 +210,9 @@ async fn download_episode_inner(state: &AppState, episode_id: i64) -> AppResult<
 
     let conn = conn(state);
     match result {
-        Ok((bytes, checksum, _content_type)) => {
+        Ok((bytes, checksum, content_type)) => {
             let completed = db::now_rfc3339();
+            let mime = crate::media_mime::from_content_type(&content_type, Some(&dest));
             db::upsert_download_state(
                 &conn,
                 episode_id,
@@ -212,6 +222,7 @@ async fn download_episode_inner(state: &AppState, episode_id: i64) -> AppResult<
                 Some(&checksum),
                 None,
                 Some(&completed),
+                Some(&mime),
             )?;
             db::set_episode_status(&conn, episode_id, "downloaded")?;
             if db::podcast_wants_transcribe(&conn, podcast_id).unwrap_or(false) {
@@ -227,6 +238,7 @@ async fn download_episode_inner(state: &AppState, episode_id: i64) -> AppResult<
                 None,
                 None,
                 Some(&err.to_string()),
+                None,
                 None,
             )?;
             return Err(err);
@@ -285,10 +297,7 @@ pub fn move_queue_item(
 }
 
 #[tauri::command]
-pub fn episode_for_player(
-    state: State<AppState>,
-    episode_id: i64,
-) -> AppResult<PlayerPayload> {
+pub fn episode_for_player(state: State<AppState>, episode_id: i64) -> AppResult<PlayerPayload> {
     let conn = conn(&state);
     let episode = db::get_episode(&conn, episode_id)?;
     let podcast = db::get_podcast(&conn, episode.podcast_id)?;
@@ -328,9 +337,8 @@ pub(crate) fn read_media_file_from(
     path: &std::path::Path,
 ) -> AppResult<Vec<u8>> {
     let root = std::fs::canonicalize(media_root)?;
-    let file = std::fs::canonicalize(path).map_err(|_| {
-        crate::error::AppError::msg("Ljudfilen hittades inte under media-root.")
-    })?;
+    let file = std::fs::canonicalize(path)
+        .map_err(|_| crate::error::AppError::msg("Ljudfilen hittades inte under media-root."))?;
     if !file.starts_with(&root) {
         return Err(crate::error::AppError::msg("Otillåten sökväg."));
     }
@@ -415,7 +423,10 @@ pub fn list_segments(state: State<AppState>, episode_id: i64) -> AppResult<Vec<T
 }
 
 #[tauri::command]
-pub fn search_transcripts(state: State<AppState>, query: String) -> AppResult<Vec<TranscriptSegment>> {
+pub fn search_transcripts(
+    state: State<AppState>,
+    query: String,
+) -> AppResult<Vec<TranscriptSegment>> {
     db::search_segments(&conn(&state), &query)
 }
 
@@ -506,15 +517,13 @@ pub fn sideload_file(state: State<AppState>, path: String) -> AppResult<Episode>
         .and_then(|s| s.to_str())
         .unwrap_or("bin")
         .to_ascii_lowercase();
-    let dest = state
-        .media_root
-        .join(podcast_id.to_string())
-        .join(format!("{episode_id}.{ext}"));
+    let dest = crate::download::episode_file(&state.media_root, podcast_id, episode_id, &ext);
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent)?;
     }
     std::fs::copy(&src, &dest)?;
     let meta = std::fs::metadata(&dest)?;
+    let mime = crate::media_mime::from_path(&dest).to_string();
     let conn = conn(&state);
     let completed = db::now_rfc3339();
     db::upsert_download_state(
@@ -526,6 +535,7 @@ pub fn sideload_file(state: State<AppState>, path: String) -> AppResult<Episode>
         None,
         None,
         Some(&completed),
+        Some(&mime),
     )?;
     db::set_episode_status(&conn, episode_id, "downloaded")?;
     if db::podcast_wants_transcribe(&conn, podcast_id).unwrap_or(false) {
@@ -535,13 +545,58 @@ pub fn sideload_file(state: State<AppState>, path: String) -> AppResult<Episode>
 }
 
 #[tauri::command]
-pub fn smtc_now_playing(
-    state: State<AppState>,
-    title: String,
-    artist: String,
-    playing: bool,
-) {
+pub fn smtc_now_playing(state: State<AppState>, title: String, artist: String, playing: bool) {
     crate::smtc::set_playing(&state.smtc, &title, &artist, playing);
+}
+
+#[tauri::command]
+pub async fn upnp_status(state: State<'_, AppState>) -> AppResult<UpnpStatus> {
+    let (settings, uuid) = {
+        let conn = conn(&state);
+        (db::upnp_settings(&conn)?, db::ensure_upnp_uuid(&conn)?)
+    };
+    Ok(state.upnp.status(settings, uuid).await)
+}
+
+#[tauri::command]
+pub fn get_upnp_settings(state: State<AppState>) -> AppResult<UpnpSettings> {
+    db::upnp_settings(&conn(&state))
+}
+
+#[tauri::command]
+pub fn save_upnp_settings(
+    state: State<AppState>,
+    settings: UpnpSettings,
+) -> AppResult<UpnpSettings> {
+    let conn = conn(&state);
+    db::save_upnp_settings(&conn, &settings)?;
+    db::upnp_settings(&conn)
+}
+
+#[tauri::command]
+pub async fn start_upnp_server(state: State<'_, AppState>) -> AppResult<UpnpStatus> {
+    let (settings, uuid, db_path, media_root) = {
+        let conn = conn(&state);
+        let settings = db::upnp_settings(&conn)?;
+        let uuid = db::ensure_upnp_uuid(&conn)?;
+        (
+            settings,
+            uuid,
+            state.db_path.clone(),
+            state.media_root.clone(),
+        )
+    };
+    state.upnp.start(db_path, media_root, settings, uuid).await
+}
+
+#[tauri::command]
+pub async fn stop_upnp_server(state: State<'_, AppState>) -> AppResult<UpnpStatus> {
+    state.upnp.stop().await?;
+    let (settings, uuid) = {
+        let conn = conn(&state);
+        (db::upnp_settings(&conn)?, db::ensure_upnp_uuid(&conn)?)
+    };
+    Ok(state.upnp.status(settings, uuid).await)
 }
 
 #[cfg(test)]

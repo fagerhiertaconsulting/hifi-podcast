@@ -45,7 +45,7 @@ FFmpeg är utmärkt för analys och *fallback-transkod till UPnP-renderer*. En a
 
 ## UPnP/DLNA
 
-Streama **samma media-root** som spelaren. MIME från original. Transkod bara om receivern nekar formatet. Se [upnp-mediaserver.md](upnp-mediaserver.md).
+Streama **samma media-root** som spelaren (`media/podcasts/…`). MIME från SQLite (`download.mime`). HTTP Range för seek. Transkod bara om receivern nekar formatet — **inte i v1 av servern**. Se [upnp-mediaserver.md](upnp-mediaserver.md).
 
 ## SMTC (Windows)
 

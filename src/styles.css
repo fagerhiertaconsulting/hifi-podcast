@@ -277,3 +277,36 @@ textarea {
 .paths dt {
   color: var(--accent-2);
 }
+
+.upnp-panel {
+  margin: 1.25rem 0;
+  padding: 1rem;
+  background: var(--bg-2);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+}
+
+.upnp-panel h2 {
+  margin: 0 0 0.5rem;
+  font-size: 1.05rem;
+}
+
+.upnp-panel p {
+  color: var(--muted);
+  line-height: 1.45;
+}
+
+.upnp-panel label {
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 0.3rem;
+}
+
+.upnp-panel input {
+  min-width: 16rem;
+}
+
+.upnp-warn {
+  color: var(--danger) !important;
+  font-size: 0.9rem;
+}

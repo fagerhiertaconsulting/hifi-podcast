@@ -33,9 +33,7 @@ pub fn http_client() -> AppResult<reqwest::Client> {
         .read_timeout(READ_TIMEOUT)
         .redirect(reqwest::redirect::Policy::custom(|attempt| {
             if attempt.previous().len() >= MAX_REDIRECTS {
-                return attempt.error(RedirectDenied(
-                    "För många HTTP-ompekningar (max 5).".into(),
-                ));
+                return attempt.error(RedirectDenied("För många HTTP-ompekningar (max 5).".into()));
             }
             match validate_http_url(attempt.url().as_str()) {
                 Ok(()) => attempt.follow(),
@@ -46,9 +44,8 @@ pub fn http_client() -> AppResult<reqwest::Client> {
 }
 
 pub fn validate_http_url(raw: &str) -> AppResult<()> {
-    let url = Url::parse(raw).map_err(|_| {
-        AppError::msg("Ogiltig adress. Använd en http- eller https-URL.")
-    })?;
+    let url = Url::parse(raw)
+        .map_err(|_| AppError::msg("Ogiltig adress. Använd en http- eller https-URL."))?;
     let scheme = url.scheme();
     if scheme != "https" && scheme != "http" {
         return Err(AppError::msg(
@@ -71,11 +68,9 @@ pub fn validate_http_url(raw: &str) -> AppResult<()> {
         }
         return Ok(());
     }
-    let port = url.port_or_known_default().unwrap_or(if scheme == "https" {
-        443
-    } else {
-        80
-    });
+    let port = url
+        .port_or_known_default()
+        .unwrap_or(if scheme == "https" { 443 } else { 80 });
     let lookup = format!("{host}:{port}");
     let addrs = lookup
         .to_socket_addrs()
