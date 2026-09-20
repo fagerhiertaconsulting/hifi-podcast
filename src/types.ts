@@ -193,6 +193,73 @@ export type UpnpStatus = {
   error: string | null;
 };
 
+export type AudioEngineSettings = {
+  backend: "native" | "webview" | string;
+  output_api: "auto" | "asio" | "wasapi_shared" | "wasapi_exclusive" | string;
+  device_name: string;
+  exclusive: boolean;
+  skip_silence: boolean;
+};
+
+export type OutputDeviceInfo = {
+  name: string;
+  id: string;
+  api: string;
+  is_default: boolean;
+  preferred: boolean;
+  sample_rate: number;
+  channels: number;
+  exclusive_capable: boolean;
+};
+
+export type EngineCapabilities = {
+  backend_default: string;
+  pcm_mimes: string[];
+  dsd_status_sv: string;
+  asio_available: boolean;
+  exclusive_available: boolean;
+  asio_note_sv: string;
+  exclusive_note_sv: string;
+  stretch_note_sv: string;
+};
+
+export type EngineStatus = {
+  loaded: boolean;
+  playing: boolean;
+  ended: boolean;
+  position_ms: number;
+  duration_ms: number;
+  sample_rate: number;
+  channels: number;
+  codec: string;
+  path: string;
+  exclusive: boolean;
+  output_api: string;
+  device_name: string;
+  output_rate: number;
+  resampled: boolean;
+  speed: number;
+  skip_silence: boolean;
+  error: string | null;
+};
+
+export type ProbeInfo = {
+  path: string;
+  support: {
+    kind: string;
+    mime: string;
+    extension: string;
+    native_decode: boolean;
+    dsd_plugin: boolean;
+    label_sv: string;
+    note_sv: string;
+  };
+  sample_rate: number | null;
+  channels: number | null;
+  duration_ms: number | null;
+  codec: string | null;
+};
+
 export type View = "library" | "inbox" | "queue" | "stats" | "settings";
 
 export type SubscribeOutcome = {

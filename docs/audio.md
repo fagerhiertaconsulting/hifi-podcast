@@ -11,7 +11,42 @@ HIFI podcast ska låta som källan, inte som en “podcast-app” som normaliser
 5. **Flyttalskedja och headroom.** Intern process i `f32` där vi styr DSP. Undvik att mixa i 16-bit med gain > 1 utan limiter. Unity-gain är default.
 6. **En motor, två bibliotek.** Podcast-UI och (senare) musik-UI delar engine + output-enhet, inte kö eller datamodell.
 
-## MVP (den här branchen)
+## Native hi-fi engine (den här branchen / PR #4)
+
+Målet är att **FLAC och vanliga poddformat ska spelas i appen** via Rust, med **ASIO som primär DAC-väg** (Nicklas: FiiO ASIO Driver, samma som Qobuz *Preferred Audio Output*). WASAPI/cpal ensamt räcker inte för den dagliga kedjan.
+
+### Decode
+
+| Format | Native (Symphonia → f32) | Kommentar |
+|--------|--------------------------|-----------|
+| FLAC, WAV/PCM, AIFF | Ja | Hi-fi-kärnan |
+| MP3, AAC/M4A/M4B, ALAC, OGG/Vorbis/Opus | Ja | Befintliga podcast-enclosure |
+| DSD (.dsf/.dff) / SACD | Nej | Känns igen (magic + MIME). **Inte** avkodat. Native DSD via ASIO (DoP eller DSD-sampletyp) är **uppskjutet**. Filen lämnas orörd. |
+| WMA | Nej | WebView2-omkopplare kan användas; ingen tyst omkodning |
+
+### Output — ASIO vs WASAPI (ärligt)
+
+| API | Vad som faktiskt finns i koden | Bit-perfect? |
+|-----|--------------------------------|--------------|
+| **ASIO** | **Ja:** enhetslista från `HKLM\SOFTWARE\ASIO` (och WOW6432Node) + `CoCreateInstance(clsid, …, clsid)` + IASIO `createBuffers`/`start`/`bufferSwitch`. Det är en riktig öppning, inte en etikett. | Närmast Qobuz-kedjan: källans samplingsfrekvens om drivrutinen tar den; intern kedja är **f32** (inte integer-bitkopia från FLAC). Ingen tyst omsampling i ASIO — om FiiO nekar Hz visas fel. |
+| **WASAPI exclusive** | Ja (Windows, `wasapi`-låda). Fallback. | Exclusive låser DAC:n; fortfarande f32-kedja. |
+| **WASAPI shared (cpal)** | Ja. Default-fallback om ASIO saknas/nekas i läge **Auto**. | Inte bit-perfect: systemets mixer kan resample:a. |
+| WebView2 `HTMLMediaElement` | Kvar som omkopplare | Chromium-mixer, inte hi-fi-DAC-läge |
+
+**Auto:** prova ASIO (FiiO först om namnet matchar), sedan WASAPI exclusive, sedan shared. Explicit **ASIO** i inställningar får inte tyst falla tillbaka — feltext på svenska.
+
+**Krav på maskinen:** FiiO ASIO Driver måste vara installerad (samma som Qobuz). Utan registerpost finns ingen ASIO-rad; UI ljuger inte om det.
+
+**DSD via ASIO:** om kanalens ASIO-sampletyp är DSD vägrar motorn strömmen i den här PR:n. FLAC → PCM → ASIO är den stödda hi-fi-vägen nu.
+
+### DSP i native-motorn
+
+- Unity-gain, ingen compressor.
+- Hastighet ≠ 1×: WSOLA (tonartsstabil). **ASIO + hastighet ≠ 1 är inte bit-perfect.**
+- Hoppa tystnad: opt-in, hopp i sample-klockan.
+- Intern `f32`. Vid ASIO skrivs till drivrutinens format (typiskt i32/i24/f32 LSB) utan dither-policy utöver clamp.
+
+## MVP (WebView2, fortfarande valbar)
 
 | Del | Val | Varför |
 |-----|-----|--------|
@@ -19,25 +54,13 @@ HIFI podcast ska låta som källan, inte som en “podcast-app” som normaliser
 | Decode/playback | WebView2 `HTMLMediaElement` **direkt till systemets mixer** | Chromium avkodar MP3/M4A utan extra fil. **Inte** `createMediaElementSource` på `asset.localhost` — det ger tyst utgång (CORS nollar bufferten). |
 | Hastighet | `playbackRate` + `preservesPitch = true` | WebView2 är Chromium: time-stretch med bevarad pitch som default |
 | Skip silence | Opt-in: same-origin `blob:` + `AnalyserNode` | Default är av. Web Audio kopplas bara efter blob-URL, aldrig mot asset-protokollet. |
-| Output | Systemets delade läge (WASAPI shared via Chromium) | Tillräckligt för podcast-MVP; inte bit-perfect |
-
-**Begränsning att vara ärlig om:** Chromium-playern är inte foobar2000. Den gör intern decode till float (bra) men går via webbläsarens mixer, inte exclusive WASAPI. Gapless, DSD och bit-perfect är **inte** MVP.
+| Output | Systemets delade läge (WASAPI shared via Chromium) | Inte bit-perfect |
 
 ## v1 (podcast-intelligens, samma filer)
 
 - FFmpeg **endast som analys-sidecar** (silence/energy, kapitelkandidater) — inte som default transcoder.
 - Inbäddade kapitel (ID3/MP4 / Podcasting 2.0) läses; genererade kapitel skriver metadata, inte ny ljudfil.
 - Volume boost / voice enhance: **off** tills användaren slår på; implementation som valbar gain/EQ, inte en tyst “enhancer”.
-
-## Native hi-fi engine (musikfas + podcast-ersättning)
-
-Målbild, i prioriterad ordning:
-
-1. **Symphonia** (decode av PCM/FLAC/MP3/AAC/OGG i Rust, `f32` frames).
-2. **cpal** för portabel output; på Windows en **WASAPI exclusive**-backend när användaren valt bit-perfect (musik).
-3. **DSD/SACD:** DoP eller native DSD via dedikerad Windows-backend (ASIO/WASAPI) — plugin-yta, inte inbakat i podcast-UI.
-4. Time-stretch för podcast: **Signalsmith Stretch**, **Rubber Band** eller WebView tills native-playern är paritet; aldrig pitch-shift som bieffekt om det går att undvika.
-5. Skip silence: hoppa i sample-klockan; skriv inte “trimmat” original. Cut-läge för reklam (v2) är en **explicit** ny fil med disclaimer.
 
 ### Varför inte bara FFmpeg-filtergraph till DAC?
 
@@ -49,4 +72,4 @@ Streama **samma media-root** som spelaren (`media/podcasts/…`). MIME från SQL
 
 ## SMTC (Windows)
 
-Mediaknappar / System Media Transport Controls är backlog strax efter MVP-skalet (sketch §12). Native engine ska äga SMTC så podcast och musik inte slåss om sessionen.
+Mediaknappar går till densamma kö-logiken oavsett native/WebView2. Native-motorn äger DAC-sessionen (ASIO/WASAPI); SMTC är transport, inte mixern.

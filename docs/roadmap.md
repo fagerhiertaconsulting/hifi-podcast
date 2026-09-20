@@ -12,6 +12,10 @@ Implementerat i appen (se [v1-asr.md](v1-asr.md)):
 - BYOK cloud-ASR avstängt
 - Windows SMTC (play/pause via systemets mediekontroller när souvlaki kan binda HWND)
 
+## Native hi-fi engine (PR #4)
+
+Symphonia-avkodning + **ASIO som primär utgång** (FiiO ASIO Driver, samma som Qobuz) med WASAPI delat/exclusive som fallback. WebView2 kvar som omkopplare. Musikbibliotek-UI är **inte** med — tomma hyllor väntar på PR #5+. Se [audio.md](audio.md).
+
 ## Musikmodul (senare, separat)
 
 Se [music-roadmap.md](music-roadmap.md). Inte i podkastabeller. Delad engine enligt [audio.md](audio.md).
@@ -22,4 +26,4 @@ Se [upnp-mediaserver.md](upnp-mediaserver.md). **Media Server** mot Onkyo TX-RZ5
 
 ## Medvetet utanför
 
-Musikbibliotek / FLAC-DSD-UI, native Symphonia/WASAPI exclusive, moln-ASR, reklam-cut ML, Chromecast/Sonos-specifikt, in-app UPnP-renderer.
+Musikbibliotek / taggar / albumvy, native DSD/SACD-avkodning (även via ASIO DoP), moln-ASR, reklam-cut ML, Chromecast/Sonos-specifikt, in-app UPnP-renderer.

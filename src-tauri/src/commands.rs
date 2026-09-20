@@ -599,6 +599,99 @@ pub async fn stop_upnp_server(state: State<'_, AppState>) -> AppResult<UpnpStatu
     Ok(state.upnp.status(settings, uuid).await)
 }
 
+#[tauri::command]
+pub fn engine_capabilities() -> crate::engine::EngineCapabilities {
+    crate::engine::Handle::capabilities()
+}
+
+#[tauri::command]
+pub fn engine_list_devices() -> Vec<crate::engine::OutputDeviceInfo> {
+    crate::engine::Handle::list_devices()
+}
+
+#[tauri::command]
+pub fn engine_get_settings(state: State<AppState>) -> AppResult<crate::models::AudioEngineSettings> {
+    db::audio_engine_settings(&conn(&state))
+}
+
+#[tauri::command]
+pub fn engine_save_settings(
+    state: State<AppState>,
+    settings: crate::models::AudioEngineSettings,
+) -> AppResult<crate::models::AudioEngineSettings> {
+    let conn = conn(&state);
+    db::save_audio_engine_settings(&conn, &settings)?;
+    db::audio_engine_settings(&conn)
+}
+
+#[tauri::command]
+pub fn engine_probe(state: State<AppState>, path: String) -> AppResult<crate::engine::ProbeInfo> {
+    let file = crate::engine::ensure_under_root(&state.media_root, std::path::Path::new(&path))?;
+    Ok(crate::engine::Handle::probe(&file)?)
+}
+
+#[tauri::command]
+pub fn engine_open(
+    state: State<AppState>,
+    path: String,
+    speed: f64,
+    skip_silence: bool,
+    output_api: Option<String>,
+    device_name: Option<String>,
+) -> AppResult<crate::engine::EngineStatus> {
+    let file = crate::engine::ensure_under_root(&state.media_root, std::path::Path::new(&path))?;
+    let saved = db::audio_engine_settings(&conn(&state))?;
+    let status = state.engine.open(crate::engine::OpenParams {
+        path: file,
+        speed,
+        skip_silence,
+        output_api: output_api.unwrap_or(saved.output_api),
+        device_name: device_name.unwrap_or(saved.device_name),
+    })?;
+    Ok(status)
+}
+
+#[tauri::command]
+pub fn engine_play(state: State<AppState>) -> AppResult<()> {
+    state.engine.play()?;
+    Ok(())
+}
+
+#[tauri::command]
+pub fn engine_pause(state: State<AppState>) -> AppResult<()> {
+    state.engine.pause()?;
+    Ok(())
+}
+
+#[tauri::command]
+pub fn engine_seek(state: State<AppState>, position_ms: u64) -> AppResult<()> {
+    state.engine.seek_ms(position_ms)?;
+    Ok(())
+}
+
+#[tauri::command]
+pub fn engine_set_speed(state: State<AppState>, speed: f64) -> AppResult<()> {
+    state.engine.set_speed(speed)?;
+    Ok(())
+}
+
+#[tauri::command]
+pub fn engine_set_skip_silence(state: State<AppState>, enabled: bool) -> AppResult<()> {
+    state.engine.set_skip_silence(enabled)?;
+    Ok(())
+}
+
+#[tauri::command]
+pub fn engine_stop(state: State<AppState>) -> AppResult<()> {
+    state.engine.stop();
+    Ok(())
+}
+
+#[tauri::command]
+pub fn engine_status(state: State<AppState>) -> crate::engine::EngineStatus {
+    state.engine.status()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

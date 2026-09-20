@@ -18,6 +18,7 @@ import type {
   AdSegment,
   AppPaths,
   AsrStatus,
+  AudioEngineSettings,
   Bookmark,
   Episode,
   InboxItem,
@@ -82,6 +83,8 @@ export default function App() {
   const [duration, setDuration] = useState(0);
   const [speed, setSpeed] = useState(1);
   const [globalSkipSilence, setGlobalSkipSilence] = useState(false);
+  const [engineSettings, setEngineSettings] = useState<AudioEngineSettings | null>(null);
+  const nativeRef = useRef(true);
   const [sleepMode, setSleepMode] = useState<"off" | "minutes" | "episode">("off");
   const [sleepMinutes, setSleepMinutes] = useState(30);
   const [sleepUntil, setSleepUntil] = useState<number | null>(null);
@@ -99,7 +102,7 @@ export default function App() {
   const skipModeRef = useRef(skipSilenceActive);
 
   const refreshLibrary = useCallback(async () => {
-    const [list, q, p, box, marks, jobList, st, asrStatus] = await Promise.all([
+    const [list, q, p, box, marks, jobList, st, asrStatus, audioSet] = await Promise.all([
       api.listPodcasts(),
       api.listQueue(),
       api.appPaths(),
@@ -108,6 +111,7 @@ export default function App() {
       api.listJobs(),
       api.libraryStats(),
       api.asrStatus(),
+      api.engineGetSettings(),
     ]);
     setPodcasts(list);
     setQueue(q);
@@ -117,6 +121,9 @@ export default function App() {
     setJobs(jobList);
     setStats(st);
     setAsr(asrStatus);
+    setEngineSettings(audioSet);
+    nativeRef.current = audioSet.backend !== "webview";
+    setGlobalSkipSilence(audioSet.skip_silence);
     if (list.length && selectedId === null) {
       setSelectedId(list[0].id);
     }
@@ -164,7 +171,8 @@ export default function App() {
     if (sleepMode !== "minutes" || !sleepUntil) return;
     const id = window.setInterval(() => {
       if (Date.now() >= sleepUntil) {
-        audioRef.current?.pause();
+        if (nativeRef.current) void api.enginePause();
+        else audioRef.current?.pause();
         setSleepMode("off");
         setSleepUntil(null);
         setStatus("Sovtimer: pausad.");
@@ -211,6 +219,10 @@ export default function App() {
     const audio = audioRef.current;
     const path = filePathRef.current;
     if (!audio || !path) return;
+    if (nativeRef.current) {
+      void api.engineSetSkipSilence(skipSilenceActive).catch((err) => setStatus(String(err)));
+      return;
+    }
     const pos = positionRef.current;
     const wasPlaying = playingRef.current;
     void loadPlaybackSource(audio, path, skipSilenceActive, speed)
@@ -224,17 +236,19 @@ export default function App() {
   }, [skipSilenceActive, loadPlaybackSource, speed]);
 
   const persistNow = useCallback(async () => {
-    const audio = audioRef.current;
     const episode = payload?.episode;
-    if (!audio || !episode) return;
+    if (!episode) return;
+    const audio = audioRef.current;
+    const posSec = nativeRef.current ? positionRef.current : (audio?.currentTime ?? positionRef.current);
+    const dur = duration;
     await api.savePlaybackState({
       episode_id: episode.id,
-      position_ms: Math.floor(audio.currentTime * 1000),
+      position_ms: Math.floor(posSec * 1000),
       speed,
-      completed: audio.ended || (audio.duration > 0 && audio.currentTime >= audio.duration - 2),
+      completed: dur > 0 && posSec >= dur - 2,
       last_played_at: new Date().toISOString(),
     });
-  }, [payload, speed]);
+  }, [payload, speed, duration]);
 
   const playEpisode = useCallback(
     async (episodeId: number, enqueue = true) => {
@@ -267,11 +281,37 @@ export default function App() {
         const useSkip = globalSkipSilence || next.podcast.skip_silence;
         skipModeRef.current = useSkip;
         filePathRef.current = filePath;
-        await loadPlaybackSource(audio, filePath, useSkip, nextSpeed);
-        audio.currentTime = Math.max(0, startSec);
-        await audio.play();
+        const useNative = (engineSettings?.backend ?? "native") !== "webview";
+        nativeRef.current = useNative;
+        if (useNative) {
+          audio.pause();
+          audio.removeAttribute("src");
+          audio.load();
+          const st = await api.engineOpen({
+            path: filePath,
+            speed: nextSpeed,
+            skipSilence: useSkip,
+            outputApi: engineSettings?.output_api,
+            deviceName: engineSettings?.device_name,
+          });
+          const startMs = Math.max(0, startSec) * 1000;
+          await api.engineSeek(Math.floor(startMs));
+          await api.enginePlay();
+          setDuration((st.duration_ms || 0) / 1000);
+          setPosition(startSec);
+          positionRef.current = startSec;
+        } else {
+          await api.engineStop();
+          await loadPlaybackSource(audio, filePath, useSkip, nextSpeed);
+          audio.currentTime = Math.max(0, startSec);
+          await audio.play();
+        }
         setPlaying(true);
-        setStatus(`Spelar: ${next.episode.title}`);
+        setStatus(
+          useNative
+            ? `Spelar native (${engineSettings?.output_api === "asio" || !engineSettings?.output_api || engineSettings.output_api === "auto" ? "ASIO/WASAPI" : engineSettings.output_api}): ${next.episode.title}`
+            : `Spelar (WebView2): ${next.episode.title}`,
+        );
         if (selectedId !== next.podcast.id) {
           setSelectedId(next.podcast.id);
         }
@@ -283,7 +323,7 @@ export default function App() {
         setBusy(false);
       }
     },
-    [loadEpisodes, loadPlaybackSource, refreshLibrary, selectedId, globalSkipSilence],
+    [loadEpisodes, loadPlaybackSource, refreshLibrary, selectedId, globalSkipSilence, engineSettings],
   );
 
   const onEnded = useCallback(async () => {
@@ -311,18 +351,62 @@ export default function App() {
   payloadRef.current = payload;
 
   useEffect(() => {
+    const unTick = listen<import("./types").EngineStatus>("engine-tick", (event) => {
+      if (!nativeRef.current) return;
+      const st = event.payload;
+      const pos = st.position_ms / 1000;
+      positionRef.current = pos;
+      setPosition(pos);
+      setDuration((st.duration_ms || 0) / 1000);
+      setPlaying(st.playing);
+      const posMs = st.position_ms;
+      const ad = adsRef.current.find((a) => posMs >= a.start_ms && posMs < a.end_ms - 200);
+      if (ad) {
+        void api.engineSeek(ad.end_ms);
+        return;
+      }
+      const outro = payloadRef.current?.podcast.outro_skip_sec ?? 0;
+      if (
+        !outroFired.current &&
+        outro > 0 &&
+        st.duration_ms > outro * 1000 &&
+        posMs >= st.duration_ms - outro * 1000
+      ) {
+        outroFired.current = true;
+        void api.enginePause();
+        void onEnded();
+      }
+    });
+    const unEnd = listen("engine-ended", () => {
+      if (!nativeRef.current) return;
+      void onEnded();
+    });
+    return () => {
+      void unTick.then((fn) => fn());
+      void unEnd.then((fn) => fn());
+    };
+  }, [onEnded]);
+
+  useEffect(() => {
     const un = listen<string>("smtc", (event) => {
       const audio = audioRef.current;
       const cmd = event.payload;
+      const native = nativeRef.current;
       if (cmd === "toggle") {
+        if (native) {
+          if (playingRef.current) void api.enginePause();
+          else void api.enginePlay();
+          return;
+        }
         if (!audio) return;
         if (audio.paused) void audio.play();
         else audio.pause();
       } else if (cmd === "play") {
-        if (!audio) return;
-        void audio.play();
+        if (native) void api.enginePlay();
+        else if (audio) void audio.play();
       } else if (cmd === "pause") {
-        audio?.pause();
+        if (native) void api.enginePause();
+        else audio?.pause();
       } else if (cmd === "next") {
         const q = queueRef.current;
         const currentId = payloadRef.current?.episode.id;
@@ -334,7 +418,11 @@ export default function App() {
           console.info("SMTC next: ingen nästa post i kön.");
         }
       } else if (cmd === "previous") {
-        if (audio && audio.currentTime > 3) {
+        if (native && positionRef.current > 3) {
+          void api.engineSeek(0);
+          return;
+        }
+        if (audio && !native && audio.currentTime > 3) {
           audio.currentTime = 0;
           return;
         }
@@ -343,6 +431,8 @@ export default function App() {
         const idx = q.findIndex((item) => item.episode_id === currentId);
         if (idx > 0) {
           void playEpisodeRef.current(q[idx - 1].episode_id, false);
+        } else if (native) {
+          void api.engineSeek(0);
         } else if (audio) {
           audio.currentTime = 0;
         } else {
@@ -354,6 +444,17 @@ export default function App() {
       void un.then((fn) => fn());
     };
   }, []);
+
+  const skipSeconds = (delta: number) => {
+    if (nativeRef.current) {
+      const next = Math.max(0, Math.min(duration || 0, positionRef.current + delta));
+      void api.engineSeek(Math.floor(next * 1000));
+      setPosition(next);
+      positionRef.current = next;
+      return;
+    }
+    skip(audioRef.current, delta);
+  };
 
   return (
     <div className="app">
@@ -562,7 +663,8 @@ export default function App() {
             jobs={jobs}
             onSeekBookmark={(episodeId, ms) => {
               void playEpisode(episodeId, false).then(() => {
-                if (audioRef.current) audioRef.current.currentTime = ms / 1000;
+                if (nativeRef.current) void api.engineSeek(ms);
+                else if (audioRef.current) audioRef.current.currentTime = ms / 1000;
               });
             }}
             onDeleteBookmark={async (id) => setBookmarks(await api.deleteBookmark(id))}
@@ -575,7 +677,13 @@ export default function App() {
             asr={asr}
             busy={busy}
             globalSkipSilence={globalSkipSilence}
-            setGlobalSkipSilence={setGlobalSkipSilence}
+            setGlobalSkipSilence={(v) => {
+              setGlobalSkipSilence(v);
+              if (nativeRef.current) void api.engineSetSkipSilence(v);
+            }}
+            engineSettings={engineSettings}
+            onEngineSettings={setEngineSettings}
+            nativeRef={nativeRef}
             onDownloadCli={async () => {
               const cuda = Boolean(asr?.nvidia_present);
               const ok = window.confirm(
@@ -665,7 +773,8 @@ export default function App() {
         positionMs={Math.floor(position * 1000)}
         jobs={jobs}
         onSeekMs={(ms) => {
-          if (audioRef.current) audioRef.current.currentTime = ms / 1000;
+          if (nativeRef.current) void api.engineSeek(ms);
+          else if (audioRef.current) audioRef.current.currentTime = ms / 1000;
         }}
       />
 
@@ -718,16 +827,21 @@ export default function App() {
           <span>{payload?.podcast.title ?? "Välj ett avsnitt att spela"}</span>
         </div>
         <div className="transport">
-          <button onClick={() => skip(audioRef.current, -30)} title="Bakåt 30 s">
+          <button onClick={() => skipSeconds(-30)} title="Bakåt 30 s">
             −30
           </button>
-          <button onClick={() => skip(audioRef.current, -15)} title="Bakåt 15 s">
+          <button onClick={() => skipSeconds(-15)} title="Bakåt 15 s">
             −15
           </button>
           <button
             className="play"
             disabled={!payload}
             onClick={() => {
+              if (nativeRef.current) {
+                if (playing) void api.enginePause();
+                else void api.enginePlay();
+                return;
+              }
               const audio = audioRef.current;
               if (!audio) return;
               if (audio.paused) void audio.play();
@@ -736,10 +850,10 @@ export default function App() {
           >
             {playing ? "Paus" : "Spela"}
           </button>
-          <button onClick={() => skip(audioRef.current, 15)} title="Framåt 15 s">
+          <button onClick={() => skipSeconds(15)} title="Framåt 15 s">
             +15
           </button>
-          <button onClick={() => skip(audioRef.current, 30)} title="Framåt 30 s">
+          <button onClick={() => skipSeconds(30)} title="Framåt 30 s">
             +30
           </button>
         </div>
@@ -753,8 +867,10 @@ export default function App() {
             value={Math.min(position, duration || 0)}
             onChange={(e) => {
               const value = Number(e.target.value);
-              if (audioRef.current) audioRef.current.currentTime = value;
+              if (nativeRef.current) void api.engineSeek(Math.floor(value * 1000));
+              else if (audioRef.current) audioRef.current.currentTime = value;
               setPosition(value);
+              positionRef.current = value;
             }}
           />
           <span>{formatTime(duration)}</span>
@@ -766,7 +882,8 @@ export default function App() {
             onChange={(e) => {
               const next = Number(e.target.value);
               setSpeed(next);
-              if (audioRef.current) configureHiFiElement(audioRef.current, next);
+              if (nativeRef.current) void api.engineSetSpeed(next);
+              else if (audioRef.current) configureHiFiElement(audioRef.current, next);
             }}
           >
             {SPEEDS.map((s) => (
@@ -817,7 +934,10 @@ export default function App() {
           >
             Bokmärke
           </button>
-        <div className="status">{status}</div>
+        <div className="status">
+          {status}
+          {nativeRef.current && payload ? " · Native" : payload ? " · WebView2" : ""}
+        </div>
       </footer>
     </div>
   );
@@ -1094,6 +1214,9 @@ function SettingsView(props: {
   busy: boolean;
   globalSkipSilence: boolean;
   setGlobalSkipSilence: (v: boolean) => void;
+  engineSettings: AudioEngineSettings | null;
+  onEngineSettings: (s: AudioEngineSettings) => void;
+  nativeRef: { current: boolean };
   onDownloadModel: () => void;
   onDownloadCli: () => void;
   onDownloadAll: () => void;
@@ -1116,6 +1239,14 @@ function SettingsView(props: {
         />
         Hoppa tystnad globalt (av som standard — påverkar inte dynamik)
       </label>
+      <AudioEnginePanel
+        settings={props.engineSettings}
+        onSettings={(s) => {
+          props.onEngineSettings(s);
+          props.nativeRef.current = s.backend !== "webview";
+        }}
+        onStatus={props.onStatus}
+      />
       <button onClick={props.onSideload}>Importera ljudfil (sideload)…</button>
       <button onClick={props.onExport}>Exportera OPML…</button>
       <UpnpSettingsPanel onStatus={props.onStatus} />
@@ -1138,6 +1269,136 @@ function SettingsView(props: {
         </dl>
       )}
     </section>
+  );
+}
+
+function AudioEnginePanel(props: {
+  settings: AudioEngineSettings | null;
+  onSettings: (s: AudioEngineSettings) => void;
+  onStatus: (s: string) => void;
+}) {
+  const [devices, setDevices] = useState<import("./types").OutputDeviceInfo[]>([]);
+  const [caps, setCaps] = useState<import("./types").EngineCapabilities | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [backend, setBackend] = useState("native");
+  const [outputApi, setOutputApi] = useState("auto");
+  const [deviceName, setDeviceName] = useState("");
+
+  const refresh = useCallback(async () => {
+    const [list, c, s] = await Promise.all([
+      api.engineListDevices(),
+      api.engineCapabilities(),
+      api.engineGetSettings(),
+    ]);
+    setDevices(list);
+    setCaps(c);
+    setBackend(s.backend);
+    setOutputApi(s.output_api || "auto");
+    setDeviceName(s.device_name);
+    props.onSettings(s);
+  }, [props]);
+
+  useEffect(() => {
+    void refresh().catch((err) => props.onStatus(String(err)));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const save = async () => {
+    setBusy(true);
+    try {
+      const next = await api.engineSaveSettings({
+        backend,
+        output_api: outputApi,
+        device_name: deviceName,
+        exclusive: outputApi === "wasapi_exclusive",
+        skip_silence: props.settings?.skip_silence ?? false,
+      });
+      props.onSettings(next);
+      props.onStatus(
+        next.output_api === "asio"
+          ? "Ljudmotor sparad. ASIO (FiiO) används när du spelar ett nedladdat avsnitt."
+          : "Ljudmotor sparad.",
+      );
+    } catch (err) {
+      props.onStatus(String(err));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const asioDevices = devices.filter((d) => d.api === "asio");
+  const wasapiDevices = devices.filter((d) => d.api === "wasapi");
+
+  return (
+    <div className="upnp-panel">
+      <h2>Hi-fi-motor (native)</h2>
+      <p>
+        Primär utgång är <strong>ASIO</strong> — välj <strong>FiiO ASIO Driver</strong> (samma som
+        Qobuz Preferred Audio Output). WASAPI delat/exclusive är fallback om ASIO saknas eller
+        nekas. WebView2 finns kvar som omkopplare för podd-MVP.
+      </p>
+      <div className="settings-grid">
+        <label>
+          Uppspelningsväg
+          <select value={backend} onChange={(e) => setBackend(e.target.value)}>
+            <option value="native">Native (Symphonia → ASIO/WASAPI)</option>
+            <option value="webview">WebView2 (HTMLMediaElement)</option>
+          </select>
+        </label>
+        <label>
+          Utgångs-API
+          <select value={outputApi} onChange={(e) => setOutputApi(e.target.value)}>
+            <option value="auto">Auto (ASIO först, därefter WASAPI)</option>
+            <option value="asio">ASIO (FiiO / andra drivrutiner)</option>
+            <option value="wasapi_shared">WASAPI delat</option>
+            <option value="wasapi_exclusive">WASAPI exclusive</option>
+          </select>
+        </label>
+        <label>
+          Enhet
+          <select value={deviceName} onChange={(e) => setDeviceName(e.target.value)}>
+            <option value="">
+              {asioDevices.some((d) => d.preferred)
+                ? "Auto — föredra FiiO ASIO Driver"
+                : "Auto — första ASIO, annars systemstandard"}
+            </option>
+            {asioDevices.map((d) => (
+              <option key={d.id} value={d.name}>
+                ASIO: {d.name}
+                {d.preferred ? " (rekommenderad)" : ""}
+              </option>
+            ))}
+            {wasapiDevices.map((d) => (
+              <option key={d.id} value={d.name}>
+                WASAPI: {d.name}
+              </option>
+            ))}
+          </select>
+        </label>
+      </div>
+      {asioDevices.length === 0 ? (
+        <p className="upnp-warn">
+          Inga ASIO-drivrutiner i Windows-registret. Installera <strong>FiiO ASIO Driver</strong>{" "}
+          och starta om appen. Tills dess används WASAPI (delat) om du valt Auto.
+        </p>
+      ) : (
+        <p className="sidebar-note">
+          Hittade ASIO: {asioDevices.map((d) => d.name).join(", ")}. Öppning sker via IASIO
+          (CoCreateInstance), inte bara en etikett.
+        </p>
+      )}
+      <p className="sidebar-note">{caps?.asio_note_sv}</p>
+      <p className="sidebar-note">{caps?.dsd_status_sv}</p>
+      <p className="sidebar-note">{caps?.stretch_note_sv}</p>
+      <div className="row-actions">
+        <button onClick={() => void save()} disabled={busy}>
+          Spara ljudmotor
+        </button>
+        <button onClick={() => void refresh()} disabled={busy}>
+          Uppdatera enheter
+        </button>
+      </div>
+    </div>
   );
 }
 

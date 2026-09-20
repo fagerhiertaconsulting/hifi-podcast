@@ -6,7 +6,8 @@
 |-----|-----|--------|
 | **MVP** | Lokal podcatcher + hi-fi-policy | Ja (skal) |
 | **v1** | Lokal ASR, kapitel, reklam-skip | Roadmap |
-| **Musik** | Separat modul, foobar2000-ambition | Roadmap |
+| **Musik** | Separat modul, foobar2000-ambition | Roadmap (PR #5+) |
+| **Native engine** | Symphonia + ASIO (FiiO) / WASAPI | PR #4 |
 | **UPnP** | Media Server mot Onkyo TX-RZ50 | PR #3: SSDP + CDS + HTTP Range; `Music/` stub |
 
 ## Process
@@ -16,6 +17,7 @@
                               ├─ RSS + OPML
                               ├─ Download manager (en fil i taget, original)
                               ├─ SQLite
+                              ├─ Native engine (Symphonia → ASIO / WASAPI)
                               ├─ Playback-state + kö
                               └─ Jobbkön (v1: whisper, kapitel, ads)
 ```

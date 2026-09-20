@@ -1,6 +1,7 @@
 mod asr;
 mod commands;
 mod db;
+mod engine;
 mod download;
 mod error;
 mod feeds;
@@ -26,6 +27,7 @@ pub struct AppState {
     pub download_lock: tokio::sync::Mutex<()>,
     pub smtc: smtc::Handle,
     pub upnp: upnp::Handle,
+    pub engine: engine::Handle,
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -48,6 +50,7 @@ pub fn run() {
             let _ = db::backfill_download_mime(&conn);
             let _ = db::requeue_running_jobs(&conn);
             let smtc = smtc::init(app);
+            let engine = engine::Handle::new();
             app.manage(AppState {
                 db: Mutex::new(conn),
                 db_path,
@@ -56,7 +59,15 @@ pub fn run() {
                 download_lock: tokio::sync::Mutex::new(()),
                 smtc,
                 upnp: upnp::Handle::new(),
+                engine: engine.clone(),
             });
+            engine.bind_app(app.handle().clone());
+            #[cfg(windows)]
+            if let Some(window) = app.get_webview_window("main") {
+                if let Ok(hwnd) = window.hwnd() {
+                    engine.set_hwnd(hwnd.0 as usize);
+                }
+            }
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 jobs::worker_loop(handle).await;
@@ -127,6 +138,19 @@ pub fn run() {
             commands::save_upnp_settings,
             commands::start_upnp_server,
             commands::stop_upnp_server,
+            commands::engine_capabilities,
+            commands::engine_list_devices,
+            commands::engine_get_settings,
+            commands::engine_save_settings,
+            commands::engine_probe,
+            commands::engine_open,
+            commands::engine_play,
+            commands::engine_pause,
+            commands::engine_seek,
+            commands::engine_set_speed,
+            commands::engine_set_skip_silence,
+            commands::engine_stop,
+            commands::engine_status,
         ])
         .run(tauri::generate_context!())
         .expect("kunde inte starta HIFI podcast");

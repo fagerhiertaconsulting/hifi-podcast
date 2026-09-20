@@ -36,9 +36,29 @@ axum = "0.8"
 tokio-util = { version = "0.7", features = ["io"] }
 uuid = { version = "1", features = ["v4"] }
 socket2 = { version = "0.6", features = ["all"] }
+symphonia = { version = "0.5.4", default-features = false, features = [
+  "mp3",
+  "aac",
+  "alac",
+  "flac",
+  "ogg",
+  "vorbis",
+  "pcm",
+  "wav",
+  "isomp4",
+  "opt-simd",
+] }
+cpal = "0.15.3"
+rubato = "0.16.2"
 
 [target.'cfg(windows)'.dependencies]
 souvlaki = "0.8"
+wasapi = "0.19"
+winreg = "0.55"
+windows-sys = { version = "0.59", features = [
+  "Win32_Foundation",
+  "Win32_System_Com",
+] }
 
 [profile.release]
 codegen-units = 1

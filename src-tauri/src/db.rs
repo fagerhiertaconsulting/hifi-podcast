@@ -141,6 +141,57 @@ pub fn save_upnp_settings(
     Ok(())
 }
 
+pub fn audio_engine_settings(conn: &Connection) -> AppResult<crate::models::AudioEngineSettings> {
+    let backend = get_setting(conn, "audio_backend")?.unwrap_or_else(|| "native".into());
+    let backend = if backend == "webview" {
+        "webview".into()
+    } else {
+        "native".into()
+    };
+    Ok(crate::models::AudioEngineSettings {
+        backend,
+        output_api: {
+            let v = get_setting(conn, "audio_output_api")?.unwrap_or_else(|| "auto".into());
+            match v.as_str() {
+                "asio" | "wasapi_shared" | "wasapi_exclusive" => v,
+                _ => "auto".into(),
+            }
+        },
+        device_name: get_setting(conn, "audio_device")?.unwrap_or_default(),
+        exclusive: get_setting(conn, "audio_exclusive")?.as_deref() == Some("1"),
+        skip_silence: get_setting(conn, "audio_skip_silence")?.as_deref() == Some("1"),
+    })
+}
+
+pub fn save_audio_engine_settings(
+    conn: &Connection,
+    settings: &crate::models::AudioEngineSettings,
+) -> AppResult<()> {
+    let backend = if settings.backend == "webview" {
+        "webview"
+    } else {
+        "native"
+    };
+    set_setting(conn, "audio_backend", backend)?;
+    let api = match settings.output_api.as_str() {
+        "asio" | "wasapi_shared" | "wasapi_exclusive" => settings.output_api.as_str(),
+        _ => "auto",
+    };
+    set_setting(conn, "audio_output_api", api)?;
+    set_setting(conn, "audio_device", settings.device_name.trim())?;
+    set_setting(
+        conn,
+        "audio_exclusive",
+        if settings.exclusive { "1" } else { "0" },
+    )?;
+    set_setting(
+        conn,
+        "audio_skip_silence",
+        if settings.skip_silence { "1" } else { "0" },
+    )?;
+    Ok(())
+}
+
 pub fn ensure_upnp_uuid(conn: &Connection) -> AppResult<String> {
     if let Some(existing) = get_setting(conn, "upnp_uuid")? {
         if !existing.is_empty() {
@@ -1536,5 +1587,31 @@ mod tests {
         let u1 = ensure_upnp_uuid(&conn).unwrap();
         let u2 = ensure_upnp_uuid(&conn).unwrap();
         assert_eq!(u1, u2);
+    }
+
+    #[test]
+    fn audio_engine_settings_default_native() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize(&conn).unwrap();
+        let s = audio_engine_settings(&conn).unwrap();
+        assert_eq!(s.backend, "native");
+        assert!(!s.exclusive);
+        save_audio_engine_settings(
+            &conn,
+            &crate::models::AudioEngineSettings {
+                backend: "webview".into(),
+                output_api: "asio".into(),
+                device_name: "FiiO ASIO Driver".into(),
+                exclusive: true,
+                skip_silence: true,
+            },
+        )
+        .unwrap();
+        let s = audio_engine_settings(&conn).unwrap();
+        assert_eq!(s.backend, "webview");
+        assert_eq!(s.output_api, "asio");
+        assert_eq!(s.device_name, "FiiO ASIO Driver");
+        assert!(s.exclusive);
+        assert!(s.skip_silence);
     }
 }
