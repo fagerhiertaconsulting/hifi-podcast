@@ -1,7 +1,7 @@
 use crate::error::AppResult;
 use crate::models::{
-    AdSegment, Bookmark, Chapter, Download, Episode, InboxItem, JobRow, LibraryStats, PlaybackState,
-    Podcast, PodcastSettings, QueueItem, Transcript, TranscriptSegment,
+    AdSegment, Bookmark, Chapter, Download, Episode, InboxItem, JobRow, LibraryStats,
+    PlaybackState, Podcast, PodcastSettings, QueueItem, Transcript, TranscriptSegment,
 };
 use rusqlite::{params, Connection, OptionalExtension};
 
@@ -57,6 +57,7 @@ pub fn initialize(conn: &Connection) -> AppResult<()> {
           file_path TEXT,
           bytes INTEGER,
           checksum TEXT,
+          mime TEXT,
           state TEXT NOT NULL,
           error_msg TEXT,
           completed_at TEXT
@@ -80,7 +81,195 @@ pub fn initialize(conn: &Connection) -> AppResult<()> {
     )?;
     migrate_v1(conn)?;
     migrate_episode_guid_scope(conn)?;
+    migrate_upnp(conn)?;
     Ok(())
+}
+
+fn migrate_upnp(conn: &Connection) -> AppResult<()> {
+    let _ = conn.execute("ALTER TABLE download ADD COLUMN mime TEXT", []);
+    conn.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS app_setting (
+          key TEXT PRIMARY KEY,
+          value TEXT NOT NULL
+        );
+        "#,
+    )?;
+    Ok(())
+}
+
+pub fn get_setting(conn: &Connection, key: &str) -> AppResult<Option<String>> {
+    let v = conn
+        .query_row(
+            "SELECT value FROM app_setting WHERE key = ?1",
+            params![key],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(v)
+}
+
+pub fn set_setting(conn: &Connection, key: &str, value: &str) -> AppResult<()> {
+    conn.execute(
+        r#"
+        INSERT INTO app_setting (key, value) VALUES (?1, ?2)
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value
+        "#,
+        params![key, value],
+    )?;
+    Ok(())
+}
+
+pub fn upnp_settings(conn: &Connection) -> AppResult<crate::models::UpnpSettings> {
+    let bind = get_setting(conn, "upnp_bind")?.unwrap_or_default();
+    let port = get_setting(conn, "upnp_port")?
+        .and_then(|s| s.parse::<u16>().ok())
+        .filter(|p| *p > 0)
+        .unwrap_or(8200);
+    Ok(crate::models::UpnpSettings { bind, port })
+}
+
+pub fn save_upnp_settings(
+    conn: &Connection,
+    settings: &crate::models::UpnpSettings,
+) -> AppResult<()> {
+    if settings.port == 0 {
+        return Err(crate::error::AppError::msg("Port måste vara 1–65535."));
+    }
+    set_setting(conn, "upnp_bind", settings.bind.trim())?;
+    set_setting(conn, "upnp_port", &settings.port.to_string())?;
+    Ok(())
+}
+
+pub fn ensure_upnp_uuid(conn: &Connection) -> AppResult<String> {
+    if let Some(existing) = get_setting(conn, "upnp_uuid")? {
+        if !existing.is_empty() {
+            return Ok(existing);
+        }
+    }
+    let uuid = uuid::Uuid::new_v4().to_string();
+    set_setting(conn, "upnp_uuid", &uuid)?;
+    Ok(uuid)
+}
+
+pub fn rewrite_legacy_download_paths(
+    conn: &Connection,
+    media_root: &std::path::Path,
+) -> AppResult<u64> {
+    let mut stmt =
+        conn.prepare("SELECT episode_id, file_path FROM download WHERE file_path IS NOT NULL")?;
+    let rows: Vec<(i64, String)> = stmt
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .filter_map(|r| r.ok())
+        .collect();
+    drop(stmt);
+    let mut n = 0u64;
+    for (episode_id, path) in rows {
+        if let Some(mapped) = crate::download::remap_legacy_file_path(media_root, &path) {
+            conn.execute(
+                "UPDATE download SET file_path = ?1 WHERE episode_id = ?2",
+                params![mapped, episode_id],
+            )?;
+            n += 1;
+        }
+    }
+    Ok(n)
+}
+
+pub fn backfill_download_mime(conn: &Connection) -> AppResult<u64> {
+    let mut stmt = conn.prepare(
+        "SELECT episode_id, file_path FROM download
+         WHERE state = 'done' AND file_path IS NOT NULL
+           AND (mime IS NULL OR mime = '')",
+    )?;
+    let rows: Vec<(i64, String)> = stmt
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .filter_map(|r| r.ok())
+        .collect();
+    drop(stmt);
+    let mut n = 0u64;
+    for (episode_id, path) in rows {
+        let mime = crate::media_mime::from_path(std::path::Path::new(&path));
+        conn.execute(
+            "UPDATE download SET mime = ?1 WHERE episode_id = ?2",
+            params![mime, episode_id],
+        )?;
+        n += 1;
+    }
+    Ok(n)
+}
+
+pub fn list_upnp_podcasts(conn: &Connection) -> AppResult<Vec<(i64, String, Option<String>, i64)>> {
+    let mut stmt = conn.prepare(
+        r#"
+        SELECT p.id, p.title, p.author, COUNT(d.episode_id)
+        FROM podcast p
+        JOIN episode e ON e.podcast_id = p.id
+        JOIN download d ON d.episode_id = e.id
+        WHERE d.state = 'done' AND d.file_path IS NOT NULL
+        GROUP BY p.id
+        ORDER BY p.title COLLATE NOCASE
+        "#,
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+    })?;
+    Ok(rows.filter_map(|r| r.ok()).collect())
+}
+
+pub fn list_upnp_episodes(
+    conn: &Connection,
+    podcast_id: i64,
+) -> AppResult<Vec<crate::models::UpnpEpisode>> {
+    let mut stmt = conn.prepare(
+        r#"
+        SELECT e.id, e.title, p.id, p.title, p.author, e.duration_ms, e.publish_at,
+               d.file_path, d.bytes, d.mime
+        FROM episode e
+        JOIN podcast p ON p.id = e.podcast_id
+        JOIN download d ON d.episode_id = e.id
+        WHERE p.id = ?1 AND d.state = 'done' AND d.file_path IS NOT NULL
+        ORDER BY CASE WHEN e.publish_at IS NULL THEN 1 ELSE 0 END, e.publish_at DESC, e.id DESC
+        "#,
+    )?;
+    let rows = stmt.query_map(params![podcast_id], map_upnp_episode)?;
+    Ok(rows.filter_map(|r| r.ok()).collect())
+}
+
+pub fn get_upnp_episode(
+    conn: &Connection,
+    episode_id: i64,
+) -> AppResult<Option<crate::models::UpnpEpisode>> {
+    let row = conn
+        .query_row(
+            r#"
+            SELECT e.id, e.title, p.id, p.title, p.author, e.duration_ms, e.publish_at,
+                   d.file_path, d.bytes, d.mime
+            FROM episode e
+            JOIN podcast p ON p.id = e.podcast_id
+            JOIN download d ON d.episode_id = e.id
+            WHERE e.id = ?1 AND d.state = 'done' AND d.file_path IS NOT NULL
+            "#,
+            params![episode_id],
+            map_upnp_episode,
+        )
+        .optional()?;
+    Ok(row)
+}
+
+fn map_upnp_episode(row: &rusqlite::Row<'_>) -> rusqlite::Result<crate::models::UpnpEpisode> {
+    Ok(crate::models::UpnpEpisode {
+        episode_id: row.get(0)?,
+        episode_title: row.get(1)?,
+        podcast_id: row.get(2)?,
+        podcast_title: row.get(3)?,
+        author: row.get(4)?,
+        duration_ms: row.get(5)?,
+        publish_at: row.get(6)?,
+        file_path: row.get(7)?,
+        bytes: row.get(8)?,
+        mime: row.get(9)?,
+    })
 }
 
 fn migrate_v1(conn: &Connection) -> AppResult<()> {
@@ -440,20 +629,31 @@ pub fn upsert_download_state(
     checksum: Option<&str>,
     error_msg: Option<&str>,
     completed_at: Option<&str>,
+    mime: Option<&str>,
 ) -> AppResult<()> {
     conn.execute(
         r#"
-        INSERT INTO download (episode_id, file_path, bytes, checksum, state, error_msg, completed_at)
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+        INSERT INTO download (episode_id, file_path, bytes, checksum, mime, state, error_msg, completed_at)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
         ON CONFLICT(episode_id) DO UPDATE SET
-          file_path = excluded.file_path,
-          bytes = excluded.bytes,
-          checksum = excluded.checksum,
+          file_path = COALESCE(excluded.file_path, download.file_path),
+          bytes = COALESCE(excluded.bytes, download.bytes),
+          checksum = COALESCE(excluded.checksum, download.checksum),
+          mime = COALESCE(excluded.mime, download.mime),
           state = excluded.state,
           error_msg = excluded.error_msg,
-          completed_at = excluded.completed_at
+          completed_at = COALESCE(excluded.completed_at, download.completed_at)
         "#,
-        params![episode_id, file_path, bytes, checksum, state, error_msg, completed_at],
+        params![
+            episode_id,
+            file_path,
+            bytes,
+            checksum,
+            mime,
+            state,
+            error_msg,
+            completed_at
+        ],
     )?;
     Ok(())
 }
@@ -461,7 +661,7 @@ pub fn upsert_download_state(
 pub fn get_download(conn: &Connection, episode_id: i64) -> AppResult<Option<Download>> {
     let row = conn
         .query_row(
-            "SELECT id, episode_id, file_path, bytes, checksum, state, error_msg, completed_at
+            "SELECT id, episode_id, file_path, bytes, checksum, mime, state, error_msg, completed_at
              FROM download WHERE episode_id = ?1",
             params![episode_id],
             |row| {
@@ -471,9 +671,10 @@ pub fn get_download(conn: &Connection, episode_id: i64) -> AppResult<Option<Down
                     file_path: row.get(2)?,
                     bytes: row.get(3)?,
                     checksum: row.get(4)?,
-                    state: row.get(5)?,
-                    error_msg: row.get(6)?,
-                    completed_at: row.get(7)?,
+                    mime: row.get(5)?,
+                    state: row.get(6)?,
+                    error_msg: row.get(7)?,
+                    completed_at: row.get(8)?,
                 })
             },
         )
@@ -622,7 +823,12 @@ fn reindex_queue(conn: &Connection) -> AppResult<()> {
     Ok(())
 }
 
-pub fn enqueue_job(conn: &Connection, job_type: &str, episode_id: i64, priority: i64) -> AppResult<i64> {
+pub fn enqueue_job(
+    conn: &Connection,
+    job_type: &str,
+    episode_id: i64,
+    priority: i64,
+) -> AppResult<i64> {
     let existing: i64 = conn.query_row(
         "SELECT COUNT(*) FROM job WHERE episode_id = ?1 AND type = ?2 AND state IN ('queued','running')",
         params![episode_id, job_type],
@@ -678,12 +884,7 @@ pub fn set_job_progress(conn: &Connection, id: i64, msg: &str) -> AppResult<()> 
 pub fn finish_job(conn: &Connection, id: i64, ok: bool, error: Option<&str>) -> AppResult<()> {
     conn.execute(
         "UPDATE job SET state = ?1, error_msg = ?2, updated_at = ?3 WHERE id = ?4",
-        params![
-            if ok { "done" } else { "error" },
-            error,
-            now_rfc3339(),
-            id
-        ],
+        params![if ok { "done" } else { "error" }, error, now_rfc3339(), id],
     )?;
     Ok(())
 }
@@ -831,7 +1032,11 @@ pub fn list_chapters(conn: &Connection, episode_id: i64) -> AppResult<Vec<Chapte
     Ok(rows.filter_map(|r| r.ok()).collect())
 }
 
-pub fn replace_ads(conn: &Connection, episode_id: i64, ads: &[crate::intel::AdDraft]) -> AppResult<()> {
+pub fn replace_ads(
+    conn: &Connection,
+    episode_id: i64,
+    ads: &[crate::intel::AdDraft],
+) -> AppResult<()> {
     conn.execute(
         "DELETE FROM ad_segment WHERE episode_id = ?1 AND method != 'user'",
         params![episode_id],
@@ -864,7 +1069,12 @@ pub fn list_ads(conn: &Connection, episode_id: i64) -> AppResult<Vec<AdSegment>>
     Ok(rows.filter_map(|r| r.ok()).collect())
 }
 
-pub fn add_bookmark(conn: &Connection, episode_id: i64, position_ms: i64, note: &str) -> AppResult<()> {
+pub fn add_bookmark(
+    conn: &Connection,
+    episode_id: i64,
+    position_ms: i64,
+    note: &str,
+) -> AppResult<()> {
     conn.execute(
         "INSERT INTO bookmark (episode_id, position_ms, note, created_at) VALUES (?1, ?2, ?3, ?4)",
         params![episode_id, position_ms, note, now_rfc3339()],
@@ -1054,10 +1264,7 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(
-            get_playback(&conn, eid).unwrap().unwrap().position_ms,
-            1234
-        );
+        assert_eq!(get_playback(&conn, eid).unwrap().unwrap().position_ms, 1234);
         enqueue_job(&conn, "transcribe", eid, 10).unwrap();
         assert!(claim_next_job(&conn).unwrap().is_some());
         assert_eq!(requeue_running_jobs(&conn).unwrap(), 1);
@@ -1069,15 +1276,40 @@ mod tests {
     fn episode_guid_unique_per_podcast_not_global() {
         let conn = Connection::open_in_memory().unwrap();
         initialize(&conn).unwrap();
-        let a = upsert_podcast(&conn, "https://a.example/feed.xml", "A", None, None, None, None)
-            .unwrap();
-        let b = upsert_podcast(&conn, "https://b.example/feed.xml", "B", None, None, None, None)
-            .unwrap();
+        let a = upsert_podcast(
+            &conn,
+            "https://a.example/feed.xml",
+            "A",
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let b = upsert_podcast(
+            &conn,
+            "https://b.example/feed.xml",
+            "B",
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         let e1 = upsert_episode(&conn, a, "same-guid", "Ep A", None, None, None, None).unwrap();
         let e2 = upsert_episode(&conn, b, "same-guid", "Ep B", None, None, None, None).unwrap();
         assert_ne!(e1, e2);
-        let e1b = upsert_episode(&conn, a, "same-guid", "Ep A uppdaterad", None, None, None, None)
-            .unwrap();
+        let e1b = upsert_episode(
+            &conn,
+            a,
+            "same-guid",
+            "Ep A uppdaterad",
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         assert_eq!(e1, e1b);
         assert_eq!(get_episode(&conn, e1).unwrap().title, "Ep A uppdaterad");
     }
@@ -1143,9 +1375,120 @@ mod tests {
             None,
         )
         .unwrap();
-        let id = upsert_episode(&conn, other, "g1", "Same guid other show", None, None, None, None)
-            .unwrap();
+        let id = upsert_episode(
+            &conn,
+            other,
+            "g1",
+            "Same guid other show",
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         assert!(id > 0);
         assert_eq!(get_episode(&conn, 1).unwrap().title, "E1");
+    }
+
+    #[test]
+    fn stores_mime_and_lists_upnp_tree() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize(&conn).unwrap();
+        let pid = upsert_podcast(
+            &conn,
+            "https://example.com/feed.xml",
+            "Show",
+            Some("Host"),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let eid = upsert_episode(
+            &conn,
+            pid,
+            "g",
+            "Ep",
+            None,
+            Some("https://example.com/a.mp3"),
+            None,
+            Some(90_000),
+        )
+        .unwrap();
+        upsert_download_state(
+            &conn,
+            eid,
+            "done",
+            Some("/data/media/podcasts/1/1.mp3"),
+            Some(12),
+            Some("ab"),
+            None,
+            Some("t"),
+            Some("audio/mpeg"),
+        )
+        .unwrap();
+        let d = get_download(&conn, eid).unwrap().unwrap();
+        assert_eq!(d.mime.as_deref(), Some("audio/mpeg"));
+        let shows = list_upnp_podcasts(&conn).unwrap();
+        assert_eq!(shows.len(), 1);
+        assert_eq!(shows[0].3, 1);
+        let eps = list_upnp_episodes(&conn, pid).unwrap();
+        assert_eq!(eps[0].episode_title, "Ep");
+        assert_eq!(eps[0].mime.as_deref(), Some("audio/mpeg"));
+    }
+
+    #[test]
+    fn backfills_mime_from_path_and_rewrites_legacy_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let media = dir.path().join("media");
+        std::fs::create_dir_all(media.join("podcasts")).unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        initialize(&conn).unwrap();
+        let pid = upsert_podcast(&conn, "https://e/x", "S", None, None, None, None).unwrap();
+        let eid = upsert_episode(&conn, pid, "g", "E", None, None, None, None).unwrap();
+        let legacy = media.join("1").join("1.m4a");
+        upsert_download_state(
+            &conn,
+            eid,
+            "done",
+            Some(&legacy.display().to_string()),
+            Some(1),
+            None,
+            None,
+            Some("t"),
+            None,
+        )
+        .unwrap();
+        assert_eq!(rewrite_legacy_download_paths(&conn, &media).unwrap(), 1);
+        let d = get_download(&conn, eid).unwrap().unwrap();
+        assert!(d.file_path.unwrap().contains("podcasts"));
+        assert_eq!(backfill_download_mime(&conn).unwrap(), 1);
+        assert_eq!(
+            get_download(&conn, eid).unwrap().unwrap().mime.as_deref(),
+            Some("audio/mp4")
+        );
+    }
+
+    #[test]
+    fn upnp_settings_roundtrip() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize(&conn).unwrap();
+        let s = upnp_settings(&conn).unwrap();
+        assert_eq!(s.port, 8200);
+        assert!(s.bind.is_empty());
+        save_upnp_settings(
+            &conn,
+            &crate::models::UpnpSettings {
+                bind: "192.168.1.20".into(),
+                port: 8201,
+            },
+        )
+        .unwrap();
+        let s = upnp_settings(&conn).unwrap();
+        assert_eq!(s.bind, "192.168.1.20");
+        assert_eq!(s.port, 8201);
+        let u1 = ensure_upnp_uuid(&conn).unwrap();
+        let u2 = ensure_upnp_uuid(&conn).unwrap();
+        assert_eq!(u1, u2);
     }
 }

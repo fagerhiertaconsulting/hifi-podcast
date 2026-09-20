@@ -52,8 +52,9 @@ export type Download = {
   episode_id: number;
   file_path: string | null;
   bytes: number | null;
-  checksum: string | null;
-  state: string;
+    checksum: string | null;
+    mime: string | null;
+    state: string;
   error_msg: string | null;
   completed_at: string | null;
 };
@@ -175,6 +176,21 @@ export type AppPaths = {
   data_dir: string;
   models_dir: string;
   bin_dir: string;
+};
+
+export type UpnpSettings = {
+  bind: string;
+  port: number;
+};
+
+export type UpnpStatus = {
+  running: boolean;
+  bind: string;
+  port: number;
+  location: string | null;
+  lan_ip: string | null;
+  uuid: string;
+  error: string | null;
 };
 
 export type View = "library" | "inbox" | "queue" | "stats" | "settings";

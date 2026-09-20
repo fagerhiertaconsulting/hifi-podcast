@@ -16,10 +16,10 @@ Implementerat i appen (se [v1-asr.md](v1-asr.md)):
 
 Se [music-roadmap.md](music-roadmap.md). Inte i podkastabeller. Delad engine enligt [audio.md](audio.md).
 
-## UPnP/DLNA (efter lokal spelare)
+## UPnP/DLNA (PR #3 — podcastträd)
 
-Se [upnp-mediaserver.md](upnp-mediaserver.md). Server först (Onkyo TX-RZ50). Renderer/control point är v2+.
+Se [upnp-mediaserver.md](upnp-mediaserver.md). **Media Server** mot Onkyo TX-RZ50: ContentDirectory `Podcasts/<show>/<episode>` streamar originalfiler med HTTP Range. `Music/` är en tom stub. Renderer/control point *i appen* är v2+. Transkod-fallback är inte med i v1 av servern.
 
-## Medvetet utanför den här branchen
+## Medvetet utanför
 
-Whisper, ad-ML, full UPnP-serverimplementation, musikbibliotek, Car Mode, Chromecast/Sonos.
+Musikbibliotek / FLAC-DSD-UI, native Symphonia/WASAPI exclusive, moln-ASR, reklam-cut ML, Chromecast/Sonos-specifikt, in-app UPnP-renderer.

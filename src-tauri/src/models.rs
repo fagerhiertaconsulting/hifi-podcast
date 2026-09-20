@@ -59,6 +59,7 @@ pub struct Download {
     pub file_path: Option<String>,
     pub bytes: Option<i64>,
     pub checksum: Option<String>,
+    pub mime: Option<String>,
     pub state: String,
     pub error_msg: Option<String>,
     pub completed_at: Option<String>,
@@ -92,6 +93,37 @@ pub struct AppPaths {
     pub data_dir: String,
     pub models_dir: String,
     pub bin_dir: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpnpSettings {
+    pub bind: String,
+    pub port: u16,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpnpStatus {
+    pub running: bool,
+    pub bind: String,
+    pub port: u16,
+    pub location: Option<String>,
+    pub lan_ip: Option<String>,
+    pub uuid: String,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct UpnpEpisode {
+    pub episode_id: i64,
+    pub episode_title: String,
+    pub podcast_id: i64,
+    pub podcast_title: String,
+    pub author: Option<String>,
+    pub duration_ms: Option<i64>,
+    pub publish_at: Option<String>,
+    pub file_path: String,
+    pub bytes: Option<i64>,
+    pub mime: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

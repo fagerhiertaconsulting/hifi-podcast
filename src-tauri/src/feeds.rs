@@ -106,9 +106,8 @@ pub async fn fetch_text(url: &str) -> AppResult<String> {
     crate::net::validate_http_url(url)?;
     let client = crate::net::http_client()?;
     let bytes = crate::net::get_limited(&client, url, crate::net::MAX_FEED_BYTES).await?;
-    String::from_utf8(bytes).map_err(|_| {
-        AppError::msg("Feeden är inte giltig text (förväntade UTF-8).")
-    })
+    String::from_utf8(bytes)
+        .map_err(|_| AppError::msg("Feeden är inte giltig text (förväntade UTF-8)."))
 }
 
 pub fn import_opml_urls(xml: &str) -> AppResult<Vec<String>> {
@@ -178,7 +177,10 @@ mod tests {
         let feed = parse_feed(xml, "https://example.com/feed.xml").unwrap();
         assert_eq!(feed.title, "HiFi Test");
         assert_eq!(feed.episodes.len(), 1);
-        assert_eq!(feed.episodes[0].audio_url.as_deref(), Some("https://cdn.example.com/ep1.mp3"));
+        assert_eq!(
+            feed.episodes[0].audio_url.as_deref(),
+            Some("https://cdn.example.com/ep1.mp3")
+        );
     }
 
     #[test]

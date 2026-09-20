@@ -19,6 +19,8 @@ import type {
   SubscribeOutcome,
   Transcript,
   TranscriptSegment,
+  UpnpSettings,
+  UpnpStatus,
 } from "./types";
 
 export const api = {
@@ -82,4 +84,10 @@ export const api = {
   sideloadFile: (path: string) => invoke<Episode>("sideload_file", { path }),
   smtcNowPlaying: (title: string, artist: string, playing: boolean) =>
     invoke<void>("smtc_now_playing", { title, artist, playing }),
+  upnpStatus: () => invoke<UpnpStatus>("upnp_status"),
+  getUpnpSettings: () => invoke<UpnpSettings>("get_upnp_settings"),
+  saveUpnpSettings: (settings: UpnpSettings) =>
+    invoke<UpnpSettings>("save_upnp_settings", { settings }),
+  startUpnpServer: () => invoke<UpnpStatus>("start_upnp_server"),
+  stopUpnpServer: () => invoke<UpnpStatus>("stop_upnp_server"),
 };

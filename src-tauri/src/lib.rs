@@ -6,9 +6,11 @@ mod error;
 mod feeds;
 mod intel;
 mod jobs;
+mod media_mime;
 mod models;
 mod net;
 mod smtc;
+mod upnp;
 
 use rusqlite::Connection;
 use std::fs;
@@ -23,6 +25,7 @@ pub struct AppState {
     pub data_dir: PathBuf,
     pub download_lock: tokio::sync::Mutex<()>,
     pub smtc: smtc::Handle,
+    pub upnp: upnp::Handle,
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -37,9 +40,12 @@ pub fn run() {
             fs::create_dir_all(asr::bin_dir(&data_dir))?;
             let media_root = data_dir.join("media");
             fs::create_dir_all(&media_root)?;
+            let _ = download::ensure_media_layout(&media_root);
             let db_path = data_dir.join("db.sqlite");
             let conn = Connection::open(&db_path)?;
             db::initialize(&conn)?;
+            let _ = db::rewrite_legacy_download_paths(&conn, &media_root);
+            let _ = db::backfill_download_mime(&conn);
             let _ = db::requeue_running_jobs(&conn);
             let smtc = smtc::init(app);
             app.manage(AppState {
@@ -49,6 +55,7 @@ pub fn run() {
                 data_dir,
                 download_lock: tokio::sync::Mutex::new(()),
                 smtc,
+                upnp: upnp::Handle::new(),
             });
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
@@ -115,6 +122,11 @@ pub fn run() {
             commands::library_stats,
             commands::sideload_file,
             commands::smtc_now_playing,
+            commands::upnp_status,
+            commands::get_upnp_settings,
+            commands::save_upnp_settings,
+            commands::start_upnp_server,
+            commands::stop_upnp_server,
         ])
         .run(tauri::generate_context!())
         .expect("kunde inte starta HIFI podcast");

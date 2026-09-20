@@ -43,12 +43,13 @@ Tauri lägger appdata under `%LOCALAPPDATA%\consulting.fagerhierta.hifi-podcast\
 
 | Sökväg | Innehåll |
 |--------|----------|
-| `db.sqlite` | Prenumerationer, avsnitt, kö, transkript, jobb |
-| `media/<podcast_id>/<episode_id>.<ext>` | **Original** enclosure-filer |
+| `db.sqlite` | Prenumerationer, avsnitt, kö, transkript, jobb, UPnP-inställningar |
+| `media/podcasts/<podcast_id>/<episode_id>.<ext>` | **Original** enclosure-filer |
+| `media/music/` | Reserverad (tom) för senare musikmodul |
 | `models/ggml-small.bin` | Whisper-modell (nedladdas av användaren) |
 | `bin/whisper-cli.exe` | whisper.cpp sidecar (Windows: Inställningar → Ladda ner whisper-cli) |
 
-Samma `media/`-root är avsiktligt delbar med en framtida UPnP/DLNA-server (Onkyo TX-RZ50). Se [docs/upnp-mediaserver.md](docs/upnp-mediaserver.md).
+Äldre layout `media/<podcast_id>/…` migreras automatiskt till `media/podcasts/…`. Samma media-root används av UPnP/DLNA-servern (Onkyo TX-RZ50). Se [docs/upnp-mediaserver.md](docs/upnp-mediaserver.md).
 
 ## MVP i den här branchen
 
@@ -59,9 +60,15 @@ Samma `media/`-root är avsiktligt delbar med en framtida UPnP/DLNA-server (Onky
 - Spelare: play/paus, seek, hastighet, ±15/±30 s, kö, sovtimer, sparad position
 - Per-podcast: hastighet, auto-nedladdning, intro/outro-skip, opt-in hoppa tystnad
 
-**Inte i koden ännu:** full UPnP-server, musikbibliotek, reklam-cut, moln-ASR.
+**Inte i koden ännu:** musikbibliotek, reklam-cut, moln-ASR, in-app UPnP-renderer.
 
 v1 (lokal intelligens) finns i appen: se [docs/v1-asr.md](docs/v1-asr.md).
+
+### UPnP/DLNA-mediaserver (Windows + Onkyo)
+
+Inställningar → **UPnP/DLNA-mediaserver** → **Starta mediaserver** (port 8200). Receivern ska se **HIFI podcast** och bläddra `Podcasts`. Originalfiler streamas med HTTP Range; ingen omkodning.
+
+**Brandvägg:** tillåt appen på privat nätverk när Windows frågar (inget admin-krav för att starta servern). Om Onkyo inte hittar den: inbound **TCP 8200** (eller vald port) och **UDP 1900** (SSDP) på den privata profilen. Steg-för-steg: [docs/upnp-mediaserver.md](docs/upnp-mediaserver.md).
 
 ## Dokumentation
 

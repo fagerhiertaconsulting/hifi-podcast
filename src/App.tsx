@@ -655,6 +655,7 @@ export default function App() {
               await api.exportOpmlFile(path);
               setStatus("OPML exporterad.");
             }}
+            onStatus={setStatus}
           />
         )}
       </main>
@@ -1098,6 +1099,7 @@ function SettingsView(props: {
   onDownloadAll: () => void;
   onSideload: () => void;
   onExport: () => void;
+  onStatus: (s: string) => void;
 }) {
   return (
     <section className="settings">
@@ -1116,6 +1118,7 @@ function SettingsView(props: {
       </label>
       <button onClick={props.onSideload}>Importera ljudfil (sideload)…</button>
       <button onClick={props.onExport}>Exportera OPML…</button>
+      <UpnpSettingsPanel onStatus={props.onStatus} />
       <AsrSettings
         status={props.asr}
         pathsBin={props.paths?.bin_dir}
@@ -1135,5 +1138,127 @@ function SettingsView(props: {
         </dl>
       )}
     </section>
+  );
+}
+
+function UpnpSettingsPanel(props: { onStatus: (s: string) => void }) {
+  const [bind, setBind] = useState("");
+  const [port, setPort] = useState(8200);
+  const [busy, setBusy] = useState(false);
+  const [status, setLocalStatus] = useState<import("./types").UpnpStatus | null>(null);
+
+  const refresh = useCallback(async () => {
+    const [settings, st] = await Promise.all([api.getUpnpSettings(), api.upnpStatus()]);
+    setBind(settings.bind);
+    setPort(settings.port);
+    setLocalStatus(st);
+  }, []);
+
+  useEffect(() => {
+    void refresh().catch((err) => props.onStatus(String(err)));
+    // Intentionally not depending on props: onStatus is a stable setState.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [refresh]);
+
+  const save = async () => {
+    setBusy(true);
+    try {
+      const next = await api.saveUpnpSettings({ bind: bind.trim(), port });
+      setBind(next.bind);
+      setPort(next.port);
+      props.onStatus("UPnP-inställningar sparade.");
+    } catch (err) {
+      props.onStatus(String(err));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const start = async () => {
+    setBusy(true);
+    try {
+      await api.saveUpnpSettings({ bind: bind.trim(), port });
+      const st = await api.startUpnpServer();
+      setLocalStatus(st);
+      props.onStatus(
+        st.location
+          ? `Mediaserver igång: ${st.location}`
+          : "Mediaserver startad.",
+      );
+    } catch (err) {
+      props.onStatus(String(err));
+      await refresh().catch(() => undefined);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const stop = async () => {
+    setBusy(true);
+    try {
+      const st = await api.stopUpnpServer();
+      setLocalStatus(st);
+      props.onStatus("Mediaserver stoppad.");
+    } catch (err) {
+      props.onStatus(String(err));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="upnp-panel">
+      <h2>UPnP/DLNA-mediaserver</h2>
+      <p>
+        HIFI podcast är servern. Onkyo TX-RZ50 (eller annan renderer) bläddrar i{" "}
+        <strong>Podcasts</strong> och spelar originalfilerna. Mappen{" "}
+        <strong>Music</strong> är tom tills musikmodulen finns. Ingen omkodning.
+      </p>
+      <div className="settings-grid">
+        <label>
+          Bindningsadress
+          <input
+            value={bind}
+            onChange={(e) => setBind(e.target.value)}
+            placeholder="Tom = LAN-gränssnitt (0.0.0.0)"
+            spellCheck={false}
+          />
+        </label>
+        <label>
+          Port
+          <input
+            type="number"
+            min={1}
+            max={65535}
+            value={port}
+            onChange={(e) => setPort(Number(e.target.value) || 8200)}
+          />
+        </label>
+      </div>
+      <div className="row-actions">
+        <button onClick={() => void save()} disabled={busy}>
+          Spara
+        </button>
+        <button className="primary" onClick={() => void start()} disabled={busy || status?.running}>
+          Starta mediaserver
+        </button>
+        <button onClick={() => void stop()} disabled={busy || !status?.running}>
+          Stoppa mediaserver
+        </button>
+      </div>
+      <p className="sidebar-note">
+        {status?.running
+          ? `Igång på ${status.location ?? `${status.bind}:${status.port}`}${
+              status.lan_ip ? ` (LAN ${status.lan_ip})` : ""
+            }.`
+          : `Stoppad. Standardport 8200. Upptäckt LAN: ${status?.lan_ip ?? "okänt"}.`}
+        {status?.error ? ` Fel: ${status.error}` : ""}
+      </p>
+      <p className="sidebar-note">
+        Windows-brandvägg: tillåt HIFI podcast för privat nätverk när Windows frågar.
+        Öppna TCP-porten (8200) och UDP 1900 (SSDP) om receivern inte ser servern. Inget
+        administratörskonto krävs för att starta servern.
+      </p>
+    </div>
   );
 }

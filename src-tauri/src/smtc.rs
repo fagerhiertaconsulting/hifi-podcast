@@ -1,6 +1,8 @@
 #[cfg(windows)]
 mod windows_smtc {
-    use souvlaki::{MediaControlEvent, MediaControls, MediaMetadata, MediaPlayback, PlatformConfig};
+    use souvlaki::{
+        MediaControlEvent, MediaControls, MediaMetadata, MediaPlayback, PlatformConfig,
+    };
     use std::sync::{Arc, Mutex};
     use tauri::{AppHandle, Emitter, Manager};
 
