@@ -1,10 +1,12 @@
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
-/// Interleaved f32 ring. try-lock in the audio callback; silence on contention.
+/// Interleaved f32 ring. try-lock in the audio callback; silence + underrun count on contention.
 pub struct FrameRing {
     inner: Mutex<VecDeque<f32>>,
     channels: usize,
+    underruns: AtomicU64,
 }
 
 impl FrameRing {
@@ -12,11 +14,20 @@ impl FrameRing {
         Self {
             inner: Mutex::new(VecDeque::with_capacity(48_000 * channels.max(1))),
             channels: channels.max(1),
+            underruns: AtomicU64::new(0),
         }
     }
 
     pub fn channels(&self) -> usize {
         self.channels
+    }
+
+    pub fn underrun_count(&self) -> u64 {
+        self.underruns.load(Ordering::Relaxed)
+    }
+
+    pub fn note_underrun(&self) {
+        self.underruns.fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn clear(&self) {
@@ -39,9 +50,11 @@ impl FrameRing {
     }
 
     /// Fill `out` with frames. Returns frames written (not samples). Remainder is silence.
+    /// Contention on the mutex is an underrun (counted); it is never silent without a metric.
     pub fn pop_interleaved(&self, out: &mut [f32]) -> usize {
         let Some(mut g) = self.inner.try_lock().ok() else {
             out.fill(0.0);
+            self.note_underrun();
             return 0;
         };
         let n = out.len().min(g.len());
@@ -52,5 +65,33 @@ impl FrameRing {
             *slot = 0.0;
         }
         n / self.channels
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn contention_counts_underrun_and_writes_silence() {
+        let ring = FrameRing::new(2);
+        ring.push_interleaved(&[0.5, -0.5, 0.25, -0.25]);
+        let _hold = ring.inner.lock().unwrap();
+        let mut out = [1.0f32, 1.0, 1.0, 1.0];
+        assert_eq!(ring.pop_interleaved(&mut out), 0);
+        assert!(out.iter().all(|s| *s == 0.0));
+        assert_eq!(ring.underrun_count(), 1);
+        ring.note_underrun();
+        assert_eq!(ring.underrun_count(), 2);
+    }
+
+    #[test]
+    fn pop_without_contention_does_not_count_underrun() {
+        let ring = FrameRing::new(2);
+        ring.push_interleaved(&[1.0, 2.0, 3.0, 4.0]);
+        let mut out = [0.0f32; 4];
+        assert_eq!(ring.pop_interleaved(&mut out), 2);
+        assert_eq!(out, [1.0, 2.0, 3.0, 4.0]);
+        assert_eq!(ring.underrun_count(), 0);
     }
 }

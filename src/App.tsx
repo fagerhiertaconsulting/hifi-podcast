@@ -283,35 +283,52 @@ export default function App() {
         filePathRef.current = filePath;
         const useNative = (engineSettings?.backend ?? "native") !== "webview";
         nativeRef.current = useNative;
+        let statusLine: string;
         if (useNative) {
           audio.pause();
           audio.removeAttribute("src");
           audio.load();
-          const st = await api.engineOpen({
-            path: filePath,
-            speed: nextSpeed,
-            skipSilence: useSkip,
-            outputApi: engineSettings?.output_api,
-            deviceName: engineSettings?.device_name,
-          });
-          const startMs = Math.max(0, startSec) * 1000;
-          await api.engineSeek(Math.floor(startMs));
-          await api.enginePlay();
-          setDuration((st.duration_ms || 0) / 1000);
-          setPosition(startSec);
-          positionRef.current = startSec;
+          try {
+            const st = await api.engineOpen({
+              path: filePath,
+              speed: nextSpeed,
+              skipSilence: useSkip,
+              outputApi: engineSettings?.output_api,
+              deviceName: engineSettings?.device_name,
+            });
+            const startMs = Math.max(0, startSec) * 1000;
+            await api.engineSeek(Math.floor(startMs));
+            await api.enginePlay();
+            setDuration((st.duration_ms || 0) / 1000);
+            setPosition(startSec);
+            positionRef.current = startSec;
+            const apiLabel =
+              engineSettings?.output_api === "asio" ||
+              !engineSettings?.output_api ||
+              engineSettings.output_api === "auto"
+                ? "ASIO/WASAPI"
+                : engineSettings.output_api;
+            statusLine = `Spelar native (${apiLabel}): ${next.episode.title}`;
+          } catch (nativeErr) {
+            nativeRef.current = false;
+            await api.engineStop();
+            await loadPlaybackSource(audio, filePath, useSkip, nextSpeed);
+            audio.currentTime = Math.max(0, startSec);
+            await audio.play();
+            setDuration(Number.isFinite(audio.duration) ? audio.duration : 0);
+            setPosition(startSec);
+            positionRef.current = startSec;
+            statusLine = `Native utgång misslyckades (${String(nativeErr)}). Spelar via WebView2: ${next.episode.title}`;
+          }
         } else {
           await api.engineStop();
           await loadPlaybackSource(audio, filePath, useSkip, nextSpeed);
           audio.currentTime = Math.max(0, startSec);
           await audio.play();
+          statusLine = `Spelar (WebView2): ${next.episode.title}`;
         }
         setPlaying(true);
-        setStatus(
-          useNative
-            ? `Spelar native (${engineSettings?.output_api === "asio" || !engineSettings?.output_api || engineSettings.output_api === "auto" ? "ASIO/WASAPI" : engineSettings.output_api}): ${next.episode.title}`
-            : `Spelar (WebView2): ${next.episode.title}`,
-        );
+        setStatus(statusLine);
         if (selectedId !== next.podcast.id) {
           setSelectedId(next.podcast.id);
         }

@@ -46,6 +46,7 @@ pub struct EngineStatus {
     pub resampled: bool,
     pub speed: f64,
     pub skip_silence: bool,
+    pub underruns: u64,
     pub error: Option<String>,
 }
 
@@ -68,6 +69,7 @@ impl Default for EngineStatus {
             resampled: false,
             speed: 1.0,
             skip_silence: false,
+            underruns: 0,
             error: None,
         }
     }
@@ -252,6 +254,7 @@ impl Handle {
                 resampled,
                 speed,
                 skip_silence,
+                underruns: 0,
                 error: None,
             };
         }
@@ -359,7 +362,23 @@ fn wasapi_device_name(name: &str) -> Option<&str> {
     if let Some(rest) = n.strip_prefix("wasapi:") {
         return Some(rest);
     }
-    if n.starts_with("asio:") || super::asio_host::is_preferred_hi_fi_name(n) {
+    if n.starts_with("asio:") {
+        return None;
+    }
+    Some(n)
+}
+
+/// Auto-fallback to WASAPI must not look up an ASIO driver name as a WASAPI device
+/// (that fails open). Explicit WASAPI names are kept. ASIO-only names use system default.
+fn wasapi_name_for_auto_fallback(name: &str) -> Option<&str> {
+    let n = wasapi_device_name(name)?;
+    if super::asio_host::is_preferred_hi_fi_name(n) {
+        return None;
+    }
+    if super::asio_host::list_asio_drivers()
+        .iter()
+        .any(|d| d.name.eq_ignore_ascii_case(n) || d.clsid.eq_ignore_ascii_case(n))
+    {
         return None;
     }
     Some(n)
@@ -397,21 +416,31 @@ fn open_output(
         "wasapi_shared" | "wasapi" | "shared" => {
             open_shared(device_name, sample_rate, channels, ring, playing)
         }
-        _ => match open_asio(device_name, sample_rate, hwnd, ring.clone(), playing.clone()) {
-            Ok(s) => Ok(s),
-            Err(asio_err) => match open_exclusive(
+        _ => {
+            let wasapi_name = wasapi_name_for_auto_fallback(device_name).unwrap_or("");
+            match open_asio(
                 device_name,
                 sample_rate,
-                channels,
+                hwnd,
                 ring.clone(),
                 playing.clone(),
             ) {
                 Ok(s) => Ok(s),
-                Err(_) => open_shared(device_name, sample_rate, channels, ring, playing).map_err(
-                    |wasapi_err| EngineError::msg(format!("ASIO: {asio_err} WASAPI: {wasapi_err}")),
-                ),
-            },
-        },
+                Err(asio_err) => match open_exclusive(
+                    wasapi_name,
+                    sample_rate,
+                    channels,
+                    ring.clone(),
+                    playing.clone(),
+                ) {
+                    Ok(s) => Ok(s),
+                    Err(_) => open_shared(wasapi_name, sample_rate, channels, ring, playing)
+                        .map_err(|wasapi_err| {
+                            EngineError::msg(format!("ASIO: {asio_err} WASAPI: {wasapi_err}"))
+                        }),
+                },
+            }
+        }
     }
 }
 
@@ -505,6 +534,7 @@ fn decode_loop(
     let mut source_consumed: u64 = 0;
     let mut ended = false;
     let mut last_emit = std::time::Instant::now();
+    let mut last_underruns = 0u64;
 
     while !stop.load(Ordering::Relaxed) {
         while let Ok(cmd) = rx.try_recv() {
@@ -548,7 +578,8 @@ fn decode_loop(
 
         let high_water = (out_rate as usize) * 2 / 5; // ~400 ms
         if playing.load(Ordering::Relaxed) && ring.len_frames() < high_water && !ended {
-            match decoder.read_interleaved((source_rate as usize / 10) * decoder.spec().channels as usize)
+            match decoder
+                .read_interleaved((source_rate as usize / 10) * decoder.spec().channels as usize)
             {
                 Ok(raw) if raw.is_empty() => {
                     ended = decoder.is_eof();
@@ -565,8 +596,7 @@ fn decode_loop(
                     source_consumed += frames;
                     let pcm = stereo;
                     if extra_ms > 0.0 {
-                        let skip_frames =
-                            ((extra_ms / 1000.0) * source_rate as f32) as u64;
+                        let skip_frames = ((extra_ms / 1000.0) * source_rate as f32) as u64;
                         let pos_ms = source_consumed * 1000 / source_rate.max(1) as u64;
                         if decoder.seek_ms(pos_ms + extra_ms as u64).is_ok() {
                             source_consumed += skip_frames;
@@ -603,11 +633,19 @@ fn decode_loop(
             };
             let audible = source_consumed.saturating_sub(buffered_source as u64);
             let pos_ms = audible * 1000 / source_rate.max(1) as u64;
+            let underruns = ring.underrun_count();
+            if underruns > last_underruns {
+                eprintln!(
+                    "native audio underrun: ring try_lock contended or callback re-entry (count {underruns})"
+                );
+                last_underruns = underruns;
+            }
             if let Ok(mut st) = status.lock() {
                 st.position_ms = pos_ms;
                 st.playing = playing.load(Ordering::Relaxed);
                 st.ended = ended;
                 st.speed = speed;
+                st.underruns = underruns;
             }
             emit_tick(&app, &status);
         }
@@ -638,5 +676,26 @@ fn emit_ended(app: &Arc<Mutex<Option<AppHandle>>>, status: &Arc<Mutex<EngineStat
                 let _ = app.emit("engine-ended", snap);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn auto_fallback_keeps_wasapi_device_name() {
+        assert_eq!(
+            wasapi_name_for_auto_fallback("Speakers (Realtek)"),
+            Some("Speakers (Realtek)")
+        );
+        assert_eq!(wasapi_name_for_auto_fallback("wasapi:HDMI"), Some("HDMI"));
+    }
+
+    #[test]
+    fn auto_fallback_does_not_pass_asio_names_to_wasapi() {
+        assert_eq!(wasapi_name_for_auto_fallback("asio:{aabb}"), None);
+        assert_eq!(wasapi_name_for_auto_fallback("FiiO ASIO Driver"), None);
+        assert_eq!(wasapi_name_for_auto_fallback(""), None);
     }
 }

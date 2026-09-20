@@ -7,8 +7,10 @@
 use super::ring::FrameRing;
 use super::EngineError;
 use serde::Serialize;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::cell::UnsafeCell;
+use std::ptr;
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, Ordering};
+use std::sync::Arc;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct AsioDriverInfo {
@@ -43,6 +45,13 @@ impl SampleType {
 
     fn is_dsd(self) -> bool {
         matches!(self, Self::Dsd)
+    }
+
+    fn is_pcm(self) -> bool {
+        matches!(
+            self,
+            Self::F32Le | Self::I16Le | Self::I24Le | Self::I32Le | Self::I32Le24
+        )
     }
 }
 
@@ -106,7 +115,7 @@ impl Drop for AsioStream {
         if let Some(h) = self.thread.take() {
             let _ = h.join();
         }
-        clear_callback_state();
+        uninstall_rt_host();
     }
 }
 
@@ -130,7 +139,10 @@ pub fn start_asio(
     }
 }
 
-struct CallbackState {
+/// Realtime host published to ASIO `bufferSwitch` via atomic pointer (no Mutex in the callback).
+/// Fields are read from the Windows ASIO callback; Linux tests only install/uninstall the pointer.
+#[allow(dead_code)]
+struct RtHost {
     ring: Arc<FrameRing>,
     playing: Arc<AtomicBool>,
     buffers: Vec<[*mut u8; 2]>,
@@ -138,21 +150,64 @@ struct CallbackState {
     sample_type: SampleType,
     channels: usize,
     stop: Arc<AtomicBool>,
+    scratch: UnsafeCell<Vec<f32>>,
+    scratch_busy: AtomicBool,
 }
 
-unsafe impl Send for CallbackState {}
-unsafe impl Sync for CallbackState {}
+unsafe impl Send for RtHost {}
+unsafe impl Sync for RtHost {}
 
-static CALLBACK: OnceLock<Mutex<Option<CallbackState>>> = OnceLock::new();
+static RT_HOST: AtomicPtr<RtHost> = AtomicPtr::new(ptr::null_mut());
+static RT_IN_FLIGHT: AtomicU32 = AtomicU32::new(0);
+static ASIO_RESET: AtomicBool = AtomicBool::new(false);
 
-fn callback_slot() -> &'static Mutex<Option<CallbackState>> {
-    CALLBACK.get_or_init(|| Mutex::new(None))
+fn install_rt_host(host: Box<RtHost>) {
+    uninstall_rt_host();
+    RT_HOST.store(Box::into_raw(host), Ordering::Release);
 }
 
-fn clear_callback_state() {
-    if let Ok(mut g) = callback_slot().lock() {
-        *g = None;
+fn uninstall_rt_host() {
+    let ptr = RT_HOST.swap(ptr::null_mut(), Ordering::AcqRel);
+    if ptr.is_null() {
+        return;
     }
+    let started = std::time::Instant::now();
+    while RT_IN_FLIGHT.load(Ordering::Acquire) != 0 {
+        std::thread::yield_now();
+        if started.elapsed() > std::time::Duration::from_millis(500) {
+            // Prefer a leak over dropping a host a callback may still touch.
+            eprintln!(
+                "ASIO: rt-host timeout while callbacks in flight — leaking to avoid use-after-free"
+            );
+            return;
+        }
+    }
+    unsafe {
+        drop(Box::from_raw(ptr));
+    }
+}
+
+fn new_rt_host(
+    ring: Arc<FrameRing>,
+    playing: Arc<AtomicBool>,
+    stop: Arc<AtomicBool>,
+    buffers: Vec<[*mut u8; 2]>,
+    frames: usize,
+    sample_type: SampleType,
+    channels: usize,
+) -> Box<RtHost> {
+    let n = frames.saturating_mul(channels.max(1));
+    Box::new(RtHost {
+        ring,
+        playing,
+        buffers,
+        frames,
+        sample_type,
+        channels,
+        stop,
+        scratch: UnsafeCell::new(vec![0.0f32; n]),
+        scratch_busy: AtomicBool::new(false),
+    })
 }
 
 #[cfg(windows)]
@@ -160,13 +215,13 @@ mod windows_impl {
     use super::*;
     use std::ffi::{c_long, c_void};
     use std::ptr;
-    use winreg::enums::HKEY_LOCAL_MACHINE;
-    use winreg::RegKey;
     use windows_sys::core::GUID;
     use windows_sys::Win32::System::Com::{
         CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER,
         COINIT_APARTMENTTHREADED,
     };
+    use winreg::enums::HKEY_LOCAL_MACHINE;
+    use winreg::RegKey;
 
     pub fn list_from_registry() -> Vec<AsioDriverInfo> {
         let mut out = Vec::new();
@@ -182,7 +237,10 @@ mod windows_impl {
                 let Ok(sub) = root.open_subkey(&name) else {
                     continue;
                 };
-                let clsid: String = sub.get_value("CLSID").or_else(|_| sub.get_value("clsid")).unwrap_or_default();
+                let clsid: String = sub
+                    .get_value("CLSID")
+                    .or_else(|_| sub.get_value("clsid"))
+                    .unwrap_or_default();
                 if clsid.trim().is_empty() {
                     continue;
                 }
@@ -191,7 +249,10 @@ mod windows_impl {
                     .or_else(|_| sub.get_value("description"))
                     .unwrap_or_else(|_| name.clone());
                 let display = if desc.trim().is_empty() { name } else { desc };
-                if out.iter().any(|d: &AsioDriverInfo| d.clsid.eq_ignore_ascii_case(&clsid)) {
+                if out
+                    .iter()
+                    .any(|d: &AsioDriverInfo| d.clsid.eq_ignore_ascii_case(&clsid))
+                {
                     continue;
                 }
                 out.push(AsioDriverInfo {
@@ -221,7 +282,8 @@ mod windows_impl {
 
     #[repr(C)]
     struct IasioVtbl {
-        query_interface: unsafe extern "system" fn(*mut Iasio, *const GUID, *mut *mut c_void) -> i32,
+        query_interface:
+            unsafe extern "system" fn(*mut Iasio, *const GUID, *mut *mut c_void) -> i32,
         add_ref: unsafe extern "system" fn(*mut Iasio) -> u32,
         release: unsafe extern "system" fn(*mut Iasio) -> u32,
         init: unsafe extern "system" fn(*mut Iasio, *mut c_void) -> i32,
@@ -242,9 +304,11 @@ mod windows_impl {
         can_sample_rate: unsafe extern "system" fn(*mut Iasio, f64) -> c_long,
         get_sample_rate: unsafe extern "system" fn(*mut Iasio, *mut f64) -> c_long,
         set_sample_rate: unsafe extern "system" fn(*mut Iasio, f64) -> c_long,
-        get_clock_sources: unsafe extern "system" fn(*mut Iasio, *mut c_void, *mut c_long) -> c_long,
+        get_clock_sources:
+            unsafe extern "system" fn(*mut Iasio, *mut c_void, *mut c_long) -> c_long,
         set_clock_source: unsafe extern "system" fn(*mut Iasio, c_long) -> c_long,
-        get_sample_position: unsafe extern "system" fn(*mut Iasio, *mut c_void, *mut c_void) -> c_long,
+        get_sample_position:
+            unsafe extern "system" fn(*mut Iasio, *mut c_void, *mut c_void) -> c_long,
         get_channel_info: unsafe extern "system" fn(*mut Iasio, *mut ChannelInfo) -> c_long,
         create_buffers: unsafe extern "system" fn(
             *mut Iasio,
@@ -299,14 +363,23 @@ mod windows_impl {
 
     unsafe extern "C" fn asio_message(
         selector: c_long,
-        _value: c_long,
+        value: c_long,
         _message: *mut c_void,
         _opt: *mut f64,
     ) -> c_long {
-        // kAsioSelectorSupported = 1, kAsioEngineVersion = 2, kAsioResetRequest = 3
+        // kAsioSelectorSupported = 1, kAsioEngineVersion = 2, kAsioResetRequest = 3,
+        // kAsioSupportsTimeInfo = 7
         match selector {
-            1 => 1,
+            1 => match value {
+                1 | 2 | 3 | 7 => 1,
+                _ => 0,
+            },
             2 => 2,
+            3 => {
+                ASIO_RESET.store(true, Ordering::Release);
+                1
+            }
+            7 => 1,
             _ => 0,
         }
     }
@@ -321,34 +394,79 @@ mod windows_impl {
     }
 
     fn fill_buffers(index: c_long) {
-        let Ok(g) = callback_slot().lock() else {
-            return;
-        };
-        let Some(st) = g.as_ref() else {
-            return;
-        };
-        if st.stop.load(Ordering::Relaxed) {
+        RT_IN_FLIGHT.fetch_add(1, Ordering::AcqRel);
+        let host = RT_HOST.load(Ordering::Acquire);
+        if host.is_null() {
+            RT_IN_FLIGHT.fetch_sub(1, Ordering::Release);
             return;
         }
+        let st = unsafe { &*host };
         let idx = if index == 0 { 0 } else { 1 };
         let frames = st.frames;
         let ch = st.channels.max(1);
-        let mut interleaved = vec![0.0f32; frames * ch];
+
+        let write_silence =
+            st.stop.load(Ordering::Relaxed) || st.scratch_busy.swap(true, Ordering::AcqRel);
+        if write_silence {
+            if !st.stop.load(Ordering::Relaxed) {
+                st.ring.note_underrun();
+            }
+            for c in 0..ch {
+                let p = st.buffers.get(c).map(|b| b[idx]).unwrap_or(ptr::null_mut());
+                if p.is_null() {
+                    continue;
+                }
+                unsafe {
+                    write_channel(p, st.sample_type, frames, |_| 0.0);
+                }
+            }
+            RT_IN_FLIGHT.fetch_sub(1, Ordering::Release);
+            return;
+        }
+
+        let scratch = unsafe { &mut *st.scratch.get() };
+        if scratch.len() < frames * ch {
+            // Preallocated at open; never grow on the realtime thread.
+            scratch.fill(0.0);
+            st.ring.note_underrun();
+            st.scratch_busy.store(false, Ordering::Release);
+            for c in 0..ch {
+                let p = st.buffers.get(c).map(|b| b[idx]).unwrap_or(ptr::null_mut());
+                if p.is_null() {
+                    continue;
+                }
+                unsafe {
+                    write_channel(p, st.sample_type, frames, |_| 0.0);
+                }
+            }
+            RT_IN_FLIGHT.fetch_sub(1, Ordering::Release);
+            return;
+        }
+        let dest = &mut scratch[..frames * ch];
         if st.playing.load(Ordering::Relaxed) {
-            let _ = st.ring.pop_interleaved(&mut interleaved);
+            let _ = st.ring.pop_interleaved(dest);
+        } else {
+            dest.fill(0.0);
         }
         for c in 0..ch {
-            let ptr = st.buffers.get(c).map(|b| b[idx]).unwrap_or(ptr::null_mut());
-            if ptr.is_null() {
+            let p = st.buffers.get(c).map(|b| b[idx]).unwrap_or(ptr::null_mut());
+            if p.is_null() {
                 continue;
             }
             unsafe {
-                write_channel(ptr, st.sample_type, frames, |i| interleaved[i * ch + c]);
+                write_channel(p, st.sample_type, frames, |i| dest[i * ch + c]);
             }
         }
+        st.scratch_busy.store(false, Ordering::Release);
+        RT_IN_FLIGHT.fetch_sub(1, Ordering::Release);
     }
 
-    unsafe fn write_channel(ptr: *mut u8, ty: SampleType, frames: usize, sample: impl Fn(usize) -> f32) {
+    unsafe fn write_channel(
+        ptr: *mut u8,
+        ty: SampleType,
+        frames: usize,
+        sample: impl Fn(usize) -> f32,
+    ) {
         match ty {
             SampleType::F32Le => {
                 for i in 0..frames {
@@ -382,6 +500,7 @@ mod windows_impl {
                 }
             }
             SampleType::Dsd | SampleType::Other(_) => {
+                // Open refuses these types; zeros are a last-resort RT fill only.
                 for i in 0..frames {
                     ptr::write(ptr.add(i), 0);
                 }
@@ -408,7 +527,10 @@ mod windows_impl {
             }
             return Err(EngineError::msg(format!(
                 "ASIO-enheten \"{want}\" saknas. Tillgängliga: {}.",
-                list.iter().map(|d| d.name.as_str()).collect::<Vec<_>>().join(", ")
+                list.iter()
+                    .map(|d| d.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
             )));
         }
         Ok(list.into_iter().next().expect("non-empty"))
@@ -459,7 +581,16 @@ mod windows_impl {
                     ))));
                     return;
                 }
-                let result = run_driver(&clsid, source_rate, hwnd, ring, playing, stop_t, &name_for_thread, &tx);
+                let result = run_driver(
+                    &clsid,
+                    source_rate,
+                    hwnd,
+                    ring,
+                    playing,
+                    stop_t,
+                    &name_for_thread,
+                    &tx,
+                );
                 if let Err(err) = result {
                     let _ = tx.send(Err(err));
                 }
@@ -557,7 +688,11 @@ mod windows_impl {
 
         let mut actual = 0.0f64;
         let _ = unsafe { (vtbl.get_sample_rate)(driver, &mut actual) };
-        let rate = if actual > 1.0 { actual.round() as u32 } else { source_rate };
+        let rate = if actual > 1.0 {
+            actual.round() as u32
+        } else {
+            source_rate
+        };
 
         let mut info = ChannelInfo {
             channel: 0,
@@ -568,8 +703,9 @@ mod windows_impl {
             name: [0; 32],
         };
         if unsafe { (vtbl.get_channel_info)(driver, &mut info) } != 0 {
+            let err = err_of(driver, "getChannelInfo misslyckades.");
             unsafe { (vtbl.release)(driver) };
-            return Err(err_of(driver, "getChannelInfo misslyckades."));
+            return Err(err);
         }
         let sample_type = SampleType::from_asio(info.sample_type);
         if sample_type.is_dsd() {
@@ -578,17 +714,33 @@ mod windows_impl {
                 "ASIO-kanalen är DSD. Native DSD via ASIO är inte i den här PR:n — spela FLAC/PCM. Filen rörs inte.",
             ));
         }
+        if !sample_type.is_pcm() {
+            let code = match sample_type {
+                SampleType::Other(v) => v,
+                _ => info.sample_type,
+            };
+            unsafe { (vtbl.release)(driver) };
+            return Err(EngineError::msg(format!(
+                "ASIO-kanalen har okänd sampletyp ({code}). Native-motorn vägrar tyst uppspelning — använd PCM/FLAC eller en drivrutin med i16/i24/i32/f32. Filen rörs inte."
+            )));
+        }
 
         let mut min = 0i32;
         let mut max = 0i32;
         let mut preferred = 0i32;
         let mut gran = 0i32;
-        if unsafe { (vtbl.get_buffer_size)(driver, &mut min, &mut max, &mut preferred, &mut gran) } != 0
+        if unsafe { (vtbl.get_buffer_size)(driver, &mut min, &mut max, &mut preferred, &mut gran) }
+            != 0
         {
+            let err = err_of(driver, "getBufferSize misslyckades.");
             unsafe { (vtbl.release)(driver) };
-            return Err(err_of(driver, "getBufferSize misslyckades."));
+            return Err(err);
         }
-        let frames = if preferred > 0 { preferred } else { min.max(64) } as usize;
+        let frames = if preferred > 0 {
+            preferred
+        } else {
+            min.max(64)
+        } as usize;
 
         let mut buf_infos: Vec<BufferInfo> = (0..channels)
             .map(|ch| BufferInfo {
@@ -608,11 +760,12 @@ mod windows_impl {
             )
         };
         if created != 0 {
-            unsafe { (vtbl.release)(driver) };
-            return Err(err_of(
+            let err = err_of(
                 driver,
                 &format!("{display_name} createBuffers misslyckades."),
-            ));
+            );
+            unsafe { (vtbl.release)(driver) };
+            return Err(err);
         }
 
         let buffers: Vec<[*mut u8; 2]> = buf_infos
@@ -620,35 +773,82 @@ mod windows_impl {
             .map(|b| [b.buffers[0] as *mut u8, b.buffers[1] as *mut u8])
             .collect();
 
-        {
-            let mut slot = callback_slot().lock().expect("asio callback");
-            *slot = Some(CallbackState {
-                ring,
-                playing,
-                buffers,
-                frames,
-                sample_type,
-                channels,
-                stop: stop.clone(),
-            });
-        }
+        ASIO_RESET.store(false, Ordering::Relaxed);
+        install_rt_host(new_rt_host(
+            ring.clone(),
+            playing.clone(),
+            stop.clone(),
+            buffers,
+            frames,
+            sample_type,
+            channels,
+        ));
 
         if unsafe { (vtbl.start)(driver) } != 0 {
+            let err = err_of(driver, &format!("{display_name} start() misslyckades."));
+            uninstall_rt_host();
             let _ = unsafe { (vtbl.dispose_buffers)(driver) };
-            clear_callback_state();
             unsafe { (vtbl.release)(driver) };
-            return Err(err_of(driver, &format!("{display_name} start() misslyckades.")));
+            return Err(err);
         }
 
         let _ = tx.send(Ok((rate, channels as u16, display_name.to_string())));
 
         while !stop.load(Ordering::Relaxed) {
+            if ASIO_RESET.swap(false, Ordering::AcqRel) {
+                let _ = unsafe { (vtbl.stop)(driver) };
+                uninstall_rt_host();
+                let _ = unsafe { (vtbl.dispose_buffers)(driver) };
+                for info in buf_infos.iter_mut() {
+                    info.buffers = [ptr::null_mut(); 2];
+                }
+                let created = unsafe {
+                    (vtbl.create_buffers)(
+                        driver,
+                        buf_infos.as_mut_ptr(),
+                        channels as c_long,
+                        frames as c_long,
+                        &CALLBACKS as *const Callbacks as *mut Callbacks,
+                    )
+                };
+                if created != 0 {
+                    let err = err_of(
+                        driver,
+                        &format!("{display_name} createBuffers misslyckades efter ASIO reset."),
+                    );
+                    unsafe { (vtbl.release)(driver) };
+                    return Err(err);
+                }
+                let buffers: Vec<[*mut u8; 2]> = buf_infos
+                    .iter()
+                    .map(|b| [b.buffers[0] as *mut u8, b.buffers[1] as *mut u8])
+                    .collect();
+                install_rt_host(new_rt_host(
+                    ring.clone(),
+                    playing.clone(),
+                    stop.clone(),
+                    buffers,
+                    frames,
+                    sample_type,
+                    channels,
+                ));
+                if unsafe { (vtbl.start)(driver) } != 0 {
+                    let err = err_of(
+                        driver,
+                        &format!("{display_name} start() misslyckades efter ASIO reset."),
+                    );
+                    uninstall_rt_host();
+                    let _ = unsafe { (vtbl.dispose_buffers)(driver) };
+                    unsafe { (vtbl.release)(driver) };
+                    return Err(err);
+                }
+            }
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
 
         let _ = unsafe { (vtbl.stop)(driver) };
+        uninstall_rt_host();
         let _ = unsafe { (vtbl.dispose_buffers)(driver) };
-        clear_callback_state();
         unsafe { (vtbl.release)(driver) };
         Ok(())
     }
@@ -680,6 +880,24 @@ mod tests {
         assert!(SampleType::from_asio(32).is_dsd());
         assert!(!SampleType::from_asio(18).is_dsd());
         assert!(!SampleType::from_asio(19).is_dsd());
+        assert!(SampleType::from_asio(18).is_pcm());
+        assert!(SampleType::from_asio(19).is_pcm());
+        assert!(!SampleType::from_asio(32).is_pcm());
+    }
+
+    #[test]
+    fn unknown_sample_type_is_not_played_as_pcm() {
+        let other = SampleType::from_asio(99);
+        assert!(!other.is_pcm());
+        assert!(!other.is_dsd());
+        assert_eq!(other, SampleType::Other(99));
+    }
+
+    #[test]
+    fn reset_request_flag_can_be_acked_without_host() {
+        ASIO_RESET.store(true, Ordering::Relaxed);
+        assert!(ASIO_RESET.swap(false, Ordering::AcqRel));
+        assert!(!ASIO_RESET.load(Ordering::Relaxed));
     }
 
     #[test]
@@ -688,5 +906,42 @@ mod tests {
             assert!(list_asio_drivers().is_empty());
             assert!(!asio_available());
         }
+    }
+
+    #[test]
+    fn rt_host_install_then_uninstall_clears_pointer() {
+        let ring = Arc::new(FrameRing::new(2));
+        install_rt_host(new_rt_host(
+            ring,
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+            vec![[ptr::null_mut(), ptr::null_mut()]],
+            64,
+            SampleType::F32Le,
+            2,
+        ));
+        assert!(!RT_HOST.load(Ordering::Acquire).is_null());
+        uninstall_rt_host();
+        assert!(RT_HOST.load(Ordering::Acquire).is_null());
+        uninstall_rt_host();
+        assert!(RT_HOST.load(Ordering::Acquire).is_null());
+    }
+
+    #[test]
+    fn rt_host_fast_reinstall_replaces_previous() {
+        let ring = Arc::new(FrameRing::new(2));
+        for _ in 0..3 {
+            install_rt_host(new_rt_host(
+                ring.clone(),
+                Arc::new(AtomicBool::new(true)),
+                Arc::new(AtomicBool::new(false)),
+                vec![[ptr::null_mut(), ptr::null_mut()]],
+                32,
+                SampleType::I32Le,
+                2,
+            ));
+        }
+        uninstall_rt_host();
+        assert!(RT_HOST.load(Ordering::Acquire).is_null());
     }
 }

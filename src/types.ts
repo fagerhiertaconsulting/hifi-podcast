@@ -240,6 +240,7 @@ export type EngineStatus = {
   resampled: boolean;
   speed: number;
   skip_silence: boolean;
+  underruns: number;
   error: string | null;
 };
 
