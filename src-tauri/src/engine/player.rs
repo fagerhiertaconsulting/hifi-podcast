@@ -636,7 +636,7 @@ fn decode_loop(
             let underruns = ring.underrun_count();
             if underruns > last_underruns {
                 eprintln!(
-                    "native audio underrun: ring try_lock contended or callback re-entry (count {underruns})"
+                    "native audio underrun: empty ring, try_lock contended, or callback re-entry (count {underruns})"
                 );
                 last_underruns = underruns;
             }

@@ -187,6 +187,22 @@ fn uninstall_rt_host() {
     }
 }
 
+/// Steinberg `ASIOError` success (`asio.h`). IASIO methods other than `init` use this.
+/// `init` is `ASIOBool` (`ASIOTrue` = 1, `ASIOFalse` = 0) — not an error code.
+#[allow(dead_code)] // used by the Windows host path and unit tests
+const ASE_OK: i32 = 0;
+
+/// Steinberg `IASIO::canSampleRate` / `ASIOCanSampleRate`.
+///
+/// `true` iff the driver reports the inquired rate as available.
+/// SDK: **ASE_OK (0) = supported**; ASE_NoClock = unsupported; ASE_NotPresent = no I/O.
+/// JUCE (`juce_win32_ASIO.cpp`): `canSampleRate(rate) == 0` then the rate is listed.
+/// foobar2000 / common hosts: same `ASE_OK` test. Non-zero is *not* “supported”.
+#[allow(dead_code)] // used by the Windows host path and unit tests
+fn asio_sample_rate_supported(can_sample_rate: i32) -> bool {
+    can_sample_rate == ASE_OK
+}
+
 fn new_rt_host(
     ring: Arc<FrameRing>,
     playing: Arc<AtomicBool>,
@@ -649,6 +665,7 @@ mod windows_impl {
         let vtbl = unsafe { &*(*driver).vtbl };
 
         let sys = hwnd.map(|h| h as *mut c_void).unwrap_or(ptr::null_mut());
+        // IASIO::init returns ASIOBool, not ASIOError: 0 = ASIOFalse (denied).
         let ok = unsafe { (vtbl.init)(driver, sys) };
         if ok == 0 {
             let err = err_of(
@@ -672,7 +689,9 @@ mod windows_impl {
         let channels = outs.min(2) as usize;
 
         let want = source_rate as f64;
-        if unsafe { (vtbl.can_sample_rate)(driver, want) } == 0 {
+        // canSampleRate is ASIOError: ASE_OK (0) means the rate *is* supported (see
+        // `asio_sample_rate_supported`). Do not treat this like init()'s ASIOBool.
+        if asio_sample_rate_supported(unsafe { (vtbl.can_sample_rate)(driver, want) }) {
             if unsafe { (vtbl.set_sample_rate)(driver, want) } != 0 {
                 unsafe { (vtbl.release)(driver) };
                 return Err(EngineError::msg(format!(
@@ -857,6 +876,18 @@ mod windows_impl {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn can_sample_rate_ase_ok_means_supported() {
+        // Steinberg asio.h: ASE_OK = 0 success; ASE_NoClock = rate not supported.
+        const ASE_NO_CLOCK: i32 = -995;
+        const ASE_NOT_PRESENT: i32 = -1000;
+        assert!(asio_sample_rate_supported(0));
+        assert!(asio_sample_rate_supported(ASE_OK));
+        assert!(!asio_sample_rate_supported(ASE_NO_CLOCK));
+        assert!(!asio_sample_rate_supported(ASE_NOT_PRESENT));
+        assert!(!asio_sample_rate_supported(1));
+    }
 
     #[test]
     fn fiio_is_preferred() {
