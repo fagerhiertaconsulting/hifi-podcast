@@ -21,6 +21,11 @@ import type {
   TranscriptSegment,
   UpnpSettings,
   UpnpStatus,
+  AudioEngineSettings,
+  EngineCapabilities,
+  EngineStatus,
+  OutputDeviceInfo,
+  ProbeInfo,
 } from "./types";
 
 export const api = {
@@ -90,4 +95,32 @@ export const api = {
     invoke<UpnpSettings>("save_upnp_settings", { settings }),
   startUpnpServer: () => invoke<UpnpStatus>("start_upnp_server"),
   stopUpnpServer: () => invoke<UpnpStatus>("stop_upnp_server"),
+  engineCapabilities: () => invoke<EngineCapabilities>("engine_capabilities"),
+  engineListDevices: () => invoke<OutputDeviceInfo[]>("engine_list_devices"),
+  engineGetSettings: () => invoke<AudioEngineSettings>("engine_get_settings"),
+  engineSaveSettings: (settings: AudioEngineSettings) =>
+    invoke<AudioEngineSettings>("engine_save_settings", { settings }),
+  engineProbe: (path: string) => invoke<ProbeInfo>("engine_probe", { path }),
+  engineOpen: (args: {
+    path: string;
+    speed: number;
+    skipSilence: boolean;
+    outputApi?: string;
+    deviceName?: string;
+  }) =>
+    invoke<EngineStatus>("engine_open", {
+      path: args.path,
+      speed: args.speed,
+      skipSilence: args.skipSilence,
+      outputApi: args.outputApi,
+      deviceName: args.deviceName,
+    }),
+  enginePlay: () => invoke<void>("engine_play"),
+  enginePause: () => invoke<void>("engine_pause"),
+  engineSeek: (positionMs: number) => invoke<void>("engine_seek", { positionMs }),
+  engineSetSpeed: (speed: number) => invoke<void>("engine_set_speed", { speed }),
+  engineSetSkipSilence: (enabled: boolean) =>
+    invoke<void>("engine_set_skip_silence", { enabled }),
+  engineStop: () => invoke<void>("engine_stop"),
+  engineStatus: () => invoke<EngineStatus>("engine_status"),
 };

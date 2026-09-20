@@ -16,6 +16,8 @@ pub enum AppError {
     Opml(#[from] opml::Error),
     #[error(transparent)]
     Url(#[from] url::ParseError),
+    #[error(transparent)]
+    Engine(#[from] crate::engine::EngineError),
 }
 
 impl AppError {

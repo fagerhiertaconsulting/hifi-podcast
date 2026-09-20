@@ -1,6 +1,6 @@
 # HIFI podcast — musikmodul (senare)
 
-**Status:** efter podcast-MVP och v1. Inte implementerad i den här branchen.
+**Status:** efter native-motorn (PR #4). Inte implementerad i den här branchen.
 
 ## Ambition
 
@@ -24,4 +24,4 @@ Blanda aldrig podcast-kö med musikbibliotek. Gemensamt är motor + globala outp
 
 ## Implikation för dagens stack
 
-MVP använder WebView2-playback eftersom det är rätt för *podcastfiler* (MP3/M4A) och snabbt att få rätt. Native-motorn (Symphonia + WASAPI exclusive) ska kunna ersätta den ytan utan att skriva om RSS/nedladdning. Se [audio.md](audio.md).
+MVP:s WebView2-yta är fallback. Native-motorn (Symphonia + **ASIO / FiiO ASIO Driver**, WASAPI som fallback) ersätter den för lokala filer utan att skriva om RSS/nedladdning. Se [audio.md](audio.md).

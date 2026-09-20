@@ -102,6 +102,30 @@ pub struct UpnpSettings {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AudioEngineSettings {
+    /// `native` or `webview`
+    pub backend: String,
+    /// `auto` | `asio` | `wasapi_shared` | `wasapi_exclusive`
+    pub output_api: String,
+    /// Empty = prefer FiiO ASIO if present, else system default
+    pub device_name: String,
+    pub exclusive: bool,
+    pub skip_silence: bool,
+}
+
+impl Default for AudioEngineSettings {
+    fn default() -> Self {
+        Self {
+            backend: "native".into(),
+            output_api: "auto".into(),
+            device_name: String::new(),
+            exclusive: false,
+            skip_silence: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UpnpStatus {
     pub running: bool,
     pub bind: String,
