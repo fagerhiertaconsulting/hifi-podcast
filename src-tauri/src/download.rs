@@ -1,27 +1,28 @@
 use crate::error::{AppError, AppResult};
-use futures_util::StreamExt;
+use crate::net;
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
-use tokio::io::AsyncWriteExt;
 
 /// Originalfilen skrivs byte-för-byte. Ingen omkodning, ingen container-ompackning.
 pub async fn download_original(
     url: &str,
     dest: &Path,
 ) -> AppResult<(u64, String, String)> {
-    if let Some(parent) = dest.parent() {
-        tokio::fs::create_dir_all(parent).await?;
-    }
-
-    let client = reqwest::Client::builder()
-        .user_agent("HIFI-podcast/0.1 (+https://github.com/fagerhiertaconsulting/hifi-podcast)")
-        .build()?;
+    net::validate_http_url(url)?;
+    let client = net::http_client()?;
     let response = client.get(url).send().await?;
     if !response.status().is_success() {
         return Err(AppError::msg(format!(
             "Nedladdning misslyckades (HTTP {}).",
             response.status()
         )));
+    }
+    if let Some(len) = response.content_length() {
+        if len > net::MAX_MEDIA_BYTES {
+            return Err(AppError::msg(format!(
+                "Ljudfilen är större än tillåtet ({len} byte)."
+            )));
+        }
     }
 
     let content_type = response
@@ -31,16 +32,27 @@ pub async fn download_original(
         .unwrap_or("")
         .to_string();
 
+    if let Some(parent) = dest.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+
     let mut hasher = Sha256::new();
     let mut bytes: u64 = 0;
     let tmp = dest.with_extension("part");
     let mut file = tokio::fs::File::create(&tmp).await?;
+    use futures_util::StreamExt;
+    use tokio::io::AsyncWriteExt;
     let mut stream = response.bytes_stream();
     while let Some(chunk) = stream.next().await {
         let chunk = chunk?;
+        bytes = bytes.saturating_add(chunk.len() as u64);
+        if bytes > net::MAX_MEDIA_BYTES {
+            drop(file);
+            let _ = tokio::fs::remove_file(&tmp).await;
+            return Err(AppError::msg("Ljudfilen är större än tillåtet (2 GB)."));
+        }
         hasher.update(&chunk);
         file.write_all(&chunk).await?;
-        bytes += chunk.len() as u64;
     }
     file.flush().await?;
     drop(file);

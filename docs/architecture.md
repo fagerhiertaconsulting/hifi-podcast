@@ -43,7 +43,7 @@ Delat: output-enhet, DSP-policy, ev. global volym. **Inte** delat: kö, spellist
 
 Tabeller: `podcast`, `episode`, `download`, `playback_state`, `queue_item`.
 
-v1 lägger till `transcript`, `transcript_segment`, `chapter`, `ad_segment`, `job`, `bookmark` utan att blanda in `music_*`.
+v1 lägger till `transcript`, `transcript_segment`, `chapter`, `ad_segment`, `job`, `bookmark`.
 
 Musik får egna tabeller (`music_track`, `music_album`, …) eller en separat SQLite-fil under samma data-dir. Preferens: **samma fil, strikt prefix**, så backup är en fil — men inga FK mellan podcast-kö och spår.
 

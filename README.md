@@ -43,8 +43,10 @@ Tauri lägger appdata under `%LOCALAPPDATA%\consulting.fagerhierta.hifi-podcast\
 
 | Sökväg | Innehåll |
 |--------|----------|
-| `db.sqlite` | Prenumerationer, avsnitt, kö, lyssningsposition |
+| `db.sqlite` | Prenumerationer, avsnitt, kö, transkript, jobb |
 | `media/<podcast_id>/<episode_id>.<ext>` | **Original** enclosure-filer |
+| `models/ggml-small.bin` | Whisper-modell (nedladdas av användaren) |
+| `bin/whisper-cli.exe` | whisper.cpp sidecar (Windows: Inställningar → Ladda ner whisper-cli) |
 
 Samma `media/`-root är avsiktligt delbar med en framtida UPnP/DLNA-server (Onkyo TX-RZ50). Se [docs/upnp-mediaserver.md](docs/upnp-mediaserver.md).
 
@@ -57,7 +59,9 @@ Samma `media/`-root är avsiktligt delbar med en framtida UPnP/DLNA-server (Onky
 - Spelare: play/paus, seek, hastighet, ±15/±30 s, kö, sovtimer, sparad position
 - Per-podcast: hastighet, auto-nedladdning, intro/outro-skip, opt-in hoppa tystnad
 
-**Inte i koden ännu** (endast roadmap): Whisper/ASR, reklam-ML, full UPnP-server, musikbibliotek.
+**Inte i koden ännu:** full UPnP-server, musikbibliotek, reklam-cut, moln-ASR.
+
+v1 (lokal intelligens) finns i appen: se [docs/v1-asr.md](docs/v1-asr.md).
 
 ## Dokumentation
 

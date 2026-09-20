@@ -2,13 +2,15 @@
 
 ## v1 — lokal intelligens
 
-- whisper.cpp (sidecar), default `ggml-small`, språk auto + override per podcast
+Implementerat i appen (se [v1-asr.md](v1-asr.md)):
+
+- Jobbköl + whisper.cpp sidecar, default `ggml-small`, språk auto + override per podcast
 - Transkript-UI: sök, klick → tid
-- Kapitel: inbäddade + genererade (tystnad/energi + transkript)
-- Reklamheuristik → **skip** (cut är v2 + privatbruks-disclaimer)
-- Inbox/triage, filter, bokmärken, statistik, sideloading
-- BYOK cloud-ASR avstängt som default
-- Windows SMTC om det inte hunnits i MVP-plus
+- Kapitel: inbäddade ID3 + genererade
+- Reklamheuristik → **skip**
+- Inkorg/triage, filter, bokmärken, statistik, sideloading
+- BYOK cloud-ASR avstängt
+- Windows SMTC (play/pause via systemets mediekontroller när souvlaki kan binda HWND)
 
 ## Musikmodul (senare, separat)
 

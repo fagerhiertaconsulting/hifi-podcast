@@ -1,5 +1,8 @@
 use crate::error::AppResult;
-use crate::models::{Download, Episode, PlaybackState, Podcast, PodcastSettings, QueueItem};
+use crate::models::{
+    AdSegment, Bookmark, Chapter, Download, Episode, InboxItem, JobRow, LibraryStats, PlaybackState,
+    Podcast, PodcastSettings, QueueItem, Transcript, TranscriptSegment,
+};
 use rusqlite::{params, Connection, OptionalExtension};
 
 pub fn initialize(conn: &Connection) -> AppResult<()> {
@@ -22,6 +25,9 @@ pub fn initialize(conn: &Connection) -> AppResult<()> {
           outro_skip_sec INTEGER NOT NULL DEFAULT 0,
           skip_silence INTEGER NOT NULL DEFAULT 0,
           language TEXT,
+          asr_language TEXT,
+          skip_ads INTEGER NOT NULL DEFAULT 0,
+          auto_transcribe INTEGER NOT NULL DEFAULT 0,
           created_at TEXT NOT NULL,
           updated_at TEXT NOT NULL
         );
@@ -29,7 +35,7 @@ pub fn initialize(conn: &Connection) -> AppResult<()> {
         CREATE TABLE IF NOT EXISTS episode (
           id INTEGER PRIMARY KEY,
           podcast_id INTEGER NOT NULL REFERENCES podcast(id) ON DELETE CASCADE,
-          guid TEXT NOT NULL UNIQUE,
+          guid TEXT NOT NULL,
           title TEXT NOT NULL,
           description TEXT,
           audio_url TEXT,
@@ -38,7 +44,8 @@ pub fn initialize(conn: &Connection) -> AppResult<()> {
           episode_image_path TEXT,
           status TEXT NOT NULL DEFAULT 'new',
           created_at TEXT NOT NULL,
-          updated_at TEXT NOT NULL
+          updated_at TEXT NOT NULL,
+          UNIQUE(podcast_id, guid)
         );
 
         CREATE INDEX IF NOT EXISTS idx_episode_podcast_pub
@@ -71,7 +78,144 @@ pub fn initialize(conn: &Connection) -> AppResult<()> {
         );
         "#,
     )?;
+    migrate_v1(conn)?;
+    migrate_episode_guid_scope(conn)?;
     Ok(())
+}
+
+fn migrate_v1(conn: &Connection) -> AppResult<()> {
+    for sql in [
+        "ALTER TABLE podcast ADD COLUMN asr_language TEXT",
+        "ALTER TABLE podcast ADD COLUMN skip_ads INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE podcast ADD COLUMN auto_transcribe INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE episode ADD COLUMN inbox INTEGER NOT NULL DEFAULT 1",
+        "ALTER TABLE episode ADD COLUMN archived INTEGER NOT NULL DEFAULT 0",
+    ] {
+        let _ = conn.execute(sql, []);
+    }
+    conn.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS transcript (
+          id INTEGER PRIMARY KEY,
+          episode_id INTEGER NOT NULL UNIQUE REFERENCES episode(id) ON DELETE CASCADE,
+          source TEXT NOT NULL,
+          model TEXT,
+          language TEXT,
+          status TEXT NOT NULL,
+          created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS transcript_segment (
+          id INTEGER PRIMARY KEY,
+          transcript_id INTEGER NOT NULL REFERENCES transcript(id) ON DELETE CASCADE,
+          start_ms INTEGER NOT NULL,
+          end_ms INTEGER NOT NULL,
+          text TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_segment_transcript ON transcript_segment(transcript_id, start_ms);
+        CREATE TABLE IF NOT EXISTS chapter (
+          id INTEGER PRIMARY KEY,
+          episode_id INTEGER NOT NULL REFERENCES episode(id) ON DELETE CASCADE,
+          start_ms INTEGER NOT NULL,
+          end_ms INTEGER,
+          title TEXT NOT NULL,
+          source TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_chapter_episode ON chapter(episode_id, start_ms);
+        CREATE TABLE IF NOT EXISTS ad_segment (
+          id INTEGER PRIMARY KEY,
+          episode_id INTEGER NOT NULL REFERENCES episode(id) ON DELETE CASCADE,
+          start_ms INTEGER NOT NULL,
+          end_ms INTEGER NOT NULL,
+          confidence REAL NOT NULL,
+          method TEXT NOT NULL,
+          enabled INTEGER NOT NULL DEFAULT 1
+        );
+        CREATE TABLE IF NOT EXISTS job (
+          id INTEGER PRIMARY KEY,
+          type TEXT NOT NULL,
+          episode_id INTEGER NOT NULL REFERENCES episode(id) ON DELETE CASCADE,
+          priority INTEGER NOT NULL DEFAULT 0,
+          state TEXT NOT NULL,
+          attempts INTEGER NOT NULL DEFAULT 0,
+          payload_json TEXT,
+          error_msg TEXT,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_job_state_pri ON job(state, priority, id);
+        CREATE TABLE IF NOT EXISTS bookmark (
+          id INTEGER PRIMARY KEY,
+          episode_id INTEGER NOT NULL REFERENCES episode(id) ON DELETE CASCADE,
+          position_ms INTEGER NOT NULL,
+          note TEXT NOT NULL DEFAULT '',
+          created_at TEXT NOT NULL
+        );
+        "#,
+    )?;
+    Ok(())
+}
+
+/// Older DBs had UNIQUE(guid) globally. Rebuild so the same GUID can exist
+/// on two podcasts, and ON CONFLICT(podcast_id, guid) works after upgrade.
+fn migrate_episode_guid_scope(conn: &Connection) -> AppResult<()> {
+    if !episode_guid_is_globally_unique(conn) {
+        return Ok(());
+    }
+    conn.execute_batch(
+        r#"
+        PRAGMA foreign_keys = OFF;
+        CREATE TABLE episode_new (
+          id INTEGER PRIMARY KEY,
+          podcast_id INTEGER NOT NULL REFERENCES podcast(id) ON DELETE CASCADE,
+          guid TEXT NOT NULL,
+          title TEXT NOT NULL,
+          description TEXT,
+          audio_url TEXT,
+          publish_at TEXT,
+          duration_ms INTEGER,
+          episode_image_path TEXT,
+          status TEXT NOT NULL DEFAULT 'new',
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          inbox INTEGER NOT NULL DEFAULT 1,
+          archived INTEGER NOT NULL DEFAULT 0,
+          UNIQUE(podcast_id, guid)
+        );
+        INSERT INTO episode_new (
+          id, podcast_id, guid, title, description, audio_url, publish_at, duration_ms,
+          episode_image_path, status, created_at, updated_at, inbox, archived
+        )
+        SELECT
+          id, podcast_id, guid, title, description, audio_url, publish_at, duration_ms,
+          episode_image_path, status, created_at, updated_at, inbox, archived
+        FROM episode;
+        DROP TABLE episode;
+        ALTER TABLE episode_new RENAME TO episode;
+        CREATE INDEX IF NOT EXISTS idx_episode_podcast_pub
+          ON episode(podcast_id, publish_at);
+        PRAGMA foreign_keys = ON;
+        "#,
+    )?;
+    Ok(())
+}
+
+fn episode_guid_is_globally_unique(conn: &Connection) -> bool {
+    let sql: Option<String> = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'episode'",
+            [],
+            |row| row.get(0),
+        )
+        .ok();
+    let Some(sql) = sql else {
+        return false;
+    };
+    let compact: String = sql
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect::<String>()
+        .to_ascii_lowercase();
+    compact.contains("guidtextnotnullunique") && !compact.contains("unique(podcast_id,guid)")
 }
 
 pub fn now_rfc3339() -> String {
@@ -90,8 +234,8 @@ pub fn upsert_podcast(
     let ts = now_rfc3339();
     conn.execute(
         r#"
-        INSERT INTO podcast (guid, title, author, feed_url, description, language, created_at, updated_at)
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)
+        INSERT INTO podcast (guid, title, author, feed_url, description, language, auto_transcribe, created_at, updated_at)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, ?7, ?7)
         ON CONFLICT(feed_url) DO UPDATE SET
           title = excluded.title,
           author = COALESCE(excluded.author, podcast.author),
@@ -114,7 +258,7 @@ pub fn list_podcasts(conn: &Connection) -> AppResult<Vec<Podcast>> {
     let mut stmt = conn.prepare(
         "SELECT id, guid, title, author, feed_url, artwork_path, description,
                 auto_download, speed, intro_skip_sec, outro_skip_sec, skip_silence,
-                language, created_at, updated_at
+                language, asr_language, skip_ads, auto_transcribe, created_at, updated_at
          FROM podcast ORDER BY title COLLATE NOCASE",
     )?;
     let rows = stmt.query_map([], map_podcast)?;
@@ -136,8 +280,11 @@ fn map_podcast(row: &rusqlite::Row<'_>) -> rusqlite::Result<Podcast> {
         outro_skip_sec: row.get(10)?,
         skip_silence: row.get::<_, i64>(11)? != 0,
         language: row.get(12)?,
-        created_at: row.get(13)?,
-        updated_at: row.get(14)?,
+        asr_language: row.get(13)?,
+        skip_ads: row.get::<_, i64>(14)? != 0,
+        auto_transcribe: row.get::<_, i64>(15)? != 0,
+        created_at: row.get(16)?,
+        updated_at: row.get(17)?,
     })
 }
 
@@ -145,7 +292,7 @@ pub fn get_podcast(conn: &Connection, id: i64) -> AppResult<Podcast> {
     conn.query_row(
         "SELECT id, guid, title, author, feed_url, artwork_path, description,
                 auto_download, speed, intro_skip_sec, outro_skip_sec, skip_silence,
-                language, created_at, updated_at
+                language, asr_language, skip_ads, auto_transcribe, created_at, updated_at
          FROM podcast WHERE id = ?1",
         params![id],
         map_podcast,
@@ -167,8 +314,11 @@ pub fn update_podcast_settings(
           intro_skip_sec = ?3,
           outro_skip_sec = ?4,
           skip_silence = ?5,
-          updated_at = ?6
-        WHERE id = ?7
+          asr_language = ?6,
+          skip_ads = ?7,
+          auto_transcribe = ?8,
+          updated_at = ?9
+        WHERE id = ?10
         "#,
         params![
             settings.auto_download as i64,
@@ -176,6 +326,9 @@ pub fn update_podcast_settings(
             settings.intro_skip_sec,
             settings.outro_skip_sec,
             settings.skip_silence as i64,
+            settings.asr_language,
+            settings.skip_ads as i64,
+            settings.auto_transcribe as i64,
             ts,
             id
         ],
@@ -201,7 +354,7 @@ pub fn upsert_episode(
         r#"
         INSERT INTO episode (podcast_id, guid, title, description, audio_url, publish_at, duration_ms, status, created_at, updated_at)
         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'new', ?8, ?8)
-        ON CONFLICT(guid) DO UPDATE SET
+        ON CONFLICT(podcast_id, guid) DO UPDATE SET
           title = excluded.title,
           description = COALESCE(excluded.description, episode.description),
           audio_url = COALESCE(excluded.audio_url, episode.audio_url),
@@ -221,8 +374,8 @@ pub fn upsert_episode(
         ],
     )?;
     let id: i64 = conn.query_row(
-        "SELECT id FROM episode WHERE guid = ?1",
-        params![guid],
+        "SELECT id FROM episode WHERE podcast_id = ?1 AND guid = ?2",
+        params![podcast_id, guid],
         |row| row.get(0),
     )?;
     Ok(id)
@@ -231,7 +384,7 @@ pub fn upsert_episode(
 pub fn list_episodes(conn: &Connection, podcast_id: i64) -> AppResult<Vec<Episode>> {
     let mut stmt = conn.prepare(
         "SELECT id, podcast_id, guid, title, description, audio_url, publish_at,
-                duration_ms, episode_image_path, status, created_at, updated_at
+                duration_ms, episode_image_path, status, inbox, archived, created_at, updated_at
          FROM episode WHERE podcast_id = ?1
          ORDER BY CASE WHEN publish_at IS NULL THEN 1 ELSE 0 END, publish_at DESC, id DESC",
     )?;
@@ -251,15 +404,17 @@ fn map_episode(row: &rusqlite::Row<'_>) -> rusqlite::Result<Episode> {
         duration_ms: row.get(7)?,
         episode_image_path: row.get(8)?,
         status: row.get(9)?,
-        created_at: row.get(10)?,
-        updated_at: row.get(11)?,
+        inbox: row.get::<_, i64>(10)? != 0,
+        archived: row.get::<_, i64>(11)? != 0,
+        created_at: row.get(12)?,
+        updated_at: row.get(13)?,
     })
 }
 
 pub fn get_episode(conn: &Connection, id: i64) -> AppResult<Episode> {
     conn.query_row(
         "SELECT id, podcast_id, guid, title, description, audio_url, publish_at,
-                duration_ms, episode_image_path, status, created_at, updated_at
+                duration_ms, episode_image_path, status, inbox, archived, created_at, updated_at
          FROM episode WHERE id = ?1",
         params![id],
         map_episode,
@@ -467,6 +622,395 @@ fn reindex_queue(conn: &Connection) -> AppResult<()> {
     Ok(())
 }
 
+pub fn enqueue_job(conn: &Connection, job_type: &str, episode_id: i64, priority: i64) -> AppResult<i64> {
+    let existing: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM job WHERE episode_id = ?1 AND type = ?2 AND state IN ('queued','running')",
+        params![episode_id, job_type],
+        |row| row.get(0),
+    )?;
+    if existing > 0 {
+        return Ok(0);
+    }
+    let ts = now_rfc3339();
+    conn.execute(
+        "INSERT INTO job (type, episode_id, priority, state, attempts, created_at, updated_at)
+         VALUES (?1, ?2, ?3, 'queued', 0, ?4, ?4)",
+        params![job_type, episode_id, priority, ts],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+pub fn claim_next_job(conn: &Connection) -> AppResult<Option<(i64, String, i64)>> {
+    let row: Option<(i64, String, i64)> = conn
+        .query_row(
+            "SELECT id, type, episode_id FROM job WHERE state = 'queued' ORDER BY priority DESC, id ASC LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    if let Some((id, ty, eid)) = &row {
+        conn.execute(
+            "UPDATE job SET state = 'running', attempts = attempts + 1, updated_at = ?1 WHERE id = ?2",
+            params![now_rfc3339(), id],
+        )?;
+        let _ = (ty, eid);
+    }
+    Ok(row)
+}
+
+pub fn requeue_running_jobs(conn: &Connection) -> AppResult<usize> {
+    let n = conn.execute(
+        "UPDATE job SET state = 'queued', error_msg = 'Omstart: jobbet låg kvar som running.', updated_at = ?1 WHERE state = 'running'",
+        params![now_rfc3339()],
+    )?;
+    Ok(n)
+}
+
+pub fn set_job_progress(conn: &Connection, id: i64, msg: &str) -> AppResult<()> {
+    let clipped: String = msg.chars().take(400).collect();
+    conn.execute(
+        "UPDATE job SET error_msg = ?1, updated_at = ?2 WHERE id = ?3 AND state = 'running'",
+        params![clipped, now_rfc3339(), id],
+    )?;
+    Ok(())
+}
+
+pub fn finish_job(conn: &Connection, id: i64, ok: bool, error: Option<&str>) -> AppResult<()> {
+    conn.execute(
+        "UPDATE job SET state = ?1, error_msg = ?2, updated_at = ?3 WHERE id = ?4",
+        params![
+            if ok { "done" } else { "error" },
+            error,
+            now_rfc3339(),
+            id
+        ],
+    )?;
+    Ok(())
+}
+
+pub fn list_jobs(conn: &Connection, limit: i64) -> AppResult<Vec<JobRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, type, episode_id, state, error_msg, created_at FROM job ORDER BY id DESC LIMIT ?1",
+    )?;
+    let rows = stmt.query_map(params![limit], |row| {
+        Ok(JobRow {
+            id: row.get(0)?,
+            job_type: row.get(1)?,
+            episode_id: row.get(2)?,
+            state: row.get(3)?,
+            error_msg: row.get(4)?,
+            created_at: row.get(5)?,
+        })
+    })?;
+    Ok(rows.filter_map(|r| r.ok()).collect())
+}
+
+pub fn replace_transcript(
+    conn: &Connection,
+    episode_id: i64,
+    source: &str,
+    model: Option<&str>,
+    language: Option<&str>,
+    segments: &[crate::intel::Segment],
+) -> AppResult<i64> {
+    conn.execute(
+        "DELETE FROM transcript WHERE episode_id = ?1",
+        params![episode_id],
+    )?;
+    let ts = now_rfc3339();
+    conn.execute(
+        "INSERT INTO transcript (episode_id, source, model, language, status, created_at)
+         VALUES (?1, ?2, ?3, ?4, 'ready', ?5)",
+        params![episode_id, source, model, language, ts],
+    )?;
+    let tid = conn.last_insert_rowid();
+    for seg in segments {
+        conn.execute(
+            "INSERT INTO transcript_segment (transcript_id, start_ms, end_ms, text) VALUES (?1, ?2, ?3, ?4)",
+            params![tid, seg.start_ms, seg.end_ms, seg.text],
+        )?;
+    }
+    Ok(tid)
+}
+
+pub fn get_transcript(conn: &Connection, episode_id: i64) -> AppResult<Option<Transcript>> {
+    conn.query_row(
+        "SELECT id, episode_id, source, model, language, status, created_at FROM transcript WHERE episode_id = ?1",
+        params![episode_id],
+        |row| {
+            Ok(Transcript {
+                id: row.get(0)?,
+                episode_id: row.get(1)?,
+                source: row.get(2)?,
+                model: row.get(3)?,
+                language: row.get(4)?,
+                status: row.get(5)?,
+                created_at: row.get(6)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+pub fn list_segments(conn: &Connection, episode_id: i64) -> AppResult<Vec<TranscriptSegment>> {
+    let mut stmt = conn.prepare(
+        r#"
+        SELECT s.id, s.transcript_id, s.start_ms, s.end_ms, s.text
+        FROM transcript_segment s
+        JOIN transcript t ON t.id = s.transcript_id
+        WHERE t.episode_id = ?1
+        ORDER BY s.start_ms
+        "#,
+    )?;
+    let rows = stmt.query_map(params![episode_id], |row| {
+        Ok(TranscriptSegment {
+            id: row.get(0)?,
+            transcript_id: row.get(1)?,
+            start_ms: row.get(2)?,
+            end_ms: row.get(3)?,
+            text: row.get(4)?,
+        })
+    })?;
+    Ok(rows.filter_map(|r| r.ok()).collect())
+}
+
+pub fn search_segments(conn: &Connection, query: &str) -> AppResult<Vec<TranscriptSegment>> {
+    let like = format!("%{}%", query);
+    let mut stmt = conn.prepare(
+        "SELECT s.id, s.transcript_id, s.start_ms, s.end_ms, s.text
+         FROM transcript_segment s
+         WHERE s.text LIKE ?1 COLLATE NOCASE
+         ORDER BY s.start_ms
+         LIMIT 200",
+    )?;
+    let rows = stmt.query_map(params![like], |row| {
+        Ok(TranscriptSegment {
+            id: row.get(0)?,
+            transcript_id: row.get(1)?,
+            start_ms: row.get(2)?,
+            end_ms: row.get(3)?,
+            text: row.get(4)?,
+        })
+    })?;
+    Ok(rows.filter_map(|r| r.ok()).collect())
+}
+
+pub fn replace_generated_chapters(
+    conn: &Connection,
+    episode_id: i64,
+    chapters: &[crate::intel::ChapterDraft],
+) -> AppResult<()> {
+    conn.execute(
+        "DELETE FROM chapter WHERE episode_id = ?1 AND source IN ('generated','embedded')",
+        params![episode_id],
+    )?;
+    for ch in chapters {
+        conn.execute(
+            "INSERT INTO chapter (episode_id, start_ms, end_ms, title, source) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![episode_id, ch.start_ms, ch.end_ms, ch.title, ch.source],
+        )?;
+    }
+    Ok(())
+}
+
+pub fn list_chapters(conn: &Connection, episode_id: i64) -> AppResult<Vec<Chapter>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, episode_id, start_ms, end_ms, title, source FROM chapter WHERE episode_id = ?1 ORDER BY start_ms",
+    )?;
+    let rows = stmt.query_map(params![episode_id], |row| {
+        Ok(Chapter {
+            id: row.get(0)?,
+            episode_id: row.get(1)?,
+            start_ms: row.get(2)?,
+            end_ms: row.get(3)?,
+            title: row.get(4)?,
+            source: row.get(5)?,
+        })
+    })?;
+    Ok(rows.filter_map(|r| r.ok()).collect())
+}
+
+pub fn replace_ads(conn: &Connection, episode_id: i64, ads: &[crate::intel::AdDraft]) -> AppResult<()> {
+    conn.execute(
+        "DELETE FROM ad_segment WHERE episode_id = ?1 AND method != 'user'",
+        params![episode_id],
+    )?;
+    for ad in ads {
+        conn.execute(
+            "INSERT INTO ad_segment (episode_id, start_ms, end_ms, confidence, method, enabled)
+             VALUES (?1, ?2, ?3, ?4, ?5, 1)",
+            params![episode_id, ad.start_ms, ad.end_ms, ad.confidence, ad.method],
+        )?;
+    }
+    Ok(())
+}
+
+pub fn list_ads(conn: &Connection, episode_id: i64) -> AppResult<Vec<AdSegment>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, episode_id, start_ms, end_ms, confidence, method, enabled FROM ad_segment WHERE episode_id = ?1 ORDER BY start_ms",
+    )?;
+    let rows = stmt.query_map(params![episode_id], |row| {
+        Ok(AdSegment {
+            id: row.get(0)?,
+            episode_id: row.get(1)?,
+            start_ms: row.get(2)?,
+            end_ms: row.get(3)?,
+            confidence: row.get(4)?,
+            method: row.get(5)?,
+            enabled: row.get::<_, i64>(6)? != 0,
+        })
+    })?;
+    Ok(rows.filter_map(|r| r.ok()).collect())
+}
+
+pub fn add_bookmark(conn: &Connection, episode_id: i64, position_ms: i64, note: &str) -> AppResult<()> {
+    conn.execute(
+        "INSERT INTO bookmark (episode_id, position_ms, note, created_at) VALUES (?1, ?2, ?3, ?4)",
+        params![episode_id, position_ms, note, now_rfc3339()],
+    )?;
+    Ok(())
+}
+
+pub fn list_bookmarks(conn: &Connection) -> AppResult<Vec<Bookmark>> {
+    let mut stmt = conn.prepare(
+        "SELECT b.id, b.episode_id, b.position_ms, b.note, b.created_at, e.title
+         FROM bookmark b JOIN episode e ON e.id = b.episode_id
+         ORDER BY b.created_at DESC",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok(Bookmark {
+            id: row.get(0)?,
+            episode_id: row.get(1)?,
+            position_ms: row.get(2)?,
+            note: row.get(3)?,
+            created_at: row.get(4)?,
+            episode_title: row.get(5)?,
+        })
+    })?;
+    Ok(rows.filter_map(|r| r.ok()).collect())
+}
+
+pub fn delete_bookmark(conn: &Connection, id: i64) -> AppResult<()> {
+    conn.execute("DELETE FROM bookmark WHERE id = ?1", params![id])?;
+    Ok(())
+}
+
+pub fn set_inbox(conn: &Connection, episode_id: i64, inbox: bool, archived: bool) -> AppResult<()> {
+    conn.execute(
+        "UPDATE episode SET inbox = ?1, archived = ?2, updated_at = ?3 WHERE id = ?4",
+        params![inbox as i64, archived as i64, now_rfc3339(), episode_id],
+    )?;
+    Ok(())
+}
+
+pub fn list_inbox(conn: &Connection) -> AppResult<Vec<InboxItem>> {
+    let mut stmt = conn.prepare(
+        r#"
+        SELECT e.id, e.podcast_id, e.guid, e.title, e.description, e.audio_url, e.publish_at,
+               e.duration_ms, e.episode_image_path, e.status, e.inbox, e.archived, e.created_at, e.updated_at,
+               p.title, d.state
+        FROM episode e
+        JOIN podcast p ON p.id = e.podcast_id
+        LEFT JOIN download d ON d.episode_id = e.id
+        WHERE e.inbox = 1 AND e.archived = 0
+        ORDER BY CASE WHEN e.publish_at IS NULL THEN 1 ELSE 0 END, e.publish_at DESC
+        "#,
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok(InboxItem {
+            episode: Episode {
+                id: row.get(0)?,
+                podcast_id: row.get(1)?,
+                guid: row.get(2)?,
+                title: row.get(3)?,
+                description: row.get(4)?,
+                audio_url: row.get(5)?,
+                publish_at: row.get(6)?,
+                duration_ms: row.get(7)?,
+                episode_image_path: row.get(8)?,
+                status: row.get(9)?,
+                inbox: row.get::<_, i64>(10)? != 0,
+                archived: row.get::<_, i64>(11)? != 0,
+                created_at: row.get(12)?,
+                updated_at: row.get(13)?,
+            },
+            podcast_title: row.get(14)?,
+            download_state: row.get(15)?,
+        })
+    })?;
+    Ok(rows.filter_map(|r| r.ok()).collect())
+}
+
+pub fn library_stats(conn: &Connection) -> AppResult<LibraryStats> {
+    let podcast_count: i64 = conn.query_row("SELECT COUNT(*) FROM podcast", [], |r| r.get(0))?;
+    let episode_count: i64 = conn.query_row("SELECT COUNT(*) FROM episode", [], |r| r.get(0))?;
+    let downloaded_count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM download WHERE state = 'done'",
+        [],
+        |r| r.get(0),
+    )?;
+    let completed_count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM playback_state WHERE completed = 1",
+        [],
+        |r| r.get(0),
+    )?;
+    let inbox_count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM episode WHERE inbox = 1 AND archived = 0",
+        [],
+        |r| r.get(0),
+    )?;
+    let bookmark_count: i64 = conn.query_row("SELECT COUNT(*) FROM bookmark", [], |r| r.get(0))?;
+    let listened_ms: i64 = conn.query_row(
+        "SELECT COALESCE(SUM(position_ms), 0) FROM playback_state",
+        [],
+        |r| r.get(0),
+    )?;
+    Ok(LibraryStats {
+        podcast_count,
+        episode_count,
+        downloaded_count,
+        completed_count,
+        inbox_count,
+        bookmark_count,
+        listened_ms,
+    })
+}
+
+pub fn ensure_sideload_podcast(conn: &Connection) -> AppResult<i64> {
+    upsert_podcast(
+        conn,
+        "local://sideload",
+        "Importerade filer",
+        Some("Lokal"),
+        Some("Ljudfiler importerade utan RSS."),
+        Some("sideload"),
+        None,
+    )
+}
+
+pub fn podcast_wants_transcribe(conn: &Connection, podcast_id: i64) -> AppResult<bool> {
+    let v: i64 = conn.query_row(
+        "SELECT auto_transcribe FROM podcast WHERE id = ?1",
+        params![podcast_id],
+        |row| row.get(0),
+    )?;
+    Ok(v != 0)
+}
+
+pub fn podcast_asr_language(conn: &Connection, podcast_id: i64) -> AppResult<String> {
+    let v: Option<String> = conn.query_row(
+        "SELECT asr_language FROM podcast WHERE id = ?1",
+        params![podcast_id],
+        |row| row.get(0),
+    )?;
+    Ok(v.unwrap_or_else(|| "auto".into()))
+}
+
+pub fn download_is_done(conn: &Connection, episode_id: i64) -> bool {
+    matches!(get_download(conn, episode_id), Ok(Some(d)) if d.state == "done")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -514,5 +1058,94 @@ mod tests {
             get_playback(&conn, eid).unwrap().unwrap().position_ms,
             1234
         );
+        enqueue_job(&conn, "transcribe", eid, 10).unwrap();
+        assert!(claim_next_job(&conn).unwrap().is_some());
+        assert_eq!(requeue_running_jobs(&conn).unwrap(), 1);
+        assert_eq!(list_jobs(&conn, 5).unwrap()[0].state, "queued");
+        assert!(!get_podcast(&conn, pid).unwrap().auto_transcribe);
+    }
+
+    #[test]
+    fn episode_guid_unique_per_podcast_not_global() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize(&conn).unwrap();
+        let a = upsert_podcast(&conn, "https://a.example/feed.xml", "A", None, None, None, None)
+            .unwrap();
+        let b = upsert_podcast(&conn, "https://b.example/feed.xml", "B", None, None, None, None)
+            .unwrap();
+        let e1 = upsert_episode(&conn, a, "same-guid", "Ep A", None, None, None, None).unwrap();
+        let e2 = upsert_episode(&conn, b, "same-guid", "Ep B", None, None, None, None).unwrap();
+        assert_ne!(e1, e2);
+        let e1b = upsert_episode(&conn, a, "same-guid", "Ep A uppdaterad", None, None, None, None)
+            .unwrap();
+        assert_eq!(e1, e1b);
+        assert_eq!(get_episode(&conn, e1).unwrap().title, "Ep A uppdaterad");
+    }
+
+    #[test]
+    fn upgrades_global_guid_unique_without_losing_rows() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            r#"
+            CREATE TABLE podcast (
+              id INTEGER PRIMARY KEY,
+              guid TEXT,
+              title TEXT NOT NULL,
+              author TEXT,
+              feed_url TEXT NOT NULL UNIQUE,
+              artwork_path TEXT,
+              description TEXT,
+              auto_download INTEGER NOT NULL DEFAULT 0,
+              speed REAL NOT NULL DEFAULT 1.0,
+              intro_skip_sec INTEGER NOT NULL DEFAULT 0,
+              outro_skip_sec INTEGER NOT NULL DEFAULT 0,
+              skip_silence INTEGER NOT NULL DEFAULT 0,
+              language TEXT,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL
+            );
+            CREATE TABLE episode (
+              id INTEGER PRIMARY KEY,
+              podcast_id INTEGER NOT NULL REFERENCES podcast(id) ON DELETE CASCADE,
+              guid TEXT NOT NULL UNIQUE,
+              title TEXT NOT NULL,
+              description TEXT,
+              audio_url TEXT,
+              publish_at TEXT,
+              duration_ms INTEGER,
+              episode_image_path TEXT,
+              status TEXT NOT NULL DEFAULT 'new',
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL
+            );
+            "#,
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO podcast (title, feed_url, created_at, updated_at) VALUES ('P','https://old.example/feed', 't','t')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO episode (podcast_id, guid, title, status, created_at, updated_at)
+             VALUES (1, 'g1', 'E1', 'new', 't', 't')",
+            [],
+        )
+        .unwrap();
+        initialize(&conn).unwrap();
+        let other = upsert_podcast(
+            &conn,
+            "https://other.example/feed.xml",
+            "Other",
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let id = upsert_episode(&conn, other, "g1", "Same guid other show", None, None, None, None)
+            .unwrap();
+        assert!(id > 0);
+        assert_eq!(get_episode(&conn, 1).unwrap().title, "E1");
     }
 }
