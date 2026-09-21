@@ -387,6 +387,47 @@ fn format_asio_code(code: i32) -> String {
     }
 }
 
+/// Pick a legal ASIO `createBuffers` length. DSD mode can report a nonsense
+/// `preferredSize` (even the bit-rate); writing that many bytes is an AV.
+#[allow(dead_code)]
+fn pick_buffer_frames(min: i32, max: i32, preferred: i32, gran: i32) -> usize {
+    const CAP: i32 = 65_536;
+    let min = min.max(0);
+    let max = max.max(0);
+    let mut n = if preferred > 0 {
+        preferred
+    } else if min > 0 {
+        min
+    } else {
+        64
+    };
+    if max > 0 && n > max {
+        n = max;
+    }
+    if min > 0 && n < min {
+        n = min;
+    }
+    if gran > 1 {
+        let base = min;
+        if n >= base {
+            n = base + ((n - base) / gran) * gran;
+            if min > 0 && n < min {
+                n = min;
+            }
+            if n <= 0 {
+                n = gran;
+            }
+        }
+    }
+    if n > CAP && !(min > CAP) {
+        n = if max > 0 { max.min(CAP) } else { CAP };
+        if min > 0 && n < min {
+            n = min;
+        }
+    }
+    n.max(1) as usize
+}
+
 #[allow(dead_code)]
 fn format_io_format_diag(p: &IoFormatProbe, sw: IoFormatSwitch) -> String {
     let get = p.get.map(format_asio_code).unwrap_or_else(|| "n/a".into());
@@ -701,12 +742,18 @@ mod windows_impl {
         buffer_switch_time_info: unsafe extern "C" fn(*mut c_void, c_long, c_long) -> *mut c_void,
     }
 
-    static CALLBACKS: Callbacks = Callbacks {
-        buffer_switch,
-        sample_rate_did_change,
-        asio_message,
-        buffer_switch_time_info,
-    };
+    /// Heap-backed: some DSD drivers write the callback table (rodata AV on `static`).
+    fn make_callbacks() -> Box<Callbacks> {
+        Box::new(Callbacks {
+            buffer_switch,
+            sample_rate_did_change,
+            asio_message,
+            buffer_switch_time_info,
+        })
+    }
+
+    static POST_OUTPUT: AtomicBool = AtomicBool::new(false);
+    static DRIVER_FOR_READY: AtomicPtr<Iasio> = AtomicPtr::new(ptr::null_mut());
 
     unsafe extern "C" fn buffer_switch(index: c_long, _direct: c_long) {
         fill_buffers(index);
@@ -748,9 +795,24 @@ mod windows_impl {
 
     fn fill_buffers(index: c_long) {
         RT_IN_FLIGHT.fetch_add(1, Ordering::AcqRel);
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            fill_buffers_inner(index);
+        }));
+        if POST_OUTPUT.load(Ordering::Relaxed) {
+            let d = DRIVER_FOR_READY.load(Ordering::Acquire);
+            if !d.is_null() {
+                unsafe {
+                    let vtbl = &*(*d).vtbl;
+                    let _ = (vtbl.output_ready)(d);
+                }
+            }
+        }
+        RT_IN_FLIGHT.fetch_sub(1, Ordering::Release);
+    }
+
+    fn fill_buffers_inner(index: c_long) {
         let host = RT_HOST.load(Ordering::Acquire);
         if host.is_null() {
-            RT_IN_FLIGHT.fetch_sub(1, Ordering::Release);
             return;
         }
         let st = unsafe { &*host };
@@ -764,7 +826,6 @@ mod windows_impl {
                 unsafe {
                     write_mute(st, idx, frames, ch);
                 }
-                RT_IN_FLIGHT.fetch_sub(1, Ordering::Release);
                 return;
             }
             CallbackBusyAction::ReentryMute => {
@@ -773,8 +834,6 @@ mod windows_impl {
                 unsafe {
                     write_mute(st, idx, frames, ch);
                 }
-                // Leave scratch_busy set — the owning callback still fills.
-                RT_IN_FLIGHT.fetch_sub(1, Ordering::Release);
                 return;
             }
             CallbackBusyAction::Fill => {}
@@ -786,7 +845,6 @@ mod windows_impl {
             RtFillMode::Dop => fill_dop(st, idx, frames, ch),
         }
         st.scratch_busy.store(false, Ordering::Release);
-        RT_IN_FLIGHT.fetch_sub(1, Ordering::Release);
     }
 
     fn fill_pcm(st: &RtHost, idx: usize, frames: usize, ch: usize) {
@@ -1226,9 +1284,10 @@ mod windows_impl {
             )
         };
         let set_format_type = fmt.format_type;
-        // Seed Invalid so a no-op Get cannot look like a confirmation of the request.
+        // Seed PCM (0), not Invalid(-1): some drivers treat Get's input as a command.
+        // A no-op Get leaving 0 cannot confirm DSD (requested=1).
         let mut got = AsioIoFormat {
-            format_type: ASIO_IO_INVALID,
+            format_type: ASIO_IO_PCM,
             reserved: [0; 508],
         };
         let get = unsafe {
@@ -1261,6 +1320,35 @@ mod windows_impl {
             return Err(err_of(driver, "getChannelInfo misslyckades."));
         }
         Ok(info.sample_type)
+    }
+
+    fn buffers_complete(infos: &[BufferInfo]) -> bool {
+        !infos.is_empty()
+            && infos
+                .iter()
+                .all(|b| !b.buffers[0].is_null() && !b.buffers[1].is_null())
+    }
+
+    fn teardown_asio(
+        driver: *mut Iasio,
+        vtbl: &IasioVtbl,
+        created_buffers: bool,
+        restore_pcm: bool,
+    ) {
+        POST_OUTPUT.store(false, Ordering::Release);
+        DRIVER_FOR_READY.store(ptr::null_mut(), Ordering::Release);
+        let _ = unsafe { (vtbl.stop)(driver) };
+        uninstall_rt_host();
+        if created_buffers {
+            let _ = unsafe { (vtbl.dispose_buffers)(driver) };
+        }
+        // IoFormat switch is only legal outside the prepared state (after dispose).
+        if restore_pcm {
+            let _ = probe_io_format(driver, vtbl, false);
+        }
+        unsafe {
+            (vtbl.release)(driver);
+        }
     }
 
     fn try_set_rate(
@@ -1382,8 +1470,10 @@ mod windows_impl {
         let io_probe = probe_io_format(driver, vtbl, want_dsd_io);
         let io_sw = classify_io_format_probe(&io_probe);
         let mut dsd_diag = format_io_format_diag(&io_probe, io_sw);
+        // Native always calls Set(DSD); restore PCM before release if we abort.
+        let restore_pcm = native_dsd;
         if native_dsd && io_sw != IoFormatSwitch::Applied {
-            unsafe { (vtbl.release)(driver) };
+            teardown_asio(driver, vtbl, false, true);
             return Err(EngineError::msg(format!(
                 "{display_name} bekräftade inte native DSD ({dsd_diag}). Native DSD avbryts — prova DoP. Filen rörs inte."
             )));
@@ -1416,7 +1506,7 @@ mod windows_impl {
             dsd_diag.push_str(&format!(" rate_skipped=[{}]", rejected_rates.join("; ")));
         }
         if !got_rate {
-            unsafe { (vtbl.release)(driver) };
+            teardown_asio(driver, vtbl, false, restore_pcm);
             return Err(EngineError::msg(if native_dsd {
                 format!(
                     "{display_name} tog inte native DSD-hastighet (bit/byte). {dsd_diag} {rate_err} Ingen tyst PCM-omkodning."
@@ -1439,7 +1529,7 @@ mod windows_impl {
         let sample_type_pre = match read_channel_sample_type(driver, vtbl) {
             Ok(v) => v,
             Err(err) => {
-                unsafe { (vtbl.release)(driver) };
+                teardown_asio(driver, vtbl, false, restore_pcm);
                 return Err(EngineError::msg(format!("{err} {dsd_diag}")));
             }
         };
@@ -1448,20 +1538,20 @@ mod windows_impl {
         // Native DSD: some drivers keep PCM sample_type until createBuffers — do not abort yet.
         if dop {
             if !sample_type.dop_ok() {
-                unsafe { (vtbl.release)(driver) };
+                teardown_asio(driver, vtbl, false, false);
                 return Err(EngineError::msg(format!(
                     "{display_name} DoP kräver 24/32-bit PCM (inte f32/i16/DSD). Sampletyp {sample_type_pre}. {dsd_diag} Filen rörs inte.",
                 )));
             }
         } else if !native_dsd {
             if sample_type.is_dsd() {
-                unsafe { (vtbl.release)(driver) };
+                teardown_asio(driver, vtbl, false, false);
                 return Err(EngineError::msg(
                     "ASIO-kanalen är DSD medan filen är PCM. Växla DAC:n till PCM eller spela en DSD-fil. Filen rörs inte.",
                 ));
             }
             if !sample_type.is_pcm() {
-                unsafe { (vtbl.release)(driver) };
+                teardown_asio(driver, vtbl, false, false);
                 return Err(EngineError::msg(format!(
                     "ASIO-kanalen har okänd sampletyp ({sample_type_pre}). Native-motorn vägrar tyst uppspelning — använd PCM/FLAC eller en drivrutin med i16/i24/i32/f32. Filen rörs inte."
                 )));
@@ -1476,15 +1566,15 @@ mod windows_impl {
             != 0
         {
             let err = err_of(driver, "getBufferSize misslyckades.");
-            unsafe { (vtbl.release)(driver) };
-            return Err(err);
+            teardown_asio(driver, vtbl, false, restore_pcm);
+            return Err(EngineError::msg(format!("{err} {dsd_diag}")));
         }
-        let frames = if preferred > 0 {
-            preferred
-        } else {
-            min.max(64)
-        } as usize;
+        let frames = pick_buffer_frames(min, max, preferred, gran);
+        dsd_diag.push_str(&format!(
+            " buf=min{min}/max{max}/pref{preferred}/gran{gran}/used{frames}"
+        ));
 
+        let mut callbacks = make_callbacks();
         let mut buf_infos: Vec<BufferInfo> = (0..channels)
             .map(|ch| BufferInfo {
                 is_input: 0,
@@ -1499,7 +1589,7 @@ mod windows_impl {
                 buf_infos.as_mut_ptr(),
                 channels as c_long,
                 frames as c_long,
-                &CALLBACKS as *const Callbacks as *mut Callbacks,
+                &mut *callbacks as *mut Callbacks,
             )
         };
         if created != 0 {
@@ -1507,23 +1597,61 @@ mod windows_impl {
                 driver,
                 &format!("{display_name} createBuffers misslyckades."),
             );
-            unsafe { (vtbl.release)(driver) };
+            teardown_asio(driver, vtbl, false, restore_pcm);
             return Err(EngineError::msg(format!("{err} {dsd_diag}")));
         }
+        if !buffers_complete(&buf_infos) {
+            teardown_asio(driver, vtbl, true, restore_pcm);
+            return Err(EngineError::msg(format!(
+                "{display_name} createBuffers lämnade null-pekare. {dsd_diag} Filen rörs inte."
+            )));
+        }
+
+        let buffers: Vec<[*mut u8; 2]> = buf_infos
+            .iter()
+            .map(|b| [b.buffers[0] as *mut u8, b.buffers[1] as *mut u8])
+            .collect();
+        // DSD IoFormat: fill as native bytes even if sample_type has not flipped yet.
+        let fill_pre = if native_dsd {
+            RtFillMode::NativeDsd {
+                reverse: file_lsb != SampleType::from_asio(sample_type_pre).dsd_lsb_first(),
+            }
+        } else if dop {
+            RtFillMode::Dop
+        } else {
+            RtFillMode::Pcm
+        };
+        let reverse_pre = if native_dsd {
+            file_lsb != SampleType::from_asio(sample_type_pre).dsd_lsb_first()
+        } else if dop {
+            file_lsb
+        } else {
+            false
+        };
+        install_session_host(
+            pcm_ring.clone(),
+            dsd_ring.clone(),
+            playing.clone(),
+            stop.clone(),
+            buffers,
+            frames,
+            SampleType::from_asio(sample_type_pre),
+            channels,
+            fill_pre,
+            reverse_pre,
+        );
 
         let sample_type_post = match read_channel_sample_type(driver, vtbl) {
             Ok(v) => v,
             Err(err) => {
-                let _ = unsafe { (vtbl.dispose_buffers)(driver) };
-                unsafe { (vtbl.release)(driver) };
+                teardown_asio(driver, vtbl, true, restore_pcm);
                 return Err(EngineError::msg(format!("{err} {dsd_diag}")));
             }
         };
         dsd_diag.push_str(&format!(" sample_type_post={sample_type_post}"));
         let sample_type = SampleType::from_asio(sample_type_post);
         if native_dsd && !sample_type.is_dsd() {
-            let _ = unsafe { (vtbl.dispose_buffers)(driver) };
-            unsafe { (vtbl.release)(driver) };
+            teardown_asio(driver, vtbl, true, true);
             return Err(EngineError::msg(format!(
                 "{display_name} växlar inte till DSD-sampletyp efter createBuffers (fick {sample_type_post}). {dsd_diag} Native DSD avbryts — prova DoP om DAC:n stöder det. Filen rörs inte."
             )));
@@ -1569,12 +1697,16 @@ mod windows_impl {
             reverse,
         );
 
+        POST_OUTPUT.store(
+            unsafe { (vtbl.output_ready)(driver) } == ASE_OK,
+            Ordering::Release,
+        );
+        DRIVER_FOR_READY.store(driver, Ordering::Release);
+
         if unsafe { (vtbl.start)(driver) } != 0 {
             let err = err_of(driver, &format!("{display_name} start() misslyckades."));
-            uninstall_rt_host();
-            let _ = unsafe { (vtbl.dispose_buffers)(driver) };
-            unsafe { (vtbl.release)(driver) };
-            return Err(err);
+            teardown_asio(driver, vtbl, true, restore_pcm);
+            return Err(EngineError::msg(format!("{err} {dsd_diag}")));
         }
 
         let _ = tx.send(Ok(Opened {
@@ -1587,6 +1719,8 @@ mod windows_impl {
 
         while !stop.load(Ordering::Relaxed) {
             if ASIO_RESET.swap(false, Ordering::AcqRel) {
+                POST_OUTPUT.store(false, Ordering::Release);
+                DRIVER_FOR_READY.store(ptr::null_mut(), Ordering::Release);
                 let _ = unsafe { (vtbl.stop)(driver) };
                 uninstall_rt_host();
                 let _ = unsafe { (vtbl.dispose_buffers)(driver) };
@@ -1599,16 +1733,16 @@ mod windows_impl {
                         buf_infos.as_mut_ptr(),
                         channels as c_long,
                         frames as c_long,
-                        &CALLBACKS as *const Callbacks as *mut Callbacks,
+                        &mut *callbacks as *mut Callbacks,
                     )
                 };
-                if created != 0 {
+                if created != 0 || !buffers_complete(&buf_infos) {
                     let err = err_of(
                         driver,
                         &format!("{display_name} createBuffers misslyckades efter ASIO reset."),
                     );
-                    unsafe { (vtbl.release)(driver) };
-                    return Err(err);
+                    teardown_asio(driver, vtbl, created == 0, restore_pcm);
+                    return Err(EngineError::msg(format!("{err} {dsd_diag}")));
                 }
                 let buffers: Vec<[*mut u8; 2]> = buf_infos
                     .iter()
@@ -1626,24 +1760,25 @@ mod windows_impl {
                     fill,
                     reverse,
                 );
+                POST_OUTPUT.store(
+                    unsafe { (vtbl.output_ready)(driver) } == ASE_OK,
+                    Ordering::Release,
+                );
+                DRIVER_FOR_READY.store(driver, Ordering::Release);
                 if unsafe { (vtbl.start)(driver) } != 0 {
                     let err = err_of(
                         driver,
                         &format!("{display_name} start() misslyckades efter ASIO reset."),
                     );
-                    uninstall_rt_host();
-                    let _ = unsafe { (vtbl.dispose_buffers)(driver) };
-                    unsafe { (vtbl.release)(driver) };
-                    return Err(err);
+                    teardown_asio(driver, vtbl, true, restore_pcm);
+                    return Err(EngineError::msg(format!("{err} {dsd_diag}")));
                 }
             }
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
 
-        let _ = unsafe { (vtbl.stop)(driver) };
-        uninstall_rt_host();
-        let _ = unsafe { (vtbl.dispose_buffers)(driver) };
-        unsafe { (vtbl.release)(driver) };
+        teardown_asio(driver, vtbl, true, restore_pcm);
+        let _ = callbacks;
         Ok(())
     }
 }
@@ -1774,6 +1909,17 @@ mod tests {
         assert!(s.contains("switch=Applied"), "{s}");
         assert_eq!(format_asio_code(1), "ASIOTrue(1)");
         assert_eq!(format_asio_code(-1000), "ASE_NotPresent(-1000)");
+    }
+
+    #[test]
+    fn pick_buffer_frames_clamps_insane_preferred() {
+        assert_eq!(pick_buffer_frames(64, 2048, 512, 8), 512);
+        assert_eq!(pick_buffer_frames(64, 2048, 0, 0), 64);
+        assert_eq!(pick_buffer_frames(0, 0, 0, 0), 64);
+        // DSD bit-rate leaked as preferredSize must not become the write length.
+        assert_eq!(pick_buffer_frames(64, 2048, 11_289_600, 0), 2048);
+        assert_eq!(pick_buffer_frames(0, 0, 11_289_600, 0), 65_536);
+        assert_eq!(pick_buffer_frames(64, 2048, 100, 64), 64);
     }
 
     #[test]
