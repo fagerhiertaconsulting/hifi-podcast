@@ -1,6 +1,8 @@
 //! Decode → buffer → output. f32 pipeline, unity gain, opt-in skip-silence and stretch.
 
+use super::byte_ring::ByteRing;
 use super::decode::{to_stereo, Decoder};
+use super::dsd::{self, DsdReader, BitOrder};
 use super::exclusive::ExclusiveStream;
 use super::formats::{self, FormatKind, FormatSupport};
 use super::output::{self, OutputDeviceInfo, SharedStream};
@@ -48,6 +50,13 @@ pub struct EngineStatus {
     pub skip_silence: bool,
     pub underruns: u64,
     pub error: Option<String>,
+    /// `pcm` or `dsd`
+    pub format: String,
+    /// e.g. `DSD256`; empty for PCM
+    pub dsd_rate: String,
+    /// `pcm`, `native_dsd`, or `dop` — never `native_dsd` for converted/DoP
+    pub output_path: String,
+    pub output_path_sv: String,
 }
 
 impl Default for EngineStatus {
@@ -71,6 +80,10 @@ impl Default for EngineStatus {
             skip_silence: false,
             underruns: 0,
             error: None,
+            format: "pcm".into(),
+            dsd_rate: String::new(),
+            output_path: "pcm".into(),
+            output_path_sv: "PCM".into(),
         }
     }
 }
@@ -148,7 +161,7 @@ impl Handle {
                 .iter()
                 .map(|s| (*s).to_string())
                 .collect(),
-            dsd_status_sv: "DSD/SACD (.dsf/.dff) känns igen men avkodas inte. Native DSD via ASIO (DoP eller DSD-sampletyp) är uppskjutet. FLAC/PCM går till ASIO som PCM. Originalfilen rörs inte.",
+            dsd_status_sv: "DSD (.dsf/.dff) spelas native: ASIO native DSD först (FiiO ASIO Driver). Om DAC:n kräver DoP märks utgången DoP — aldrig \"native DSD\". WASAPI exclusive DoP är dokumenterad fallback. Delat WASAPI och WebView2 används inte för DSD. SACD-ISO rippning ingår inte.",
             asio_available: super::asio_host::asio_available(),
             exclusive_available: output::exclusive_available(),
             asio_note_sv: "Primär hi-fi-utgång är ASIO (FiiO ASIO Driver, samma som i Qobuz). Listan läses från HKLM\\SOFTWARE\\ASIO och strömmen öppnas via IASIO. WASAPI delat/exclusive är fallback om ASIO saknas eller nekas.",
@@ -172,13 +185,25 @@ impl Handle {
     pub fn probe(path: &Path) -> Result<ProbeInfo, EngineError> {
         let support = formats::support_for(path, None);
         if support.kind == FormatKind::Dsd {
+            if !support.native_decode {
+                return Ok(ProbeInfo {
+                    path: path.display().to_string(),
+                    support,
+                    sample_rate: None,
+                    channels: None,
+                    duration_ms: None,
+                    codec: Some("DSD".into()),
+                });
+            }
+            let r = DsdReader::open(path)?;
+            let spec = r.spec().clone();
             return Ok(ProbeInfo {
                 path: path.display().to_string(),
                 support,
-                sample_rate: None,
-                channels: None,
-                duration_ms: None,
-                codec: Some("DSD".into()),
+                sample_rate: Some(spec.sample_rate),
+                channels: Some(spec.channels),
+                duration_ms: Some(spec.duration_ms),
+                codec: Some(spec.codec),
             });
         }
         if !support.native_decode {
@@ -210,7 +235,7 @@ impl Handle {
         let skip_silence = params.skip_silence;
         let probe = Self::probe(&path)?;
         if probe.support.kind == FormatKind::Dsd {
-            return Err(EngineError::dsd());
+            return self.open_dsd(path, params.output_api, params.device_name, probe);
         }
         if !probe.support.native_decode {
             return Err(EngineError::msg(probe.support.note_sv.clone()));
@@ -256,6 +281,14 @@ impl Handle {
                 skip_silence,
                 underruns: 0,
                 error: None,
+                format: "pcm".into(),
+                dsd_rate: String::new(),
+                output_path: if opened.api == "asio" {
+                    opened.io_path.clone()
+                } else {
+                    "pcm".into()
+                },
+                output_path_sv: "PCM (f32-kedja)".into(),
             };
         }
 
@@ -283,6 +316,108 @@ impl Handle {
                 );
             })
             .map_err(|e| EngineError::msg(format!("Avkodningstråd: {e}")))?;
+
+        *self.session.lock().expect("engine session") = Some(Session {
+            cmd: tx,
+            playing,
+            stop,
+            worker: Some(worker),
+            _shared: opened.shared,
+            _exclusive: opened.exclusive_stream,
+            _asio: opened.asio,
+        });
+        Ok(self.status())
+    }
+
+    fn open_dsd(
+        &self,
+        path: PathBuf,
+        output_api: String,
+        device_name: String,
+        probe: ProbeInfo,
+    ) -> Result<EngineStatus, EngineError> {
+        if !probe.support.native_decode {
+            return Err(EngineError::msg(probe.support.note_sv));
+        }
+        let reader = DsdReader::open(&path)?;
+        let spec = reader.spec().clone();
+        let file_lsb = spec.bit_order == BitOrder::LsbFirst;
+        let playing = Arc::new(AtomicBool::new(false));
+        let stop = Arc::new(AtomicBool::new(false));
+        let ring = Arc::new(ByteRing::new(2));
+        let hwnd = *self.hwnd.lock().expect("engine hwnd");
+
+        let opened = open_dsd_output(
+            &output_api,
+            &device_name,
+            spec.sample_rate,
+            hwnd,
+            ring.clone(),
+            playing.clone(),
+            file_lsb,
+        )?;
+
+        let path_sv = match opened.io_path.as_str() {
+            "native_dsd" => format!(
+                "Native DSD via ASIO ({}) — bit-perfect DSD-bytes, inte PCM-omkodning.",
+                opened.device_name
+            ),
+            "dop" => format!(
+                "DoP (DSD over PCM) via {} — inte native DSD. Markörer 0x05/0xFA, 24-bit.",
+                opened.api
+            ),
+            other => format!("Okänd DSD-väg ({other})."),
+        };
+
+        {
+            let mut st = self.status.lock().expect("engine status");
+            *st = EngineStatus {
+                loaded: true,
+                playing: false,
+                ended: false,
+                position_ms: 0,
+                duration_ms: spec.duration_ms,
+                sample_rate: spec.sample_rate,
+                channels: spec.channels,
+                codec: spec.codec.clone(),
+                path: path.display().to_string(),
+                exclusive: opened.exclusive,
+                output_api: opened.api.clone(),
+                device_name: opened.device_name.clone(),
+                output_rate: opened.out_rate,
+                resampled: false,
+                speed: 1.0,
+                skip_silence: false,
+                underruns: 0,
+                error: None,
+                format: "dsd".into(),
+                dsd_rate: spec.rate_label.clone(),
+                output_path: opened.io_path.clone(),
+                output_path_sv: path_sv,
+            };
+        }
+
+        let (tx, rx) = mpsc::channel();
+        let status = self.status.clone();
+        let app = self.app.clone();
+        let stop_w = stop.clone();
+        let playing_w = playing.clone();
+        let source_rate = spec.sample_rate;
+        let worker = std::thread::Builder::new()
+            .name("hifi-dsd".into())
+            .spawn(move || {
+                dsd_loop(
+                    reader,
+                    rx,
+                    ring,
+                    status,
+                    app,
+                    stop_w,
+                    playing_w,
+                    source_rate,
+                );
+            })
+            .map_err(|e| EngineError::msg(format!("DSD-tråd: {e}")))?;
 
         *self.session.lock().expect("engine session") = Some(Session {
             cmd: tx,
@@ -352,6 +487,7 @@ struct OpenedOutput {
     exclusive: bool,
     api: String,
     device_name: String,
+    io_path: String,
 }
 
 fn wasapi_device_name(name: &str) -> Option<&str> {
@@ -455,6 +591,7 @@ fn open_asio(
     let stream = super::asio_host::start_asio(name, sample_rate, hwnd, ring, playing)?;
     let out_rate = stream.sample_rate;
     let device_name = stream.driver_name.clone();
+    let io_path = stream.io_path.clone();
     Ok(OpenedOutput {
         shared: None,
         exclusive_stream: None,
@@ -463,6 +600,7 @@ fn open_asio(
         exclusive: true,
         api: "asio".into(),
         device_name,
+        io_path,
     })
 }
 
@@ -484,6 +622,7 @@ fn open_exclusive(
         exclusive: true,
         api: "wasapi_exclusive".into(),
         device_name: name.unwrap_or("").to_string(),
+        io_path: "pcm".into(),
     })
 }
 
@@ -505,6 +644,125 @@ fn open_shared(
         api: "wasapi_shared".into(),
         device_name: name.unwrap_or("").to_string(),
         shared: Some(stream),
+        io_path: "pcm".into(),
+    })
+}
+
+fn open_dsd_output(
+    api: &str,
+    device_name: &str,
+    dsd_hz: u32,
+    hwnd: Option<usize>,
+    ring: Arc<ByteRing>,
+    playing: Arc<AtomicBool>,
+    file_lsb: bool,
+) -> Result<OpenedOutput, EngineError> {
+    let api = api.trim().to_ascii_lowercase();
+    match api.as_str() {
+        "wasapi_shared" | "wasapi" | "shared" => Err(EngineError::msg(
+            "DSD spelas inte via WASAPI delat (systemets mixer). Välj ASIO (FiiO) för native DSD, eller WASAPI exclusive för DoP. Filen rörs inte.",
+        )),
+        "wasapi_exclusive" | "exclusive" => open_dsd_wasapi_dop(device_name, dsd_hz, ring, playing, file_lsb),
+        "asio" => open_dsd_asio(device_name, dsd_hz, hwnd, ring, playing, file_lsb, true),
+        _ => {
+            match open_dsd_asio(
+                device_name,
+                dsd_hz,
+                hwnd,
+                ring.clone(),
+                playing.clone(),
+                file_lsb,
+                true,
+            ) {
+                Ok(s) => Ok(s),
+                Err(asio_err) => match open_dsd_wasapi_dop(
+                    device_name,
+                    dsd_hz,
+                    ring,
+                    playing,
+                    file_lsb,
+                ) {
+                    Ok(s) => Ok(s),
+                    Err(wasapi_err) => Err(EngineError::msg(format!(
+                        "DSD kunde inte öppnas. ASIO native/DoP: {asio_err} WASAPI exclusive DoP: {wasapi_err} Ingen tyst PCM-omkodning. Delat WASAPI används inte."
+                    ))),
+                },
+            }
+        }
+    }
+}
+
+fn open_dsd_asio(
+    device_name: &str,
+    dsd_hz: u32,
+    hwnd: Option<usize>,
+    ring: Arc<ByteRing>,
+    playing: Arc<AtomicBool>,
+    file_lsb: bool,
+    try_native_then_dop: bool,
+) -> Result<OpenedOutput, EngineError> {
+    let name = asio_driver_name(device_name);
+    if try_native_then_dop {
+        match super::asio_host::start_asio_native_dsd(
+            name,
+            dsd_hz,
+            hwnd,
+            ring.clone(),
+            playing.clone(),
+            file_lsb,
+        ) {
+            Ok(stream) => return wrap_asio_dsd(stream),
+            Err(_) => {
+                let stream = super::asio_host::start_asio_dop(name, dsd_hz, hwnd, ring, playing, file_lsb)?;
+                return wrap_asio_dsd(stream);
+            }
+        }
+    }
+    let stream = super::asio_host::start_asio_native_dsd(name, dsd_hz, hwnd, ring, playing, file_lsb)?;
+    wrap_asio_dsd(stream)
+}
+
+fn wrap_asio_dsd(stream: super::asio_host::AsioStream) -> Result<OpenedOutput, EngineError> {
+    if stream.io_path == "native_dsd" || stream.io_path == "dop" {
+        let out_rate = stream.sample_rate;
+        let device_name = stream.driver_name.clone();
+        let io_path = stream.io_path.clone();
+        return Ok(OpenedOutput {
+            shared: None,
+            exclusive_stream: None,
+            asio: Some(stream),
+            out_rate,
+            exclusive: true,
+            api: "asio".into(),
+            device_name,
+            io_path,
+        });
+    }
+    Err(EngineError::msg(
+        "ASIO öppnade DSD men rapporterade PCM-väg. Vägrar låtsas-native. Filen rörs inte.",
+    ))
+}
+
+fn open_dsd_wasapi_dop(
+    device_name: &str,
+    dsd_hz: u32,
+    ring: Arc<ByteRing>,
+    playing: Arc<AtomicBool>,
+    file_lsb: bool,
+) -> Result<OpenedOutput, EngineError> {
+    let name = wasapi_name_for_auto_fallback(device_name).or_else(|| wasapi_device_name(device_name));
+    let dop_rate = dsd::dop_pcm_rate(dsd_hz);
+    let stream =
+        super::exclusive::start_exclusive_dop(name, dop_rate, 2, ring, playing, file_lsb)?;
+    Ok(OpenedOutput {
+        shared: None,
+        exclusive_stream: Some(stream),
+        asio: None,
+        out_rate: dop_rate,
+        exclusive: true,
+        api: "wasapi_exclusive".into(),
+        device_name: name.unwrap_or("").to_string(),
+        io_path: "dop".into(),
     })
 }
 
@@ -645,6 +903,107 @@ fn decode_loop(
                 st.playing = playing.load(Ordering::Relaxed);
                 st.ended = ended;
                 st.speed = speed;
+                st.underruns = underruns;
+            }
+            emit_tick(&app, &status);
+        }
+
+        std::thread::sleep(Duration::from_millis(4));
+    }
+}
+
+fn dsd_loop(
+    mut reader: DsdReader,
+    rx: Receiver<Cmd>,
+    ring: Arc<ByteRing>,
+    status: Arc<Mutex<EngineStatus>>,
+    app: Arc<Mutex<Option<AppHandle>>>,
+    stop: Arc<AtomicBool>,
+    playing: Arc<AtomicBool>,
+    source_rate: u32,
+) {
+    let mut source_consumed_bytes: u64 = 0;
+    let mut ended = false;
+    let mut last_emit = std::time::Instant::now();
+    let mut last_underruns = 0u64;
+
+    while !stop.load(Ordering::Relaxed) {
+        while let Ok(cmd) = rx.try_recv() {
+            match cmd {
+                Cmd::Play => {
+                    playing.store(true, Ordering::Relaxed);
+                    ended = false;
+                }
+                Cmd::Pause => playing.store(false, Ordering::Relaxed),
+                Cmd::Stop => {
+                    stop.store(true, Ordering::Relaxed);
+                    playing.store(false, Ordering::Relaxed);
+                }
+                Cmd::Speed(_) => {
+                    if let Ok(mut st) = status.lock() {
+                        st.error = Some(
+                            "DSD spelas bara i 1× (bit-perfect). Hastighet ≠ 1 vägras.".into(),
+                        );
+                    }
+                }
+                Cmd::SkipSilence(_) => {
+                    if let Ok(mut st) = status.lock() {
+                        st.skip_silence = false;
+                    }
+                }
+                Cmd::Seek(ms) => {
+                    ring.clear();
+                    if let Ok(actual) = reader.seek_ms(ms) {
+                        let ch = 2u64;
+                        source_consumed_bytes = actual as u64 * source_rate as u64 / 1000 / 8 * ch;
+                    }
+                    ended = false;
+                }
+            }
+        }
+
+        let high_water = (source_rate as usize / 8) * 2 / 5; // ~400 ms of stereo bytes
+        if playing.load(Ordering::Relaxed) && ring.len_frames() < high_water && !ended {
+            match reader.read_interleaved_bytes((source_rate as usize / 8 / 10) * 2) {
+                Ok(raw) if raw.is_empty() => {
+                    ended = reader.is_eof();
+                    if ended {
+                        playing.store(false, Ordering::Relaxed);
+                        emit_ended(&app, &status);
+                    }
+                }
+                Ok(raw) => {
+                    let stereo = dsd::to_stereo_bytes(&raw, reader.spec().channels);
+                    source_consumed_bytes += stereo.len() as u64;
+                    if !stereo.is_empty() {
+                        ring.push_interleaved(&stereo);
+                    }
+                }
+                Err(err) => {
+                    if let Ok(mut st) = status.lock() {
+                        st.error = Some(err.to_string());
+                        st.playing = false;
+                    }
+                    playing.store(false, Ordering::Relaxed);
+                }
+            }
+        }
+
+        if last_emit.elapsed() >= Duration::from_millis(80) {
+            last_emit = std::time::Instant::now();
+            let ring_bytes = ring.len_frames() as u64 * 2;
+            let audible = source_consumed_bytes.saturating_sub(ring_bytes);
+            let bits = audible / 2 * 8;
+            let pos_ms = bits * 1000 / source_rate.max(1) as u64;
+            let underruns = ring.underrun_count();
+            if underruns > last_underruns {
+                eprintln!("DSD underrun (count {underruns})");
+                last_underruns = underruns;
+            }
+            if let Ok(mut st) = status.lock() {
+                st.position_ms = pos_ms;
+                st.playing = playing.load(Ordering::Relaxed);
+                st.ended = ended;
                 st.underruns = underruns;
             }
             emit_tick(&app, &status);

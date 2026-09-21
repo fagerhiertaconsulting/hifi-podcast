@@ -41,7 +41,9 @@ impl Decoder {
         }
         match classify_magic(&header, Some(path)) {
             FormatKind::Dsd => {
-                return Err(EngineError::dsd());
+                return Err(EngineError::msg(
+                    "DSD går inte genom Symphonia. Använd DSD-vägen (.dsf/.dff → ASIO native/DoP).",
+                ));
             }
             FormatKind::Unknown => {
                 let ext = path

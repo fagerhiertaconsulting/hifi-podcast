@@ -1,4 +1,4 @@
-//! Format detection for the native engine. DSD/SACD is a plugin slot, not a decoder.
+//! Format detection for the native engine. DSD (.dsf/.dff) is native; SACD ISO is not ripped.
 
 use crate::media_mime;
 use serde::Serialize;
@@ -118,15 +118,26 @@ pub fn support_for(path: &Path, stored_mime: Option<&str>) -> FormatSupport {
             label_sv: "PCM (Symphonia)".into(),
             note_sv: "Avkodas native till f32. Originalfilen rörs inte.".into(),
         },
-        FormatKind::Dsd => FormatSupport {
-            kind,
-            mime,
-            extension: ext,
-            native_decode: false,
-            dsd_plugin: true,
-            label_sv: "DSD/SACD (plugin-yta)".into(),
-            note_sv: "DSD/SACD avkodas inte i den här versionen. DoP/native DSD kopplas in som plugin senare. Filen bevaras orörd.".into(),
-        },
+        FormatKind::Dsd => {
+            let iso = ext == "iso";
+            FormatSupport {
+                kind,
+                mime,
+                extension: ext,
+                native_decode: !iso,
+                dsd_plugin: iso,
+                label_sv: if iso {
+                    "SACD ISO (ej rippning)".into()
+                } else {
+                    "DSD (.dsf/.dff)".into()
+                },
+                note_sv: if iso {
+                    "SACD-ISO rippning ingår inte. Använd .dsf/.dff. Filen bevaras orörd.".into()
+                } else {
+                    "Rå DSD avkodas native. Primär utgång: native DSD via ASIO (FiiO). DoP om DAC kräver det — då visas DoP, aldrig \"native DSD\". WASAPI exclusive DoP är dokumenterad fallback. Delat WASAPI vägras. Originalfilen rörs inte.".into()
+                },
+            }
+        }
         FormatKind::Unknown => FormatSupport {
             kind,
             mime,
@@ -165,13 +176,16 @@ mod tests {
     }
 
     #[test]
-    fn dsd_is_plugin_not_decode() {
+    fn dsd_files_are_native_iso_is_not() {
         for ext in ["dsf", "dff", "dsd"] {
             let support = support_for(Path::new(&format!("track.{ext}")), None);
             assert_eq!(support.kind, FormatKind::Dsd);
-            assert!(!support.native_decode);
-            assert!(support.dsd_plugin);
+            assert!(support.native_decode, "{ext}");
+            assert!(!support.dsd_plugin);
         }
+        let iso = support_for(Path::new("album.iso"), None);
+        assert_eq!(iso.kind, FormatKind::Dsd);
+        assert!(!iso.native_decode);
         assert_eq!(
             classify_magic(b"DSD ", Some(Path::new("x.bin"))),
             FormatKind::Dsd

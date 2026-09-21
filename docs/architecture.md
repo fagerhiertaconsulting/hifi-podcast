@@ -7,7 +7,7 @@
 | **MVP** | Lokal podcatcher + hi-fi-policy | Ja (skal) |
 | **v1** | Lokal ASR, kapitel, reklam-skip | Roadmap |
 | **Musik** | Separat modul, foobar2000-ambition | Roadmap (PR #5+) |
-| **Native engine** | Symphonia + ASIO (FiiO) / WASAPI | PR #4 |
+| **Native engine** | Symphonia PCM + DSD (.dsf/.dff) → ASIO (FiiO native/DoP) / WASAPI | PR #4 PCM; DSD native i efterföljande PR |
 | **UPnP** | Media Server mot Onkyo TX-RZ50 | PR #3: SSDP + CDS + HTTP Range; `Music/` stub |
 
 ## Process

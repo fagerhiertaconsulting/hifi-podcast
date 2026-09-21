@@ -84,6 +84,7 @@ export default function App() {
   const [speed, setSpeed] = useState(1);
   const [globalSkipSilence, setGlobalSkipSilence] = useState(false);
   const [engineSettings, setEngineSettings] = useState<AudioEngineSettings | null>(null);
+  const [engineQa, setEngineQa] = useState("");
   const nativeRef = useRef(true);
   const [sleepMode, setSleepMode] = useState<"off" | "minutes" | "episode">("off");
   const [sleepMinutes, setSleepMinutes] = useState(30);
@@ -303,13 +304,27 @@ export default function App() {
             setPosition(startSec);
             positionRef.current = startSec;
             const apiLabel =
-              engineSettings?.output_api === "asio" ||
-              !engineSettings?.output_api ||
-              engineSettings.output_api === "auto"
-                ? "ASIO/WASAPI"
-                : engineSettings.output_api;
+              st.output_path === "native_dsd"
+                ? `native DSD ${st.dsd_rate} / ${st.device_name}`
+                : st.output_path === "dop"
+                  ? `DoP ${st.dsd_rate} (inte native DSD) / ${st.output_api}`
+                  : engineSettings?.output_api === "asio" ||
+                      !engineSettings?.output_api ||
+                      engineSettings.output_api === "auto"
+                    ? "ASIO/WASAPI"
+                    : engineSettings.output_api;
             statusLine = `Spelar native (${apiLabel}): ${next.episode.title}`;
           } catch (nativeErr) {
+            const isDsd = /\.(dsf|dff|dsd)$/i.test(filePath);
+            if (isDsd) {
+              nativeRef.current = true;
+              await api.engineStop();
+              setPlaying(false);
+              setStatus(
+                `DSD kunde inte spelas: ${String(nativeErr)}. Ingen WebView2-fallback (skulle bli tystnad).`,
+              );
+              return;
+            }
             nativeRef.current = false;
             await api.engineStop();
             await loadPlaybackSource(audio, filePath, useSkip, nextSpeed);
@@ -376,6 +391,14 @@ export default function App() {
       setPosition(pos);
       setDuration((st.duration_ms || 0) / 1000);
       setPlaying(st.playing);
+      if (st.format === "dsd") {
+        setEngineQa(`${st.dsd_rate} · ${st.output_path} · ${st.output_path_sv}`);
+      } else if (st.loaded) {
+        setEngineQa(`PCM ${st.sample_rate} Hz · ${st.output_api}`);
+      }
+      if (st.error) {
+        setStatus(st.error);
+      }
       const posMs = st.position_ms;
       const ad = adsRef.current.find((a) => posMs >= a.start_ms && posMs < a.end_ms - 200);
       if (ad) {
@@ -762,7 +785,7 @@ export default function App() {
             onSideload={async () => {
               const path = await open({
                 multiple: false,
-                filters: [{ name: "Ljud", extensions: ["mp3", "m4a", "aac", "ogg", "opus", "flac", "wav"] }],
+                filters: [{ name: "Ljud", extensions: ["mp3", "m4a", "aac", "ogg", "opus", "flac", "wav", "dsf", "dff", "dsd"] }],
               });
               if (!path || Array.isArray(path)) return;
               const ep = await api.sideloadFile(path);
@@ -954,6 +977,7 @@ export default function App() {
         <div className="status">
           {status}
           {nativeRef.current && payload ? " · Native" : payload ? " · WebView2" : ""}
+          {engineQa ? ` · ${engineQa}` : ""}
         </div>
       </footer>
     </div>
@@ -1358,7 +1382,7 @@ function AudioEnginePanel(props: {
         <label>
           Uppspelningsväg
           <select value={backend} onChange={(e) => setBackend(e.target.value)}>
-            <option value="native">Native (Symphonia → ASIO/WASAPI)</option>
+            <option value="native">Native (Symphonia PCM / DSD → ASIO)</option>
             <option value="webview">WebView2 (HTMLMediaElement)</option>
           </select>
         </label>
