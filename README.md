@@ -57,10 +57,10 @@ Tauri lägger appdata under `%LOCALAPPDATA%\consulting.fagerhierta.hifi-podcast\
 - Prenumerera via RSS-URL
 - OPML-import (fil eller inklistrad XML) och export
 - Nedladdning utan omkodning + SHA-256-checksumma
-- Spelare: native Symphonia → **ASIO (FiiO ASIO Driver) / WASAPI**, med WebView2 som omkopplare; play/paus, seek, hastighet, ±15/±30 s, kö, sovtimer, sparad position
+- Spelare: native Symphonia PCM + DSD (.dsf/.dff) → **ASIO (FiiO native DSD / DoP) / WASAPI exclusive DoP**, med WebView2 som omkopplare för podd (inte DSD)
 - Per-podcast: hastighet, auto-nedladdning, intro/outro-skip, opt-in hoppa tystnad
 
-**Inte i koden ännu:** musikbibliotek-UI, native DSD-avkodning, reklam-cut, moln-ASR, in-app UPnP-renderer.
+**Inte i koden ännu:** musikbibliotek-UI, SACD-ISO-rippning, reklam-cut, moln-ASR, in-app UPnP-renderer.
 
 v1 (lokal intelligens) finns i appen: se [docs/v1-asr.md](docs/v1-asr.md).
 

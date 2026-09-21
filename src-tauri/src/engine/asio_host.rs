@@ -4,12 +4,15 @@
 //! Hosts (Qobuz, foobar2000) CoCreate the CLSID and talk IASIO. Callbacks are
 //! `cdecl`; COM methods are `stdcall`.
 
+use super::byte_ring::ByteRing;
+#[allow(unused_imports)]
+use super::dsd::{self, DSD_MUTE};
 use super::ring::FrameRing;
 use super::EngineError;
 use serde::Serialize;
 use std::cell::UnsafeCell;
 use std::ptr;
-use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 
 #[derive(Debug, Clone, Serialize)]
@@ -26,7 +29,9 @@ pub enum SampleType {
     I24Le,
     I32Le,
     I32Le24,
-    Dsd,
+    DsdLsb,
+    DsdMsb,
+    DsdNer8,
     Other(i32),
 }
 
@@ -38,13 +43,25 @@ impl SampleType {
             18 => Self::I32Le,
             19 => Self::F32Le,
             27 => Self::I32Le24,
-            32 | 33 | 40 => Self::Dsd,
+            32 => Self::DsdLsb,
+            33 => Self::DsdMsb,
+            40 => Self::DsdNer8,
             other => Self::Other(other),
         }
     }
 
     fn is_dsd(self) -> bool {
-        matches!(self, Self::Dsd)
+        matches!(self, Self::DsdLsb | Self::DsdMsb | Self::DsdNer8)
+    }
+
+    #[allow(dead_code)]
+    fn dsd_lsb_first(self) -> bool {
+        matches!(self, Self::DsdLsb)
+    }
+
+    #[allow(dead_code)]
+    fn dop_ok(self) -> bool {
+        matches!(self, Self::I24Le | Self::I32Le | Self::I32Le24)
     }
 
     fn is_pcm(self) -> bool {
@@ -101,12 +118,22 @@ pub fn list_asio_drivers() -> Vec<AsioDriverInfo> {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+#[allow(dead_code)]
+enum RtFillMode {
+    Pcm,
+    NativeDsd { reverse: bool },
+    Dop,
+}
+
 pub struct AsioStream {
     stop: Arc<AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
     pub sample_rate: u32,
     pub channels: u16,
     pub driver_name: String,
+    /// `pcm`, `native_dsd`, or `dop` — never claim native DSD for DoP.
+    pub io_path: String,
 }
 
 impl Drop for AsioStream {
@@ -139,11 +166,69 @@ pub fn start_asio(
     }
 }
 
+pub fn start_asio_native_dsd(
+    driver_name: Option<&str>,
+    dsd_hz: u32,
+    hwnd: Option<usize>,
+    ring: Arc<ByteRing>,
+    playing: Arc<AtomicBool>,
+    file_lsb_first: bool,
+) -> Result<AsioStream, EngineError> {
+    #[cfg(windows)]
+    {
+        windows_impl::start_dsd(
+            driver_name,
+            dsd_hz,
+            hwnd,
+            ring,
+            playing,
+            file_lsb_first,
+            true,
+        )
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (driver_name, dsd_hz, hwnd, ring, playing, file_lsb_first);
+        Err(EngineError::msg(
+            "Native DSD via ASIO finns bara på Windows (FiiO ASIO Driver).",
+        ))
+    }
+}
+
+pub fn start_asio_dop(
+    driver_name: Option<&str>,
+    dsd_hz: u32,
+    hwnd: Option<usize>,
+    ring: Arc<ByteRing>,
+    playing: Arc<AtomicBool>,
+    file_lsb_first: bool,
+) -> Result<AsioStream, EngineError> {
+    #[cfg(windows)]
+    {
+        windows_impl::start_dsd(
+            driver_name,
+            dsd_hz,
+            hwnd,
+            ring,
+            playing,
+            file_lsb_first,
+            false,
+        )
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (driver_name, dsd_hz, hwnd, ring, playing, file_lsb_first);
+        Err(EngineError::msg("DoP via ASIO finns bara på Windows."))
+    }
+}
+
 /// Realtime host published to ASIO `bufferSwitch` via atomic pointer (no Mutex in the callback).
 /// Fields are read from the Windows ASIO callback; Linux tests only install/uninstall the pointer.
 #[allow(dead_code)]
 struct RtHost {
-    ring: Arc<FrameRing>,
+    pcm_ring: Arc<FrameRing>,
+    dsd_ring: Option<Arc<ByteRing>>,
+    fill: RtFillMode,
     playing: Arc<AtomicBool>,
     buffers: Vec<[*mut u8; 2]>,
     frames: usize,
@@ -151,7 +236,12 @@ struct RtHost {
     channels: usize,
     stop: Arc<AtomicBool>,
     scratch: UnsafeCell<Vec<f32>>,
+    scratch_u8: UnsafeCell<Vec<u8>>,
     scratch_busy: AtomicBool,
+    dop_marker_a: AtomicBool,
+    /// True when file bit order must be reversed for this output (DSF→DoP/MSB, etc.).
+    dsd_reverse: bool,
+    reentries: AtomicU64,
 }
 
 unsafe impl Send for RtHost {}
@@ -163,6 +253,7 @@ static ASIO_RESET: AtomicBool = AtomicBool::new(false);
 
 fn install_rt_host(host: Box<RtHost>) {
     uninstall_rt_host();
+    ASIO_REENTRIES.store(0, Ordering::Relaxed);
     RT_HOST.store(Box::into_raw(host), Ordering::Release);
 }
 
@@ -191,6 +282,9 @@ fn uninstall_rt_host() {
 /// `init` is `ASIOBool` (`ASIOTrue` = 1, `ASIOFalse` = 0) — not an error code.
 #[allow(dead_code)] // used by the Windows host path and unit tests
 const ASE_OK: i32 = 0;
+/// `asio.h` `ASE_NotPresent` — selector/method not implemented.
+#[allow(dead_code)]
+const ASE_NOT_PRESENT: i32 = -1000;
 
 /// Steinberg `IASIO::canSampleRate` / `ASIOCanSampleRate`.
 ///
@@ -203,6 +297,59 @@ fn asio_sample_rate_supported(can_sample_rate: i32) -> bool {
     can_sample_rate == ASE_OK
 }
 
+/// Result of `kAsioCanDoIoFormat` + `kAsioSetIoFormat`. Native DSD is only `Applied`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+enum IoFormatSwitch {
+    /// Driver accepted the requested PCM/DSD IO format.
+    Applied,
+    /// `future` not implemented — PCM/DoP may continue; native DSD must not.
+    NotImplemented,
+    /// Driver refused the format.
+    Denied,
+}
+
+/// Native DSD requires a successful Set. CanDo may be ASE_OK or NotPresent (then Set is the gate).
+#[allow(dead_code)]
+fn classify_io_format_switch(can: i32, set: i32) -> IoFormatSwitch {
+    if set == ASE_OK && (can == ASE_OK || can == ASE_NOT_PRESENT) {
+        IoFormatSwitch::Applied
+    } else if can == ASE_NOT_PRESENT && set == ASE_NOT_PRESENT {
+        IoFormatSwitch::NotImplemented
+    } else {
+        IoFormatSwitch::Denied
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+enum CallbackBusyAction {
+    /// Stream stopping: mute this buffer, do not count underrun or re-entry.
+    StopMute,
+    /// Nested bufferSwitch while fill is in progress: mute this callback only, count re-entry (not underrun).
+    ReentryMute,
+    Fill,
+}
+
+#[allow(dead_code)]
+fn callback_busy_action(stopped: bool, already_busy: bool) -> CallbackBusyAction {
+    if stopped {
+        CallbackBusyAction::StopMute
+    } else if already_busy {
+        CallbackBusyAction::ReentryMute
+    } else {
+        CallbackBusyAction::Fill
+    }
+}
+
+static ASIO_REENTRIES: AtomicU64 = AtomicU64::new(0);
+
+/// Nested `bufferSwitch` count (not underruns). Reset when an ASIO stream is installed.
+#[allow(dead_code)]
+pub fn asio_callback_reentries() -> u64 {
+    ASIO_REENTRIES.load(Ordering::Relaxed)
+}
+
 fn new_rt_host(
     ring: Arc<FrameRing>,
     playing: Arc<AtomicBool>,
@@ -212,9 +359,39 @@ fn new_rt_host(
     sample_type: SampleType,
     channels: usize,
 ) -> Box<RtHost> {
-    let n = frames.saturating_mul(channels.max(1));
-    Box::new(RtHost {
+    new_rt_host_ex(
         ring,
+        None,
+        playing,
+        stop,
+        buffers,
+        frames,
+        sample_type,
+        channels,
+        RtFillMode::Pcm,
+    )
+}
+
+fn new_rt_host_ex(
+    pcm_ring: Arc<FrameRing>,
+    dsd_ring: Option<Arc<ByteRing>>,
+    playing: Arc<AtomicBool>,
+    stop: Arc<AtomicBool>,
+    buffers: Vec<[*mut u8; 2]>,
+    frames: usize,
+    sample_type: SampleType,
+    channels: usize,
+    fill: RtFillMode,
+) -> Box<RtHost> {
+    let n = frames.saturating_mul(channels.max(1));
+    let u8_n = match fill {
+        RtFillMode::Dop => n.saturating_mul(2),
+        _ => n,
+    };
+    Box::new(RtHost {
+        pcm_ring,
+        dsd_ring,
+        fill,
         playing,
         buffers,
         frames,
@@ -222,8 +399,79 @@ fn new_rt_host(
         channels,
         stop,
         scratch: UnsafeCell::new(vec![0.0f32; n]),
+        scratch_u8: UnsafeCell::new(vec![DSD_MUTE; u8_n.max(1)]),
         scratch_busy: AtomicBool::new(false),
+        dop_marker_a: AtomicBool::new(true),
+        dsd_reverse: match fill {
+            RtFillMode::NativeDsd { reverse } => reverse,
+            _ => false,
+        },
+        reentries: AtomicU64::new(0),
     })
+}
+
+#[allow(dead_code)]
+fn new_rt_host_dsd(
+    dsd_ring: Arc<ByteRing>,
+    playing: Arc<AtomicBool>,
+    stop: Arc<AtomicBool>,
+    buffers: Vec<[*mut u8; 2]>,
+    frames: usize,
+    sample_type: SampleType,
+    channels: usize,
+    fill: RtFillMode,
+    reverse: bool,
+) -> Box<RtHost> {
+    let mut host = new_rt_host_ex(
+        Arc::new(FrameRing::new(channels.max(1))),
+        Some(dsd_ring),
+        playing,
+        stop,
+        buffers,
+        frames,
+        sample_type,
+        channels,
+        fill,
+    );
+    host.dsd_reverse = reverse;
+    host
+}
+
+#[allow(dead_code)]
+fn install_session_host(
+    pcm_ring: Option<Arc<FrameRing>>,
+    dsd_ring: Option<Arc<ByteRing>>,
+    playing: Arc<AtomicBool>,
+    stop: Arc<AtomicBool>,
+    buffers: Vec<[*mut u8; 2]>,
+    frames: usize,
+    sample_type: SampleType,
+    channels: usize,
+    fill: RtFillMode,
+    reverse: bool,
+) {
+    match fill {
+        RtFillMode::Pcm => {
+            let ring = pcm_ring.unwrap_or_else(|| Arc::new(FrameRing::new(channels.max(1))));
+            install_rt_host(new_rt_host(
+                ring, playing, stop, buffers, frames, sample_type, channels,
+            ));
+        }
+        _ => {
+            let ring = dsd_ring.unwrap_or_else(|| Arc::new(ByteRing::new(channels.max(1))));
+            install_rt_host(new_rt_host_dsd(
+                ring,
+                playing,
+                stop,
+                buffers,
+                frames,
+                sample_type,
+                channels,
+                fill,
+                reverse,
+            ));
+        }
+    }
 }
 
 #[cfg(windows)]
@@ -421,31 +669,42 @@ mod windows_impl {
         let frames = st.frames;
         let ch = st.channels.max(1);
 
-        let write_silence =
-            st.stop.load(Ordering::Relaxed) || st.scratch_busy.swap(true, Ordering::AcqRel);
-        if write_silence {
-            if !st.stop.load(Ordering::Relaxed) {
-                st.ring.note_underrun();
-            }
-            for c in 0..ch {
-                let p = st.buffers.get(c).map(|b| b[idx]).unwrap_or(ptr::null_mut());
-                if p.is_null() {
-                    continue;
-                }
+        let already_busy = st.scratch_busy.swap(true, Ordering::AcqRel);
+        match callback_busy_action(st.stop.load(Ordering::Relaxed), already_busy) {
+            CallbackBusyAction::StopMute => {
                 unsafe {
-                    write_channel(p, st.sample_type, frames, |_| 0.0);
+                    write_mute(st, idx, frames, ch);
                 }
+                RT_IN_FLIGHT.fetch_sub(1, Ordering::Release);
+                return;
             }
-            RT_IN_FLIGHT.fetch_sub(1, Ordering::Release);
-            return;
+            CallbackBusyAction::ReentryMute => {
+                st.reentries.fetch_add(1, Ordering::Relaxed);
+                ASIO_REENTRIES.fetch_add(1, Ordering::Relaxed);
+                unsafe {
+                    write_mute(st, idx, frames, ch);
+                }
+                // Leave scratch_busy set — the owning callback still fills.
+                RT_IN_FLIGHT.fetch_sub(1, Ordering::Release);
+                return;
+            }
+            CallbackBusyAction::Fill => {}
         }
 
+        match st.fill {
+            RtFillMode::Pcm => fill_pcm(st, idx, frames, ch),
+            RtFillMode::NativeDsd { reverse } => fill_native_dsd(st, idx, frames, ch, reverse),
+            RtFillMode::Dop => fill_dop(st, idx, frames, ch),
+        }
+        st.scratch_busy.store(false, Ordering::Release);
+        RT_IN_FLIGHT.fetch_sub(1, Ordering::Release);
+    }
+
+    fn fill_pcm(st: &RtHost, idx: usize, frames: usize, ch: usize) {
         let scratch = unsafe { &mut *st.scratch.get() };
         if scratch.len() < frames * ch {
-            // Preallocated at open; never grow on the realtime thread.
             scratch.fill(0.0);
-            st.ring.note_underrun();
-            st.scratch_busy.store(false, Ordering::Release);
+            st.pcm_ring.note_underrun();
             for c in 0..ch {
                 let p = st.buffers.get(c).map(|b| b[idx]).unwrap_or(ptr::null_mut());
                 if p.is_null() {
@@ -455,12 +714,11 @@ mod windows_impl {
                     write_channel(p, st.sample_type, frames, |_| 0.0);
                 }
             }
-            RT_IN_FLIGHT.fetch_sub(1, Ordering::Release);
             return;
         }
         let dest = &mut scratch[..frames * ch];
         if st.playing.load(Ordering::Relaxed) {
-            let _ = st.ring.pop_interleaved(dest);
+            let _ = st.pcm_ring.pop_interleaved(dest);
         } else {
             dest.fill(0.0);
         }
@@ -473,8 +731,158 @@ mod windows_impl {
                 write_channel(p, st.sample_type, frames, |i| dest[i * ch + c]);
             }
         }
-        st.scratch_busy.store(false, Ordering::Release);
-        RT_IN_FLIGHT.fetch_sub(1, Ordering::Release);
+    }
+
+    fn fill_native_dsd(st: &RtHost, idx: usize, frames: usize, ch: usize, reverse: bool) {
+        let Some(ring) = st.dsd_ring.as_ref() else {
+            unsafe { write_mute(st, idx, frames, ch) };
+            return;
+        };
+        let scratch = unsafe { &mut *st.scratch_u8.get() };
+        if scratch.len() < frames * ch {
+            ring.note_underrun();
+            unsafe { write_mute(st, idx, frames, ch) };
+            return;
+        }
+        let dest = &mut scratch[..frames * ch];
+        if st.playing.load(Ordering::Relaxed) {
+            let _ = ring.pop_interleaved(dest, DSD_MUTE);
+        } else {
+            dest.fill(DSD_MUTE);
+        }
+        for c in 0..ch {
+            let p = st.buffers.get(c).map(|b| b[idx]).unwrap_or(ptr::null_mut());
+            if p.is_null() {
+                continue;
+            }
+            unsafe {
+                for i in 0..frames {
+                    let mut b = dest[i * ch + c];
+                    if reverse {
+                        b = dsd::reverse_bits_byte(b);
+                    }
+                    ptr::write(p.add(i), b);
+                }
+            }
+        }
+    }
+
+    fn fill_dop(st: &RtHost, idx: usize, frames: usize, ch: usize) {
+        let Some(ring) = st.dsd_ring.as_ref() else {
+            unsafe { write_mute(st, idx, frames, ch) };
+            return;
+        };
+        let need = frames * ch * 2;
+        let scratch = unsafe { &mut *st.scratch_u8.get() };
+        if scratch.len() < need {
+            ring.note_underrun();
+            unsafe { write_mute(st, idx, frames, ch) };
+            return;
+        }
+        let dest = &mut scratch[..need];
+        if st.playing.load(Ordering::Relaxed) {
+            let _ = ring.pop_interleaved(dest, DSD_MUTE);
+        } else {
+            dest.fill(DSD_MUTE);
+        }
+        let reverse = st.dsd_reverse;
+        let mut marker_a = st.dop_marker_a.load(Ordering::Relaxed);
+        for i in 0..frames {
+            let marker = if marker_a {
+                dsd::DOP_MARKER_A
+            } else {
+                dsd::DOP_MARKER_B
+            };
+            marker_a = !marker_a;
+            for c in 0..ch {
+                let p = st.buffers.get(c).map(|b| b[idx]).unwrap_or(ptr::null_mut());
+                if p.is_null() {
+                    continue;
+                }
+                let mut b0 = dest[i * 2 * ch + c];
+                let mut b1 = dest[i * 2 * ch + ch + c];
+                if reverse {
+                    b0 = dsd::reverse_bits_byte(b0);
+                    b1 = dsd::reverse_bits_byte(b1);
+                }
+                unsafe {
+                    write_dop_sample(p, st.sample_type, i, b0, b1, marker);
+                }
+            }
+        }
+        st.dop_marker_a.store(marker_a, Ordering::Relaxed);
+    }
+
+    unsafe fn write_mute(st: &RtHost, idx: usize, frames: usize, ch: usize) {
+        match st.fill {
+            RtFillMode::Pcm => {
+                for c in 0..ch {
+                    let p = st.buffers.get(c).map(|b| b[idx]).unwrap_or(ptr::null_mut());
+                    if p.is_null() {
+                        continue;
+                    }
+                    write_channel(p, st.sample_type, frames, |_| 0.0);
+                }
+            }
+            RtFillMode::NativeDsd { .. } => {
+                for c in 0..ch {
+                    let p = st.buffers.get(c).map(|b| b[idx]).unwrap_or(ptr::null_mut());
+                    if p.is_null() {
+                        continue;
+                    }
+                    for i in 0..frames {
+                        ptr::write(p.add(i), DSD_MUTE);
+                    }
+                }
+            }
+            RtFillMode::Dop => {
+                let mut marker_a = st.dop_marker_a.load(Ordering::Relaxed);
+                for i in 0..frames {
+                    let marker = if marker_a {
+                        dsd::DOP_MARKER_A
+                    } else {
+                        dsd::DOP_MARKER_B
+                    };
+                    marker_a = !marker_a;
+                    for c in 0..ch {
+                        let p = st.buffers.get(c).map(|b| b[idx]).unwrap_or(ptr::null_mut());
+                        if p.is_null() {
+                            continue;
+                        }
+                        write_dop_sample(p, st.sample_type, i, DSD_MUTE, DSD_MUTE, marker);
+                    }
+                }
+                st.dop_marker_a.store(marker_a, Ordering::Relaxed);
+            }
+        }
+    }
+
+    unsafe fn write_dop_sample(
+        ptr: *mut u8,
+        ty: SampleType,
+        i: usize,
+        first: u8,
+        second: u8,
+        marker: u8,
+    ) {
+        match ty {
+            SampleType::I24Le => {
+                let base = ptr.add(i * 3);
+                ptr::write(base, second);
+                ptr::write(base.add(1), first);
+                ptr::write(base.add(2), marker);
+            }
+            SampleType::I32Le | SampleType::I32Le24 => {
+                let base = ptr.add(i * 4);
+                ptr::write(base, 0);
+                ptr::write(base.add(1), second);
+                ptr::write(base.add(2), first);
+                ptr::write(base.add(3), marker);
+            }
+            _ => {
+                ptr::write(ptr.add(i), DSD_MUTE);
+            }
+        }
     }
 
     unsafe fn write_channel(
@@ -515,10 +923,9 @@ mod windows_impl {
                     ptr::copy_nonoverlapping(v.to_le_bytes().as_ptr(), ptr.add(i * 4), 4);
                 }
             }
-            SampleType::Dsd | SampleType::Other(_) => {
-                // Open refuses these types; zeros are a last-resort RT fill only.
+            SampleType::DsdLsb | SampleType::DsdMsb | SampleType::DsdNer8 | SampleType::Other(_) => {
                 for i in 0..frames {
-                    ptr::write(ptr.add(i), 0);
+                    ptr::write(ptr.add(i), DSD_MUTE);
                 }
             }
         }
@@ -572,6 +979,36 @@ mod windows_impl {
         }
     }
 
+    const K_ASIO_SET_IO_FORMAT: c_long = 0x2311_1961;
+    const K_ASIO_CAN_DO_IO_FORMAT: c_long = 0x2311_2004;
+    const ASIO_IO_PCM: i32 = 0;
+    const ASIO_IO_DSD: i32 = 1;
+
+    #[repr(C)]
+    struct AsioIoFormat {
+        format_type: i32,
+        reserved: [u8; 508],
+    }
+
+    enum StreamKind {
+        Pcm {
+            ring: Arc<FrameRing>,
+            rate: u32,
+        },
+        NativeDsd {
+            ring: Arc<ByteRing>,
+            dsd_hz: u32,
+            file_lsb: bool,
+        },
+        Dop {
+            ring: Arc<ByteRing>,
+            dsd_hz: u32,
+            file_lsb: bool,
+        },
+    }
+
+    type Opened = (u32, u16, String, String);
+
     pub fn start(
         driver_name: Option<&str>,
         source_rate: u32,
@@ -579,9 +1016,51 @@ mod windows_impl {
         ring: Arc<FrameRing>,
         playing: Arc<AtomicBool>,
     ) -> Result<AsioStream, EngineError> {
+        start_kind(
+            driver_name,
+            hwnd,
+            playing,
+            StreamKind::Pcm {
+                ring,
+                rate: source_rate,
+            },
+        )
+    }
+
+    pub fn start_dsd(
+        driver_name: Option<&str>,
+        dsd_hz: u32,
+        hwnd: Option<usize>,
+        ring: Arc<ByteRing>,
+        playing: Arc<AtomicBool>,
+        file_lsb: bool,
+        native: bool,
+    ) -> Result<AsioStream, EngineError> {
+        let kind = if native {
+            StreamKind::NativeDsd {
+                ring,
+                dsd_hz,
+                file_lsb,
+            }
+        } else {
+            StreamKind::Dop {
+                ring,
+                dsd_hz,
+                file_lsb,
+            }
+        };
+        start_kind(driver_name, hwnd, playing, kind)
+    }
+
+    fn start_kind(
+        driver_name: Option<&str>,
+        hwnd: Option<usize>,
+        playing: Arc<AtomicBool>,
+        kind: StreamKind,
+    ) -> Result<AsioStream, EngineError> {
         let meta = pick_driver(driver_name)?;
         let stop = Arc::new(AtomicBool::new(false));
-        let (tx, rx) = std::sync::mpsc::channel::<Result<(u32, u16, String), EngineError>>();
+        let (tx, rx) = std::sync::mpsc::channel::<Result<Opened, EngineError>>();
         let stop_t = stop.clone();
         let name_for_thread = meta.name.clone();
         let clsid = meta.clsid.clone();
@@ -591,22 +1070,12 @@ mod windows_impl {
             .spawn(move || {
                 let hr = unsafe { CoInitializeEx(ptr::null(), COINIT_APARTMENTTHREADED as u32) };
                 if hr < 0 && hr != 1 {
-                    // 1 = S_FALSE already initialized
                     let _ = tx.send(Err(EngineError::msg(format!(
                         "Kunde inte initiera COM för ASIO (HRESULT {hr:#x})."
                     ))));
                     return;
                 }
-                let result = run_driver(
-                    &clsid,
-                    source_rate,
-                    hwnd,
-                    ring,
-                    playing,
-                    stop_t,
-                    &name_for_thread,
-                    &tx,
-                );
+                let result = run_driver(&clsid, hwnd, playing, stop_t, &name_for_thread, kind, &tx);
                 if let Err(err) = result {
                     let _ = tx.send(Err(err));
                 }
@@ -615,12 +1084,13 @@ mod windows_impl {
             .map_err(|e| EngineError::msg(format!("ASIO-tråd: {e}")))?;
 
         match rx.recv() {
-            Ok(Ok((rate, ch, name))) => Ok(AsioStream {
+            Ok(Ok((rate, ch, name, io_path))) => Ok(AsioStream {
                 stop,
                 thread: Some(thread),
                 sample_rate: rate,
                 channels: ch,
                 driver_name: name,
+                io_path,
             }),
             Ok(Err(err)) => {
                 stop.store(true, Ordering::Relaxed);
@@ -635,15 +1105,62 @@ mod windows_impl {
         }
     }
 
+    fn set_io_format(driver: *mut Iasio, vtbl: &IasioVtbl, dsd: bool) -> IoFormatSwitch {
+        let mut fmt = AsioIoFormat {
+            format_type: if dsd { ASIO_IO_DSD } else { ASIO_IO_PCM },
+            reserved: [0; 508],
+        };
+        let can = unsafe {
+            (vtbl.future)(
+                driver,
+                K_ASIO_CAN_DO_IO_FORMAT,
+                &mut fmt as *mut AsioIoFormat as *mut c_void,
+            )
+        };
+        fmt.format_type = if dsd { ASIO_IO_DSD } else { ASIO_IO_PCM };
+        let set = unsafe {
+            (vtbl.future)(
+                driver,
+                K_ASIO_SET_IO_FORMAT,
+                &mut fmt as *mut AsioIoFormat as *mut c_void,
+            )
+        };
+        classify_io_format_switch(can, set)
+    }
+
+    fn try_set_rate(
+        driver: *mut Iasio,
+        vtbl: &IasioVtbl,
+        display_name: &str,
+        want: u32,
+    ) -> Result<u32, EngineError> {
+        if !asio_sample_rate_supported(unsafe { (vtbl.can_sample_rate)(driver, want as f64) }) {
+            return Err(EngineError::msg(format!(
+                "{display_name} stöder inte {want} Hz (canSampleRate)."
+            )));
+        }
+        if unsafe { (vtbl.set_sample_rate)(driver, want as f64) } != 0 {
+            return Err(EngineError::msg(format!(
+                "{display_name} tog inte {want} Hz (setSampleRate)."
+            )));
+        }
+        let mut actual = 0.0f64;
+        let _ = unsafe { (vtbl.get_sample_rate)(driver, &mut actual) };
+        Ok(if actual > 1.0 {
+            actual.round() as u32
+        } else {
+            want
+        })
+    }
+
     fn run_driver(
         clsid: &str,
-        source_rate: u32,
         hwnd: Option<usize>,
-        ring: Arc<FrameRing>,
         playing: Arc<AtomicBool>,
         stop: Arc<AtomicBool>,
         display_name: &str,
-        tx: &std::sync::mpsc::Sender<Result<(u32, u16, String), EngineError>>,
+        kind: StreamKind,
+        tx: &std::sync::mpsc::Sender<Result<Opened, EngineError>>,
     ) -> Result<(), EngineError> {
         let guid = guid_from_clsid(clsid)?;
         let mut raw: *mut c_void = ptr::null_mut();
@@ -688,30 +1205,89 @@ mod windows_impl {
         }
         let channels = outs.min(2) as usize;
 
-        let want = source_rate as f64;
-        // canSampleRate is ASIOError: ASE_OK (0) means the rate *is* supported (see
-        // `asio_sample_rate_supported`). Do not treat this like init()'s ASIOBool.
-        if asio_sample_rate_supported(unsafe { (vtbl.can_sample_rate)(driver, want) }) {
-            if unsafe { (vtbl.set_sample_rate)(driver, want) } != 0 {
-                unsafe { (vtbl.release)(driver) };
-                return Err(EngineError::msg(format!(
-                    "{display_name} tog inte {source_rate} Hz. Välj en fil med en samplingsfrekvens DAC:n stöder, eller använd WASAPI-delat som fallback."
-                )));
-            }
-        } else {
+        let (want_dsd_io, rate_candidates, native_dsd, dop, file_lsb, pcm_ring, dsd_ring) =
+            match &kind {
+                StreamKind::Pcm { ring, rate } => (
+                    false,
+                    vec![*rate],
+                    false,
+                    false,
+                    false,
+                    Some(ring.clone()),
+                    None,
+                ),
+                StreamKind::NativeDsd {
+                    ring,
+                    dsd_hz,
+                    file_lsb,
+                } => (
+                    true,
+                    vec![*dsd_hz, dsd::native_dsd_byte_rate(*dsd_hz)],
+                    true,
+                    false,
+                    *file_lsb,
+                    None,
+                    Some(ring.clone()),
+                ),
+                StreamKind::Dop {
+                    ring,
+                    dsd_hz,
+                    file_lsb,
+                } => (
+                    false,
+                    vec![dsd::dop_pcm_rate(*dsd_hz)],
+                    false,
+                    true,
+                    *file_lsb,
+                    None,
+                    Some(ring.clone()),
+                ),
+            };
+
+        let io_sw = set_io_format(driver, vtbl, want_dsd_io);
+        if native_dsd && io_sw != IoFormatSwitch::Applied {
             unsafe { (vtbl.release)(driver) };
             return Err(EngineError::msg(format!(
-                "{display_name} stöder inte {source_rate} Hz (canSampleRate). Ingen tyst omsampling i ASIO — byt filhastighet eller använd WASAPI."
+                "{display_name} bekräftade inte native DSD (kAsioCanDoIoFormat/kAsioSetIoFormat = {io_sw:?}). Native DSD avbryts — prova DoP. Filen rörs inte."
             )));
         }
 
-        let mut actual = 0.0f64;
-        let _ = unsafe { (vtbl.get_sample_rate)(driver, &mut actual) };
-        let rate = if actual > 1.0 {
-            actual.round() as u32
-        } else {
-            source_rate
-        };
+        let mut rate_err = String::new();
+        let mut rate = 0u32;
+        let mut got_rate = false;
+        for cand in rate_candidates {
+            if cand == 0 {
+                continue;
+            }
+            match try_set_rate(driver, vtbl, display_name, cand) {
+                Ok(r) => {
+                    rate = r;
+                    got_rate = true;
+                    break;
+                }
+                Err(e) => rate_err = e.to_string(),
+            }
+        }
+        if !got_rate {
+            unsafe { (vtbl.release)(driver) };
+            return Err(EngineError::msg(if native_dsd {
+                format!(
+                    "{display_name} tog inte native DSD-hastighet (bit/byte). {rate_err} Ingen tyst PCM-omkodning."
+                )
+            } else if dop {
+                format!(
+                    "{display_name} tog inte DoP-hastighet ({}/16 Hz). {rate_err} Delat WASAPI används inte för DSD.",
+                    match &kind {
+                        StreamKind::Dop { dsd_hz, .. } => *dsd_hz,
+                        _ => 0,
+                    }
+                )
+            } else {
+                format!(
+                    "{display_name} stöder inte källans Hz. Ingen tyst omsampling i ASIO — byt filhastighet eller använd WASAPI. {rate_err}"
+                )
+            }));
+        }
 
         let mut info = ChannelInfo {
             channel: 0,
@@ -727,21 +1303,39 @@ mod windows_impl {
             return Err(err);
         }
         let sample_type = SampleType::from_asio(info.sample_type);
-        if sample_type.is_dsd() {
-            unsafe { (vtbl.release)(driver) };
-            return Err(EngineError::msg(
-                "ASIO-kanalen är DSD. Native DSD via ASIO är inte i den här PR:n — spela FLAC/PCM. Filen rörs inte.",
-            ));
-        }
-        if !sample_type.is_pcm() {
-            let code = match sample_type {
-                SampleType::Other(v) => v,
-                _ => info.sample_type,
-            };
-            unsafe { (vtbl.release)(driver) };
-            return Err(EngineError::msg(format!(
-                "ASIO-kanalen har okänd sampletyp ({code}). Native-motorn vägrar tyst uppspelning — använd PCM/FLAC eller en drivrutin med i16/i24/i32/f32. Filen rörs inte."
-            )));
+        if native_dsd {
+            if !sample_type.is_dsd() {
+                unsafe { (vtbl.release)(driver) };
+                return Err(EngineError::msg(format!(
+                    "{display_name} växlar inte till DSD-sampletyp (fick {}). Native DSD avbryts — prova DoP om DAC:n stöder det. Filen rörs inte.",
+                    info.sample_type
+                )));
+            }
+        } else if dop {
+            if !sample_type.dop_ok() {
+                unsafe { (vtbl.release)(driver) };
+                return Err(EngineError::msg(format!(
+                    "{display_name} DoP kräver 24/32-bit PCM (inte f32/i16/DSD). Sampletyp {}. Filen rörs inte.",
+                    info.sample_type
+                )));
+            }
+        } else {
+            if sample_type.is_dsd() {
+                unsafe { (vtbl.release)(driver) };
+                return Err(EngineError::msg(
+                    "ASIO-kanalen är DSD medan filen är PCM. Växla DAC:n till PCM eller spela en DSD-fil. Filen rörs inte.",
+                ));
+            }
+            if !sample_type.is_pcm() {
+                let code = match sample_type {
+                    SampleType::Other(v) => v,
+                    _ => info.sample_type,
+                };
+                unsafe { (vtbl.release)(driver) };
+                return Err(EngineError::msg(format!(
+                    "ASIO-kanalen har okänd sampletyp ({code}). Native-motorn vägrar tyst uppspelning — använd PCM/FLAC eller en drivrutin med i16/i24/i32/f32. Filen rörs inte."
+                )));
+            }
         }
 
         let mut min = 0i32;
@@ -793,15 +1387,39 @@ mod windows_impl {
             .collect();
 
         ASIO_RESET.store(false, Ordering::Relaxed);
-        install_rt_host(new_rt_host(
-            ring.clone(),
+        let reverse = if native_dsd {
+            file_lsb != sample_type.dsd_lsb_first()
+        } else if dop {
+            file_lsb // DoP is MSB-first
+        } else {
+            false
+        };
+        let fill = if native_dsd {
+            RtFillMode::NativeDsd { reverse }
+        } else if dop {
+            RtFillMode::Dop
+        } else {
+            RtFillMode::Pcm
+        };
+        let io_path = if native_dsd {
+            "native_dsd"
+        } else if dop {
+            "dop"
+        } else {
+            "pcm"
+        };
+        install_session_host(
+            pcm_ring.clone(),
+            dsd_ring.clone(),
             playing.clone(),
             stop.clone(),
             buffers,
             frames,
             sample_type,
             channels,
-        ));
+            fill,
+            reverse,
+        );
 
         if unsafe { (vtbl.start)(driver) } != 0 {
             let err = err_of(driver, &format!("{display_name} start() misslyckades."));
@@ -811,7 +1429,12 @@ mod windows_impl {
             return Err(err);
         }
 
-        let _ = tx.send(Ok((rate, channels as u16, display_name.to_string())));
+        let _ = tx.send(Ok((
+            rate,
+            channels as u16,
+            display_name.to_string(),
+            io_path.to_string(),
+        )));
 
         while !stop.load(Ordering::Relaxed) {
             if ASIO_RESET.swap(false, Ordering::AcqRel) {
@@ -842,15 +1465,18 @@ mod windows_impl {
                     .iter()
                     .map(|b| [b.buffers[0] as *mut u8, b.buffers[1] as *mut u8])
                     .collect();
-                install_rt_host(new_rt_host(
-                    ring.clone(),
+                install_session_host(
+                    pcm_ring.clone(),
+                    dsd_ring.clone(),
                     playing.clone(),
                     stop.clone(),
                     buffers,
                     frames,
                     sample_type,
                     channels,
-                ));
+                    fill,
+                    reverse,
+                );
                 if unsafe { (vtbl.start)(driver) } != 0 {
                     let err = err_of(
                         driver,
@@ -876,6 +1502,34 @@ mod windows_impl {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn classify_io_format_switch_native_requires_applied() {
+        assert_eq!(classify_io_format_switch(0, 0), IoFormatSwitch::Applied);
+        assert_eq!(
+            classify_io_format_switch(ASE_NOT_PRESENT, 0),
+            IoFormatSwitch::Applied
+        );
+        assert_eq!(
+            classify_io_format_switch(ASE_NOT_PRESENT, ASE_NOT_PRESENT),
+            IoFormatSwitch::NotImplemented
+        );
+        assert_eq!(classify_io_format_switch(0, -1), IoFormatSwitch::Denied);
+        assert_eq!(classify_io_format_switch(1, 0), IoFormatSwitch::Denied);
+        assert_ne!(IoFormatSwitch::NotImplemented, IoFormatSwitch::Applied);
+        assert_ne!(IoFormatSwitch::Denied, IoFormatSwitch::Applied);
+    }
+
+    #[test]
+    fn reentry_is_not_classified_as_underrun() {
+        assert_eq!(
+            callback_busy_action(false, true),
+            CallbackBusyAction::ReentryMute
+        );
+        assert_eq!(callback_busy_action(false, false), CallbackBusyAction::Fill);
+        assert_eq!(callback_busy_action(true, true), CallbackBusyAction::StopMute);
+        assert_eq!(callback_busy_action(true, false), CallbackBusyAction::StopMute);
+    }
 
     #[test]
     fn can_sample_rate_ase_ok_means_supported() {
@@ -909,6 +1563,10 @@ mod tests {
     #[test]
     fn dsd_sample_types_detected() {
         assert!(SampleType::from_asio(32).is_dsd());
+        assert!(SampleType::from_asio(33).is_dsd());
+        assert!(SampleType::from_asio(40).is_dsd());
+        assert!(SampleType::from_asio(32).dsd_lsb_first());
+        assert!(!SampleType::from_asio(33).dsd_lsb_first());
         assert!(!SampleType::from_asio(18).is_dsd());
         assert!(!SampleType::from_asio(19).is_dsd());
         assert!(SampleType::from_asio(18).is_pcm());

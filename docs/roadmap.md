@@ -26,4 +26,4 @@ Se [upnp-mediaserver.md](upnp-mediaserver.md). **Media Server** mot Onkyo TX-RZ5
 
 ## Medvetet utanför
 
-Musikbibliotek / taggar / albumvy, native DSD/SACD-avkodning (även via ASIO DoP), moln-ASR, reklam-cut ML, Chromecast/Sonos-specifikt, in-app UPnP-renderer.
+Musikbibliotek / taggar / albumvy, SACD-ISO-rippning, moln-ASR, reklam-cut ML, Chromecast/Sonos-specifikt, in-app UPnP-renderer.

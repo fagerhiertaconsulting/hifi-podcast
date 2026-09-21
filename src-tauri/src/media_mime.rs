@@ -19,7 +19,7 @@ pub fn from_extension(ext: &str) -> &'static str {
         "wav" => "audio/wav",
         "aiff" | "aif" => "audio/aiff",
         "wma" => "audio/x-ms-wma",
-        "dsf" | "dff" => "audio/x-dsd",
+        "dsf" | "dff" | "dsd" => "audio/x-dsd",
         _ => "application/octet-stream",
     }
 }

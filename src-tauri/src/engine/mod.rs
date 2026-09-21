@@ -1,7 +1,9 @@
-//! Native hi-fi playback engine: Symphonia decode → f32 → ASIO / WASAPI.
+//! Native hi-fi playback engine: Symphonia PCM → f32, DSD bytes → ASIO / WASAPI DoP.
 
 mod asio_host;
+mod byte_ring;
 mod decode;
+mod dsd;
 mod exclusive;
 mod formats;
 mod output;
@@ -38,7 +40,7 @@ impl EngineError {
 
     pub fn dsd() -> Self {
         Self::Message(
-            "DSD/SACD avkodas inte i native-motorn ännu (plugin-yta). Filen lämnas orörd. FLAC och vanliga poddformat spelas native.".into(),
+            "DSD kan inte spelas på den här vägen. Behöver .dsf/.dff och ASIO native DSD (FiiO) eller DoP. SACD-ISO rippning ingår inte. Filen lämnas orörd.".into(),
         )
     }
 }
@@ -100,7 +102,37 @@ mod tests {
         let caps = Handle::capabilities();
         assert!(caps.pcm_mimes.iter().any(|m| m == "audio/flac"));
         assert!(caps.asio_note_sv.contains("ASIO"));
+        assert!(caps.dsd_status_sv.contains("native DSD") || caps.dsd_status_sv.contains("Native DSD"));
         assert!(!crate::engine::is_preferred_hi_fi_name("Realtek"));
         assert!(crate::engine::is_preferred_hi_fi_name("FiiO ASIO Driver"));
+    }
+
+    #[test]
+    fn probe_dsf_reports_dsd_rate() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hires.dsf");
+        crate::engine::dsd::write_test_dsf(&path, 11_289_600, 2, 32, 0x69);
+        let probe = Handle::probe(&path).unwrap();
+        assert_eq!(probe.support.kind, FormatKind::Dsd);
+        assert!(probe.support.native_decode);
+        assert_eq!(probe.sample_rate, Some(11_289_600));
+        assert_eq!(probe.codec.as_deref(), Some("DSD"));
+        let h = Handle::new();
+        let err = h
+            .open(OpenParams {
+                path,
+                speed: 1.0,
+                skip_silence: false,
+                output_api: "asio".into(),
+                device_name: String::new(),
+            })
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("ASIO") || msg.contains("Windows") || msg.contains("DSD"),
+            "{msg}"
+        );
+        assert!(!msg.contains("plugin-yta"), "{msg}");
+        assert!(!msg.contains("avkodas inte"), "{msg}");
     }
 }

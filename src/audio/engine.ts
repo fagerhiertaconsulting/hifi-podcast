@@ -41,8 +41,10 @@ export function mimeFromPath(path: string): string {
       return "audio/ogg";
     case "flac":
       return "audio/flac";
-    case "wav":
-      return "audio/wav";
+    case "dsf":
+    case "dff":
+    case "dsd":
+      return "audio/x-dsd";
     default:
       return "application/octet-stream";
   }

@@ -21,7 +21,7 @@ Målet är att **FLAC och vanliga poddformat ska spelas i appen** via Rust, med 
 |--------|--------------------------|-----------|
 | FLAC, WAV/PCM, AIFF | Ja | Hi-fi-kärnan |
 | MP3, AAC/M4A/M4B, ALAC, OGG/Vorbis/Opus | Ja | Befintliga podcast-enclosure |
-| DSD (.dsf/.dff) / SACD | Nej | Känns igen (magic + MIME). **Inte** avkodat. Native DSD via ASIO (DoP eller DSD-sampletyp) är **uppskjutet**. Filen lämnas orörd. |
+| DSD (.dsf/.dff) | Ja (rå DSD-bytes) | Primärt **native DSD via ASIO** (FiiO). DoP om DAC kräver det — UI säger då **DoP**, aldrig “native DSD”. WASAPI exclusive DoP är dokumenterad fallback. Delat WASAPI och WebView2 **vägras** (ingen tyst PCM-stub). SACD-ISO rippning ingår inte. |
 | WMA | Nej | WebView2-omkopplare kan användas; ingen tyst omkodning |
 
 ### Output — ASIO vs WASAPI (ärligt)
@@ -37,7 +37,7 @@ Målet är att **FLAC och vanliga poddformat ska spelas i appen** via Rust, med 
 
 **Krav på maskinen:** FiiO ASIO Driver måste vara installerad (samma som Qobuz). Utan registerpost finns ingen ASIO-rad; UI ljuger inte om det.
 
-**DSD via ASIO:** om kanalens ASIO-sampletyp är DSD vägrar motorn strömmen i den här PR:n. FLAC → PCM → ASIO är den stödda hi-fi-vägen nu.
+**DSD via ASIO:** `IASIO::future(kAsioSetIoFormat, DSD)` + sampletyp 32/33/40. FiiO ASIO Driver är primär. Misslyckad native-växling → ASIO DoP (24-bit, markörer 0x05/0xFA) märkt `dop`. WASAPI exclusive DoP bara om ASIO saknas/nekas i **Auto**. Explicit ASIO tyst-faller **inte** till WASAPI. DSD-tystnad är `0x69`, aldrig `0x00`.
 
 ### DSP i native-motorn
 

@@ -1,5 +1,8 @@
 //! WASAPI exclusive output. Windows only; other OS get a clear error.
 
+use super::byte_ring::ByteRing;
+#[allow(unused_imports)]
+use super::dsd::{self, DSD_MUTE};
 use super::ring::FrameRing;
 use super::EngineError;
 use std::sync::atomic::AtomicBool;
@@ -34,6 +37,20 @@ pub fn start_exclusive(
     ))
 }
 
+#[cfg(not(windows))]
+pub fn start_exclusive_dop(
+    _device_name: Option<&str>,
+    _dop_rate: u32,
+    _channels: u16,
+    _ring: Arc<ByteRing>,
+    _playing: Arc<AtomicBool>,
+    _file_lsb: bool,
+) -> Result<ExclusiveStream, EngineError> {
+    Err(EngineError::msg(
+        "WASAPI exclusive DoP finns bara på Windows. Native DSD kräver ASIO (FiiO).",
+    ))
+}
+
 #[cfg(windows)]
 pub fn start_exclusive(
     device_name: Option<&str>,
@@ -43,6 +60,18 @@ pub fn start_exclusive(
     playing: Arc<AtomicBool>,
 ) -> Result<ExclusiveStream, EngineError> {
     windows_impl::start(device_name, source_rate, source_channels, ring, playing)
+}
+
+#[cfg(windows)]
+pub fn start_exclusive_dop(
+    device_name: Option<&str>,
+    dop_rate: u32,
+    channels: u16,
+    ring: Arc<ByteRing>,
+    playing: Arc<AtomicBool>,
+    file_lsb: bool,
+) -> Result<ExclusiveStream, EngineError> {
+    windows_impl::start_dop(device_name, dop_rate, channels, ring, playing, file_lsb)
 }
 
 #[cfg(windows)]
@@ -243,5 +272,166 @@ mod windows_impl {
             }
         }
         out
+    }
+
+    pub fn start_dop(
+        device_name: Option<&str>,
+        dop_rate: u32,
+        channels: u16,
+        ring: Arc<ByteRing>,
+        playing: Arc<AtomicBool>,
+        file_lsb: bool,
+    ) -> Result<ExclusiveStream, EngineError> {
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_t = stop.clone();
+        let device_owned = device_name.map(str::to_string);
+        let (tx, rx) = std::sync::mpsc::channel();
+
+        let thread = std::thread::Builder::new()
+            .name("hifi-wasapi-dop".into())
+            .spawn(move || {
+                if let Err(err) = run_exclusive_dop(
+                    device_owned.as_deref(),
+                    dop_rate,
+                    channels,
+                    ring,
+                    playing,
+                    stop_t,
+                    file_lsb,
+                    &tx,
+                ) {
+                    let _ = tx.send(Err(err));
+                }
+            })
+            .map_err(|e| EngineError::msg(format!("WASAPI-tråd: {e}")))?;
+
+        match rx.recv() {
+            Ok(Ok((sample_rate, ch))) => Ok(ExclusiveStream {
+                stop,
+                thread: Some(thread),
+                sample_rate,
+                channels: ch,
+            }),
+            Ok(Err(err)) => {
+                stop.store(true, Ordering::Relaxed);
+                let _ = thread.join();
+                Err(err)
+            }
+            Err(_) => {
+                stop.store(true, Ordering::Relaxed);
+                let _ = thread.join();
+                Err(EngineError::msg(
+                    "WASAPI exclusive-tråden dog innan DoP-strömmen öppnades.",
+                ))
+            }
+        }
+    }
+
+    fn run_exclusive_dop(
+        device_name: Option<&str>,
+        dop_rate: u32,
+        source_channels: u16,
+        ring: Arc<ByteRing>,
+        playing: Arc<AtomicBool>,
+        stop: Arc<AtomicBool>,
+        file_lsb: bool,
+        tx: &Sender<Result<(u32, u16), EngineError>>,
+    ) -> Result<(), EngineError> {
+        let _ = initialize_mta();
+        let device = pick(device_name)?;
+        let mut client = device
+            .get_iaudioclient()
+            .map_err(|e| EngineError::msg(format!("IAudioClient: {e}")))?;
+
+        let channels = source_channels.max(1) as usize;
+        let rate = dop_rate as usize;
+        // DoP is 24-bit markers — never float (that would destroy bit-perfect DoP).
+        let candidates = [
+            WaveFormat::new(24, 24, &SampleType::Int, rate, channels, None),
+            WaveFormat::new(24, 32, &SampleType::Int, rate, channels, None),
+        ];
+
+        let mut chosen: Option<WaveFormat> = None;
+        for fmt in candidates {
+            if let Ok(supported) = client.is_supported_exclusive_with_quirks(&fmt) {
+                if matches!(supported.get_subformat(), Ok(SampleType::Float)) {
+                    continue;
+                }
+                chosen = Some(supported);
+                break;
+            }
+        }
+        let format = chosen.ok_or_else(|| {
+            EngineError::msg(format!(
+                "WASAPI exclusive accepterar inte DoP {rate} Hz / {channels} ch som 24-bit integer. Native DSD kräver ASIO (FiiO). Delat WASAPI används inte för DSD. Filen rörs inte."
+            ))
+        })?;
+
+        let (_def_period, min_period) = client
+            .get_device_period()
+            .map_err(|e| EngineError::msg(format!("WASAPI-period: {e}")))?;
+        let period = client
+            .calculate_aligned_period_near(3 * min_period / 2, Some(128), &format)
+            .unwrap_or(min_period);
+        let mode = StreamMode::EventsExclusive {
+            period_hns: period,
+        };
+        client
+            .initialize_client(&format, &Direction::Render, &mode)
+            .map_err(|e| {
+                EngineError::msg(format!(
+                    "Kunde inte öppna WASAPI exclusive för DoP: {e}."
+                ))
+            })?;
+
+        let h_event = client
+            .set_get_eventhandle()
+            .map_err(|e| EngineError::msg(format!("WASAPI-event: {e}")))?;
+        let render = client
+            .get_audiorenderclient()
+            .map_err(|e| EngineError::msg(format!("WASAPI render: {e}")))?;
+        client
+            .start_stream()
+            .map_err(|e| EngineError::msg(format!("WASAPI start: {e}")))?;
+
+        let block = format.get_blockalign() as usize;
+        let bytes_per_sample = if channels == 0 { 3 } else { block / channels };
+
+        tx.send(Ok((dop_rate, source_channels)))
+            .map_err(|_| EngineError::msg("WASAPI DoP-start kunde inte rapporteras."))?;
+
+        let mut dsd_buf = vec![DSD_MUTE; 8192 * channels * 2];
+        let mut marker_a = true;
+        while !stop.load(Ordering::Relaxed) {
+            if h_event.wait_for_event(200).is_err() {
+                continue;
+            }
+            let Ok(frames) = client.get_available_space_in_frames() else {
+                break;
+            };
+            if frames == 0 {
+                continue;
+            }
+            let need_dsd = frames as usize * channels * 2;
+            if dsd_buf.len() < need_dsd {
+                dsd_buf.resize(need_dsd, DSD_MUTE);
+            }
+            let dest = &mut dsd_buf[..need_dsd];
+            if playing.load(Ordering::Relaxed) {
+                let _ = ring.pop_interleaved(dest, DSD_MUTE);
+            } else {
+                dest.fill(DSD_MUTE);
+            }
+            let (packed, _rest, next) =
+                if bytes_per_sample >= 4 {
+                    dsd::pack_dop_i32_left(dest, channels, marker_a, file_lsb)
+                } else {
+                    dsd::pack_dop_i24(dest, channels, marker_a, file_lsb)
+                };
+            marker_a = next;
+            let _ = render.write_to_device(frames as usize, &packed, None);
+        }
+        let _ = client.stop_stream();
+        Ok(())
     }
 }

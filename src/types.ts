@@ -242,6 +242,11 @@ export type EngineStatus = {
   skip_silence: boolean;
   underruns: number;
   error: string | null;
+  format: string;
+  dsd_rate: string;
+  output_path: string;
+  output_path_sv: string;
+  callback_reentries: number;
 };
 
 export type ProbeInfo = {
