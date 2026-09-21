@@ -1661,7 +1661,7 @@ mod windows_impl {
         dsd_diag.push_str(&format!(" sample_type_pre={sample_type_pre}"));
         publish_dsd_diag(&dsd_diag);
         let sample_type = SampleType::from_asio(sample_type_pre);
-        // Native DSD: some drivers keep PCM sample_type until createBuffers — do not abort yet.
+        // FiiO AV: do not createBuffers/start in DSD IoFormat unless type is already DSD.
         if native_dsd && !native_dsd_may_create_buffers(sample_type) {
             dsd_diag.push_str(" refuse_createBuffers=sample_type_not_dsd_pre");
             publish_dsd_diag(&dsd_diag);
