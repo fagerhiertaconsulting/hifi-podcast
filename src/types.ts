@@ -248,6 +248,13 @@ export type EngineStatus = {
   output_path_sv: string;
   callback_reentries: number;
   dsd_diag: string;
+  file_bits: number;
+  output_bits: number;
+  output_sample: string;
+  file_quality_sv: string;
+  output_quality_sv: string;
+  quality_delta: string[];
+  quality_delta_sv: string;
 };
 
 export type ProbeInfo = {
@@ -265,6 +272,7 @@ export type ProbeInfo = {
   channels: number | null;
   duration_ms: number | null;
   codec: string | null;
+  bits_per_sample: number | null;
 };
 
 export type View = "library" | "inbox" | "queue" | "stats" | "settings";

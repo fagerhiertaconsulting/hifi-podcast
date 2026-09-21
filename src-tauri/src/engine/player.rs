@@ -6,6 +6,7 @@ use super::dsd::{self, BitOrder, DsdReader};
 use super::exclusive::ExclusiveStream;
 use super::formats::{self, FormatKind, FormatSupport};
 use super::output::{self, OutputDeviceInfo, SharedStream};
+use super::quality;
 use super::resample::RateConvert;
 use super::ring::FrameRing;
 use super::skip::SkipSilence;
@@ -28,6 +29,7 @@ pub struct ProbeInfo {
     pub channels: Option<u16>,
     pub duration_ms: Option<u64>,
     pub codec: Option<String>,
+    pub bits_per_sample: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -61,6 +63,17 @@ pub struct EngineStatus {
     pub callback_reentries: u64,
     /// Raw native-DSD negotiation (CanDo/Set/Get, rates, sample_type). Kept when DoP wins.
     pub dsd_diag: String,
+    /// File bit depth (0 unknown). DSD is 1.
+    pub file_bits: u32,
+    /// DAC/engine output bit depth (0 unknown). Native DSD is 1; DoP typically 24.
+    pub output_bits: u32,
+    /// e.g. `f32`, `i24`, `i32`, `dsd_lsb`
+    pub output_sample: String,
+    pub file_quality_sv: String,
+    pub output_quality_sv: String,
+    /// `dop`, `resample`, `bit_depth` — empty if original matches playback in a hi-fi sense.
+    pub quality_delta: Vec<String>,
+    pub quality_delta_sv: String,
 }
 
 impl Default for EngineStatus {
@@ -90,6 +103,13 @@ impl Default for EngineStatus {
             output_path_sv: "PCM".into(),
             callback_reentries: 0,
             dsd_diag: String::new(),
+            file_bits: 0,
+            output_bits: 0,
+            output_sample: String::new(),
+            file_quality_sv: String::new(),
+            output_quality_sv: String::new(),
+            quality_delta: Vec::new(),
+            quality_delta_sv: String::new(),
         }
     }
 }
@@ -199,6 +219,7 @@ impl Handle {
                     channels: None,
                     duration_ms: None,
                     codec: Some("DSD".into()),
+                    bits_per_sample: None,
                 });
             }
             let r = DsdReader::open(path)?;
@@ -210,6 +231,7 @@ impl Handle {
                 channels: Some(spec.channels),
                 duration_ms: Some(spec.duration_ms),
                 codec: Some(spec.codec),
+                bits_per_sample: Some(1),
             });
         }
         if !support.native_decode {
@@ -220,6 +242,7 @@ impl Handle {
                 channels: None,
                 duration_ms: None,
                 codec: None,
+                bits_per_sample: None,
             });
         }
         let dec = Decoder::open(path)?;
@@ -231,6 +254,11 @@ impl Handle {
             channels: Some(spec.channels),
             duration_ms: spec.duration_ms,
             codec: Some(spec.codec),
+            bits_per_sample: if spec.bits_per_sample > 0 {
+                Some(spec.bits_per_sample)
+            } else {
+                None
+            },
         })
     }
 
@@ -297,7 +325,15 @@ impl Handle {
                 output_path_sv: "PCM (f32-kedja)".into(),
                 callback_reentries: 0,
                 dsd_diag: opened.dsd_diag.clone(),
+                file_bits: spec.bits_per_sample,
+                output_bits: opened.output_bits,
+                output_sample: opened.output_sample.clone(),
+                file_quality_sv: String::new(),
+                output_quality_sv: String::new(),
+                quality_delta: Vec::new(),
+                quality_delta_sv: String::new(),
             };
+            stamp_quality(&mut st);
         }
 
         let (tx, rx) = mpsc::channel();
@@ -432,7 +468,15 @@ impl Handle {
                 output_path_sv: path_sv,
                 callback_reentries: 0,
                 dsd_diag: opened.dsd_diag.clone(),
+                file_bits: 1,
+                output_bits: opened.output_bits,
+                output_sample: opened.output_sample.clone(),
+                file_quality_sv: String::new(),
+                output_quality_sv: String::new(),
+                quality_delta: Vec::new(),
+                quality_delta_sv: String::new(),
             };
+            stamp_quality(&mut st);
         }
 
         let (tx, rx) = mpsc::channel();
@@ -527,6 +571,8 @@ struct OpenedOutput {
     device_name: String,
     io_path: String,
     dsd_diag: String,
+    output_bits: u32,
+    output_sample: String,
 }
 
 fn wasapi_device_name(name: &str) -> Option<&str> {
@@ -632,6 +678,8 @@ fn open_asio(
     let device_name = stream.driver_name.clone();
     let io_path = stream.io_path.clone();
     let dsd_diag = stream.dsd_diag.clone();
+    let output_bits = stream.output_bits;
+    let output_sample = stream.output_sample.clone();
     Ok(OpenedOutput {
         shared: None,
         exclusive_stream: None,
@@ -642,6 +690,8 @@ fn open_asio(
         device_name,
         io_path,
         dsd_diag,
+        output_bits,
+        output_sample,
     })
 }
 
@@ -655,6 +705,8 @@ fn open_exclusive(
     let name = wasapi_device_name(device_name);
     let stream = super::exclusive::start_exclusive(name, sample_rate, channels, ring, playing)?;
     let out_rate = stream.sample_rate;
+    let output_bits = stream.output_bits;
+    let output_sample = stream.output_sample.clone();
     Ok(OpenedOutput {
         shared: None,
         exclusive_stream: Some(stream),
@@ -665,6 +717,8 @@ fn open_exclusive(
         device_name: name.unwrap_or("").to_string(),
         io_path: "pcm".into(),
         dsd_diag: String::new(),
+        output_bits,
+        output_sample,
     })
 }
 
@@ -678,6 +732,8 @@ fn open_shared(
     let name = wasapi_device_name(device_name);
     let stream = output::start_shared(name, sample_rate, channels, ring, playing)?;
     let out_rate = stream.sample_rate;
+    let output_bits = stream.output_bits;
+    let output_sample = stream.output_sample.clone();
     Ok(OpenedOutput {
         exclusive_stream: None,
         asio: None,
@@ -688,6 +744,8 @@ fn open_shared(
         shared: Some(stream),
         io_path: "pcm".into(),
         dsd_diag: String::new(),
+        output_bits,
+        output_sample,
     })
 }
 
@@ -793,6 +851,8 @@ fn wrap_asio_dsd(stream: super::asio_host::AsioStream) -> Result<OpenedOutput, E
         let device_name = stream.driver_name.clone();
         let io_path = stream.io_path.clone();
         let dsd_diag = stream.dsd_diag.clone();
+        let output_bits = stream.output_bits;
+        let output_sample = stream.output_sample.clone();
         return Ok(OpenedOutput {
             shared: None,
             exclusive_stream: None,
@@ -803,6 +863,8 @@ fn wrap_asio_dsd(stream: super::asio_host::AsioStream) -> Result<OpenedOutput, E
             device_name,
             io_path,
             dsd_diag,
+            output_bits,
+            output_sample,
         });
     }
     Err(EngineError::msg(
@@ -821,6 +883,8 @@ fn open_dsd_wasapi_dop(
         wasapi_name_for_auto_fallback(device_name).or_else(|| wasapi_device_name(device_name));
     let dop_rate = dsd::dop_pcm_rate(dsd_hz);
     let stream = super::exclusive::start_exclusive_dop(name, dop_rate, 2, ring, playing, file_lsb)?;
+    let output_bits = stream.output_bits;
+    let output_sample = stream.output_sample.clone();
     Ok(OpenedOutput {
         shared: None,
         exclusive_stream: Some(stream),
@@ -831,6 +895,8 @@ fn open_dsd_wasapi_dop(
         device_name: name.unwrap_or("").to_string(),
         io_path: "dop".into(),
         dsd_diag: format!("wasapi_exclusive_dop rate={dop_rate}"),
+        output_bits,
+        output_sample,
     })
 }
 
@@ -1083,6 +1149,34 @@ fn dsd_loop(
 
         std::thread::sleep(Duration::from_millis(4));
     }
+}
+
+fn stamp_quality(st: &mut EngineStatus) {
+    st.file_quality_sv = quality::file_quality_sv(
+        &st.format,
+        &st.codec,
+        st.sample_rate,
+        st.file_bits,
+        &st.dsd_rate,
+    );
+    st.output_quality_sv = quality::output_quality_sv(
+        &st.output_path,
+        &st.output_api,
+        st.output_rate,
+        st.output_bits,
+        &st.output_sample,
+        &st.dsd_rate,
+    );
+    st.quality_delta = quality::quality_delta(
+        &st.format,
+        &st.output_path,
+        st.resampled,
+        st.sample_rate,
+        st.output_rate,
+        st.file_bits,
+        st.output_bits,
+    );
+    st.quality_delta_sv = quality::quality_delta_sv(&st.quality_delta);
 }
 
 fn emit_tick(app: &Arc<Mutex<Option<AppHandle>>>, status: &Arc<Mutex<EngineStatus>>) {

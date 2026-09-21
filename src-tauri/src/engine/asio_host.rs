@@ -80,6 +80,32 @@ impl SampleType {
             Self::Other(_) => None,
         }
     }
+
+    #[allow(dead_code)]
+    fn bits(self) -> u32 {
+        match self {
+            Self::I16Le => 16,
+            Self::I24Le | Self::I32Le24 => 24,
+            Self::I32Le | Self::F32Le => 32,
+            Self::DsdLsb | Self::DsdMsb | Self::DsdNer8 => 1,
+            Self::Other(_) => 0,
+        }
+    }
+
+    #[allow(dead_code)]
+    fn label(self) -> String {
+        match self {
+            Self::F32Le => "f32".into(),
+            Self::I16Le => "i16".into(),
+            Self::I24Le => "i24".into(),
+            Self::I32Le => "i32".into(),
+            Self::I32Le24 => "i32_24".into(),
+            Self::DsdLsb => "dsd_lsb".into(),
+            Self::DsdMsb => "dsd_msb".into(),
+            Self::DsdNer8 => "dsd_ner8".into(),
+            Self::Other(n) => format!("other_{n}"),
+        }
+    }
 }
 
 pub fn asio_available() -> bool {
@@ -146,6 +172,8 @@ pub struct AsioStream {
     pub io_path: String,
     /// Raw kAsioCanDo/Set/GetIoFormat, rates, and channel sample_type (QA).
     pub dsd_diag: String,
+    pub output_bits: u32,
+    pub output_sample: String,
 }
 
 impl Drop for AsioStream {
@@ -1288,6 +1316,8 @@ mod windows_impl {
         name: String,
         io_path: String,
         dsd_diag: String,
+        output_bits: u32,
+        output_sample: String,
     }
 
     pub fn start(
@@ -1373,6 +1403,8 @@ mod windows_impl {
                 driver_name: opened.name,
                 io_path: opened.io_path,
                 dsd_diag: opened.dsd_diag,
+                output_bits: opened.output_bits,
+                output_sample: opened.output_sample,
             }),
             Ok(Err(err)) => {
                 stop.store(true, Ordering::Relaxed);
@@ -1816,6 +1848,8 @@ mod windows_impl {
             name: display_name.to_string(),
             io_path: io_path.to_string(),
             dsd_diag: dsd_diag.clone(),
+            output_bits: sample_type.bits(),
+            output_sample: sample_type.label(),
         }));
 
         while !stop.load(Ordering::Relaxed) {
@@ -2090,6 +2124,11 @@ mod tests {
         assert!(SampleType::from_asio(18).is_pcm());
         assert!(SampleType::from_asio(19).is_pcm());
         assert!(!SampleType::from_asio(32).is_pcm());
+        assert_eq!(SampleType::from_asio(17).bits(), 24);
+        assert_eq!(SampleType::from_asio(18).bits(), 32);
+        assert_eq!(SampleType::from_asio(19).label(), "f32");
+        assert_eq!(SampleType::from_asio(32).bits(), 1);
+        assert_eq!(SampleType::from_asio(32).label(), "dsd_lsb");
     }
 
     #[test]

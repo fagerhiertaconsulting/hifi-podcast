@@ -13,6 +13,8 @@ pub struct ExclusiveStream {
     thread: Option<std::thread::JoinHandle<()>>,
     pub sample_rate: u32,
     pub channels: u16,
+    pub output_bits: u32,
+    pub output_sample: String,
 }
 
 impl Drop for ExclusiveStream {
@@ -113,11 +115,13 @@ mod windows_impl {
             .map_err(|e| EngineError::msg(format!("WASAPI-tråd: {e}")))?;
 
         match rx.recv() {
-            Ok(Ok((sample_rate, channels))) => Ok(ExclusiveStream {
+            Ok(Ok((sample_rate, channels, output_bits, output_sample))) => Ok(ExclusiveStream {
                 stop,
                 thread: Some(thread),
                 sample_rate,
                 channels,
+                output_bits,
+                output_sample,
             }),
             Ok(Err(err)) => {
                 stop.store(true, Ordering::Relaxed);
@@ -141,7 +145,7 @@ mod windows_impl {
         ring: Arc<FrameRing>,
         playing: Arc<AtomicBool>,
         stop: Arc<AtomicBool>,
-        tx: &Sender<Result<(u32, u16), EngineError>>,
+        tx: &Sender<Result<(u32, u16, u32, String), EngineError>>,
     ) -> Result<(), EngineError> {
         let _ = initialize_mta();
         let device = pick(device_name)?;
@@ -202,7 +206,20 @@ mod windows_impl {
         let block = format.get_blockalign() as usize;
         let bytes_per_sample = if channels == 0 { 4 } else { block / channels };
 
-        tx.send(Ok((source_rate, source_channels)))
+        tx.send(Ok((
+            source_rate,
+            source_channels,
+            bits as u32,
+            if is_float {
+                "f32".into()
+            } else if bits == 16 {
+                "i16".into()
+            } else if bits == 24 {
+                "i24".into()
+            } else {
+                "i32".into()
+            },
+        )))
             .map_err(|_| EngineError::msg("WASAPI exclusive-start kunde inte rapporteras."))?;
 
         let mut f32_buf = vec![0.0f32; 8192 * channels];
@@ -306,11 +323,13 @@ mod windows_impl {
             .map_err(|e| EngineError::msg(format!("WASAPI-tråd: {e}")))?;
 
         match rx.recv() {
-            Ok(Ok((sample_rate, ch))) => Ok(ExclusiveStream {
+            Ok(Ok((sample_rate, ch, output_bits, output_sample))) => Ok(ExclusiveStream {
                 stop,
                 thread: Some(thread),
                 sample_rate,
                 channels: ch,
+                output_bits,
+                output_sample,
             }),
             Ok(Err(err)) => {
                 stop.store(true, Ordering::Relaxed);
@@ -335,7 +354,7 @@ mod windows_impl {
         playing: Arc<AtomicBool>,
         stop: Arc<AtomicBool>,
         file_lsb: bool,
-        tx: &Sender<Result<(u32, u16), EngineError>>,
+        tx: &Sender<Result<(u32, u16, u32, String), EngineError>>,
     ) -> Result<(), EngineError> {
         let _ = initialize_mta();
         let device = pick(device_name)?;
@@ -397,7 +416,14 @@ mod windows_impl {
         let block = format.get_blockalign() as usize;
         let bytes_per_sample = if channels == 0 { 3 } else { block / channels };
 
-        tx.send(Ok((dop_rate, source_channels)))
+        let bits = format.get_validbitspersample() as u32;
+        let sample = if bytes_per_sample >= 4 {
+            "i32_24".to_string()
+        } else {
+            "i24".to_string()
+        };
+
+        tx.send(Ok((dop_rate, source_channels, bits.max(24), sample)))
             .map_err(|_| EngineError::msg("WASAPI DoP-start kunde inte rapporteras."))?;
 
         let mut dsd_buf = vec![DSD_MUTE; 8192 * channels * 2];
