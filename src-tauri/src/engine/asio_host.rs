@@ -12,7 +12,7 @@ use super::EngineError;
 use serde::Serialize;
 use std::cell::UnsafeCell;
 use std::ptr;
-use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 
 #[derive(Debug, Clone, Serialize)]
@@ -241,6 +241,7 @@ struct RtHost {
     dop_marker_a: AtomicBool,
     /// True when file bit order must be reversed for this output (DSF→DoP/MSB, etc.).
     dsd_reverse: bool,
+    reentries: AtomicU64,
 }
 
 unsafe impl Send for RtHost {}
@@ -252,6 +253,7 @@ static ASIO_RESET: AtomicBool = AtomicBool::new(false);
 
 fn install_rt_host(host: Box<RtHost>) {
     uninstall_rt_host();
+    ASIO_REENTRIES.store(0, Ordering::Relaxed);
     RT_HOST.store(Box::into_raw(host), Ordering::Release);
 }
 
@@ -280,6 +282,9 @@ fn uninstall_rt_host() {
 /// `init` is `ASIOBool` (`ASIOTrue` = 1, `ASIOFalse` = 0) — not an error code.
 #[allow(dead_code)] // used by the Windows host path and unit tests
 const ASE_OK: i32 = 0;
+/// `asio.h` `ASE_NotPresent` — selector/method not implemented.
+#[allow(dead_code)]
+const ASE_NOT_PRESENT: i32 = -1000;
 
 /// Steinberg `IASIO::canSampleRate` / `ASIOCanSampleRate`.
 ///
@@ -290,6 +295,59 @@ const ASE_OK: i32 = 0;
 #[allow(dead_code)] // used by the Windows host path and unit tests
 fn asio_sample_rate_supported(can_sample_rate: i32) -> bool {
     can_sample_rate == ASE_OK
+}
+
+/// Result of `kAsioCanDoIoFormat` + `kAsioSetIoFormat`. Native DSD is only `Applied`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+enum IoFormatSwitch {
+    /// Driver accepted the requested PCM/DSD IO format.
+    Applied,
+    /// `future` not implemented — PCM/DoP may continue; native DSD must not.
+    NotImplemented,
+    /// Driver refused the format.
+    Denied,
+}
+
+/// Native DSD requires a successful Set. CanDo may be ASE_OK or NotPresent (then Set is the gate).
+#[allow(dead_code)]
+fn classify_io_format_switch(can: i32, set: i32) -> IoFormatSwitch {
+    if set == ASE_OK && (can == ASE_OK || can == ASE_NOT_PRESENT) {
+        IoFormatSwitch::Applied
+    } else if can == ASE_NOT_PRESENT && set == ASE_NOT_PRESENT {
+        IoFormatSwitch::NotImplemented
+    } else {
+        IoFormatSwitch::Denied
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+enum CallbackBusyAction {
+    /// Stream stopping: mute this buffer, do not count underrun or re-entry.
+    StopMute,
+    /// Nested bufferSwitch while fill is in progress: mute this callback only, count re-entry (not underrun).
+    ReentryMute,
+    Fill,
+}
+
+#[allow(dead_code)]
+fn callback_busy_action(stopped: bool, already_busy: bool) -> CallbackBusyAction {
+    if stopped {
+        CallbackBusyAction::StopMute
+    } else if already_busy {
+        CallbackBusyAction::ReentryMute
+    } else {
+        CallbackBusyAction::Fill
+    }
+}
+
+static ASIO_REENTRIES: AtomicU64 = AtomicU64::new(0);
+
+/// Nested `bufferSwitch` count (not underruns). Reset when an ASIO stream is installed.
+#[allow(dead_code)]
+pub fn asio_callback_reentries() -> u64 {
+    ASIO_REENTRIES.load(Ordering::Relaxed)
 }
 
 fn new_rt_host(
@@ -348,6 +406,7 @@ fn new_rt_host_ex(
             RtFillMode::NativeDsd { reverse } => reverse,
             _ => false,
         },
+        reentries: AtomicU64::new(0),
     })
 }
 
@@ -610,24 +669,26 @@ mod windows_impl {
         let frames = st.frames;
         let ch = st.channels.max(1);
 
-        let write_silence =
-            st.stop.load(Ordering::Relaxed) || st.scratch_busy.swap(true, Ordering::AcqRel);
-        if write_silence {
-            if !st.stop.load(Ordering::Relaxed) {
-                match &st.fill {
-                    RtFillMode::Pcm => st.pcm_ring.note_underrun(),
-                    _ => {
-                        if let Some(r) = st.dsd_ring.as_ref() {
-                            r.note_underrun();
-                        }
-                    }
+        let already_busy = st.scratch_busy.swap(true, Ordering::AcqRel);
+        match callback_busy_action(st.stop.load(Ordering::Relaxed), already_busy) {
+            CallbackBusyAction::StopMute => {
+                unsafe {
+                    write_mute(st, idx, frames, ch);
                 }
+                RT_IN_FLIGHT.fetch_sub(1, Ordering::Release);
+                return;
             }
-            unsafe {
-                write_mute(st, idx, frames, ch);
+            CallbackBusyAction::ReentryMute => {
+                st.reentries.fetch_add(1, Ordering::Relaxed);
+                ASIO_REENTRIES.fetch_add(1, Ordering::Relaxed);
+                unsafe {
+                    write_mute(st, idx, frames, ch);
+                }
+                // Leave scratch_busy set — the owning callback still fills.
+                RT_IN_FLIGHT.fetch_sub(1, Ordering::Release);
+                return;
             }
-            RT_IN_FLIGHT.fetch_sub(1, Ordering::Release);
-            return;
+            CallbackBusyAction::Fill => {}
         }
 
         match st.fill {
@@ -1044,12 +1105,12 @@ mod windows_impl {
         }
     }
 
-    fn set_io_format(driver: *mut Iasio, vtbl: &IasioVtbl, dsd: bool) {
+    fn set_io_format(driver: *mut Iasio, vtbl: &IasioVtbl, dsd: bool) -> IoFormatSwitch {
         let mut fmt = AsioIoFormat {
             format_type: if dsd { ASIO_IO_DSD } else { ASIO_IO_PCM },
             reserved: [0; 508],
         };
-        let _ = unsafe {
+        let can = unsafe {
             (vtbl.future)(
                 driver,
                 K_ASIO_CAN_DO_IO_FORMAT,
@@ -1057,13 +1118,14 @@ mod windows_impl {
             )
         };
         fmt.format_type = if dsd { ASIO_IO_DSD } else { ASIO_IO_PCM };
-        let _ = unsafe {
+        let set = unsafe {
             (vtbl.future)(
                 driver,
                 K_ASIO_SET_IO_FORMAT,
                 &mut fmt as *mut AsioIoFormat as *mut c_void,
             )
         };
+        classify_io_format_switch(can, set)
     }
 
     fn try_set_rate(
@@ -1182,7 +1244,13 @@ mod windows_impl {
                 ),
             };
 
-        set_io_format(driver, vtbl, want_dsd_io);
+        let io_sw = set_io_format(driver, vtbl, want_dsd_io);
+        if native_dsd && io_sw != IoFormatSwitch::Applied {
+            unsafe { (vtbl.release)(driver) };
+            return Err(EngineError::msg(format!(
+                "{display_name} bekräftade inte native DSD (kAsioCanDoIoFormat/kAsioSetIoFormat = {io_sw:?}). Native DSD avbryts — prova DoP. Filen rörs inte."
+            )));
+        }
 
         let mut rate_err = String::new();
         let mut rate = 0u32;
@@ -1434,6 +1502,34 @@ mod windows_impl {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn classify_io_format_switch_native_requires_applied() {
+        assert_eq!(classify_io_format_switch(0, 0), IoFormatSwitch::Applied);
+        assert_eq!(
+            classify_io_format_switch(ASE_NOT_PRESENT, 0),
+            IoFormatSwitch::Applied
+        );
+        assert_eq!(
+            classify_io_format_switch(ASE_NOT_PRESENT, ASE_NOT_PRESENT),
+            IoFormatSwitch::NotImplemented
+        );
+        assert_eq!(classify_io_format_switch(0, -1), IoFormatSwitch::Denied);
+        assert_eq!(classify_io_format_switch(1, 0), IoFormatSwitch::Denied);
+        assert_ne!(IoFormatSwitch::NotImplemented, IoFormatSwitch::Applied);
+        assert_ne!(IoFormatSwitch::Denied, IoFormatSwitch::Applied);
+    }
+
+    #[test]
+    fn reentry_is_not_classified_as_underrun() {
+        assert_eq!(
+            callback_busy_action(false, true),
+            CallbackBusyAction::ReentryMute
+        );
+        assert_eq!(callback_busy_action(false, false), CallbackBusyAction::Fill);
+        assert_eq!(callback_busy_action(true, true), CallbackBusyAction::StopMute);
+        assert_eq!(callback_busy_action(true, false), CallbackBusyAction::StopMute);
+    }
 
     #[test]
     fn can_sample_rate_ase_ok_means_supported() {

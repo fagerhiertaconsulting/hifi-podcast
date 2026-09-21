@@ -57,6 +57,8 @@ pub struct EngineStatus {
     /// `pcm`, `native_dsd`, or `dop` — never `native_dsd` for converted/DoP
     pub output_path: String,
     pub output_path_sv: String,
+    /// Nested ASIO `bufferSwitch` (not underruns).
+    pub callback_reentries: u64,
 }
 
 impl Default for EngineStatus {
@@ -84,6 +86,7 @@ impl Default for EngineStatus {
             dsd_rate: String::new(),
             output_path: "pcm".into(),
             output_path_sv: "PCM".into(),
+            callback_reentries: 0,
         }
     }
 }
@@ -289,6 +292,7 @@ impl Handle {
                     "pcm".into()
                 },
                 output_path_sv: "PCM (f32-kedja)".into(),
+                callback_reentries: 0,
             };
         }
 
@@ -394,6 +398,7 @@ impl Handle {
                 dsd_rate: spec.rate_label.clone(),
                 output_path: opened.io_path.clone(),
                 output_path_sv: path_sv,
+                callback_reentries: 0,
             };
         }
 
@@ -692,6 +697,12 @@ fn open_dsd_output(
     }
 }
 
+fn combine_dsd_open_errors(native: &EngineError, dop: &EngineError) -> EngineError {
+    EngineError::msg(format!(
+        "Native DSD: {native} DoP: {dop} (båda vägarna misslyckades; ingen tyst PCM-omkodning)."
+    ))
+}
+
 fn open_dsd_asio(
     device_name: &str,
     dsd_hz: u32,
@@ -712,13 +723,18 @@ fn open_dsd_asio(
             file_lsb,
         ) {
             Ok(stream) => return wrap_asio_dsd(stream),
-            Err(_) => {
-                let stream = super::asio_host::start_asio_dop(name, dsd_hz, hwnd, ring, playing, file_lsb)?;
-                return wrap_asio_dsd(stream);
+            Err(native_err) => {
+                return match super::asio_host::start_asio_dop(
+                    name, dsd_hz, hwnd, ring, playing, file_lsb,
+                ) {
+                    Ok(stream) => wrap_asio_dsd(stream),
+                    Err(dop_err) => Err(combine_dsd_open_errors(&native_err, &dop_err)),
+                };
             }
         }
     }
-    let stream = super::asio_host::start_asio_native_dsd(name, dsd_hz, hwnd, ring, playing, file_lsb)?;
+    let stream =
+        super::asio_host::start_asio_native_dsd(name, dsd_hz, hwnd, ring, playing, file_lsb)?;
     wrap_asio_dsd(stream)
 }
 
@@ -892,9 +908,10 @@ fn decode_loop(
             let audible = source_consumed.saturating_sub(buffered_source as u64);
             let pos_ms = audible * 1000 / source_rate.max(1) as u64;
             let underruns = ring.underrun_count();
+            let reentries = super::asio_host::asio_callback_reentries();
             if underruns > last_underruns {
                 eprintln!(
-                    "native audio underrun: empty ring, try_lock contended, or callback re-entry (count {underruns})"
+                    "native audio underrun: empty ring or try_lock contended (count {underruns}); ASIO re-entry {reentries}"
                 );
                 last_underruns = underruns;
             }
@@ -904,6 +921,7 @@ fn decode_loop(
                 st.ended = ended;
                 st.speed = speed;
                 st.underruns = underruns;
+                st.callback_reentries = reentries;
             }
             emit_tick(&app, &status);
         }
@@ -996,8 +1014,9 @@ fn dsd_loop(
             let bits = audible / 2 * 8;
             let pos_ms = bits * 1000 / source_rate.max(1) as u64;
             let underruns = ring.underrun_count();
+            let reentries = super::asio_host::asio_callback_reentries();
             if underruns > last_underruns {
-                eprintln!("DSD underrun (count {underruns})");
+                eprintln!("DSD underrun (count {underruns}); ASIO re-entry {reentries}");
                 last_underruns = underruns;
             }
             if let Ok(mut st) = status.lock() {
@@ -1005,6 +1024,7 @@ fn dsd_loop(
                 st.playing = playing.load(Ordering::Relaxed);
                 st.ended = ended;
                 st.underruns = underruns;
+                st.callback_reentries = reentries;
             }
             emit_tick(&app, &status);
         }
@@ -1056,5 +1076,16 @@ mod tests {
         assert_eq!(wasapi_name_for_auto_fallback("asio:{aabb}"), None);
         assert_eq!(wasapi_name_for_auto_fallback("FiiO ASIO Driver"), None);
         assert_eq!(wasapi_name_for_auto_fallback(""), None);
+    }
+
+    #[test]
+    fn native_and_dop_failures_are_both_in_the_error() {
+        let native = EngineError::msg("kan inte sätta DSD-format");
+        let dop = EngineError::msg("ingen 24-bit DoP-hastighet");
+        let combined = combine_dsd_open_errors(&native, &dop).to_string();
+        assert!(combined.contains("Native DSD"), "{combined}");
+        assert!(combined.contains("kan inte sätta DSD-format"), "{combined}");
+        assert!(combined.contains("DoP"), "{combined}");
+        assert!(combined.contains("ingen 24-bit DoP-hastighet"), "{combined}");
     }
 }

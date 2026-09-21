@@ -392,9 +392,15 @@ export default function App() {
       setDuration((st.duration_ms || 0) / 1000);
       setPlaying(st.playing);
       if (st.format === "dsd") {
-        setEngineQa(`${st.dsd_rate} · ${st.output_path} · ${st.output_path_sv}`);
+        const re =
+          st.callback_reentries > 0 ? ` · re-entry ${st.callback_reentries} (inte underrun)` : "";
+        setEngineQa(
+          `${st.dsd_rate} · ${st.output_path} · ${st.output_path_sv} · underrun ${st.underruns}${re}`,
+        );
       } else if (st.loaded) {
-        setEngineQa(`PCM ${st.sample_rate} Hz · ${st.output_api}`);
+        const re =
+          st.callback_reentries > 0 ? ` · re-entry ${st.callback_reentries} (inte underrun)` : "";
+        setEngineQa(`PCM ${st.sample_rate} Hz · ${st.output_api} · underrun ${st.underruns}${re}`);
       }
       if (st.error) {
         setStatus(st.error);

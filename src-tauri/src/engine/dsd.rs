@@ -22,6 +22,21 @@ const BIT_REVERSE: [u8; 256] = {
     t
 };
 
+/// Hard caps so a corrupt header cannot allocate unbounded memory.
+const MAX_CHANNELS: u16 = 8;
+const MAX_FMT_BODY: u64 = 4096;
+const MAX_DSF_BLOCK: u64 = 256 * 1024;
+const MAX_STREAM_READ: usize = 256 * 1024;
+const MAX_DFF_CHUNKS: u32 = 8192;
+const MAX_DFF_PROP_SPAN: u64 = 1024 * 1024;
+const MAX_DFF_FORM: u64 = 64 * 1024 * 1024 * 1024; // 64 GiB file sanity
+
+fn fail_limit(what: &str) -> EngineError {
+    EngineError::msg(format!(
+        "DSD-filen överskrider {what}. Avvisad (korrupt eller fientlig header). Filen rörs inte."
+    ))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DsdContainer {
     Dsf,
@@ -110,15 +125,16 @@ impl DsdReader {
         if !self.leftover.is_empty() {
             out.append(&mut self.leftover);
         }
+        let min_bytes = min_bytes.min(MAX_STREAM_READ);
         let ch = self.spec.channels as usize;
-        let block = self.block_size.max(1) * ch.max(1);
+        let block = self.block_size.max(1).saturating_mul(ch.max(1)).min(MAX_STREAM_READ);
         while out.len() < min_bytes && !self.eof {
             let remaining = self.data_end.saturating_sub(self.cursor);
             if remaining == 0 {
                 self.eof = true;
                 break;
             }
-            let take = (remaining as usize).min(block);
+            let take = (remaining as usize).min(block).min(MAX_STREAM_READ);
             let mut buf = vec![0u8; take];
             self.file.seek(SeekFrom::Start(self.cursor))?;
             let n = self.file.read(&mut buf)?;
@@ -172,12 +188,19 @@ impl DsdReader {
         if &fmt_hdr[0..4] != b"fmt " {
             return Err(EngineError::msg("Ogiltig DSF: saknar fmt-chunk."));
         }
+        let file_len = file.metadata()?.len();
         let fmt_chunk_size = u64::from_le_bytes(fmt_hdr[4..12].try_into().unwrap());
-        let fmt_body_len = fmt_chunk_size.saturating_sub(12) as usize;
-        if fmt_body_len < 40 {
+        let fmt_body_len = fmt_chunk_size.saturating_sub(12);
+        if fmt_chunk_size < 52 || fmt_body_len < 40 {
             return Err(EngineError::msg("Ogiltig DSF fmt-chunk."));
         }
-        let mut fmt = vec![0u8; fmt_body_len];
+        if fmt_body_len > MAX_FMT_BODY {
+            return Err(fail_limit("fmt-chunk (max 4 KiB)"));
+        }
+        if fmt_chunk_size > file_len {
+            return Err(EngineError::msg("Ogiltig DSF fmt-chunk."));
+        }
+        let mut fmt = vec![0u8; fmt_body_len as usize];
         file.read_exact(&mut fmt)?;
         let format_id = u32::from_le_bytes(fmt[4..8].try_into().unwrap());
         if format_id != 0 {
@@ -189,10 +212,14 @@ impl DsdReader {
         let sample_rate = u32::from_le_bytes(fmt[16..20].try_into().unwrap());
         let bits_per_sample = u32::from_le_bytes(fmt[20..24].try_into().unwrap());
         let sample_count = u64::from_le_bytes(fmt[24..32].try_into().unwrap());
-        let block_size = u32::from_le_bytes(fmt[32..36].try_into().unwrap()) as usize;
-        if channels == 0 || sample_rate == 0 || block_size == 0 {
+        let block_size = u32::from_le_bytes(fmt[32..36].try_into().unwrap()) as u64;
+        if channels == 0 || channels > MAX_CHANNELS || sample_rate == 0 || block_size == 0 {
             return Err(EngineError::msg("DSF har ogiltig kanal-/hastighetsdata."));
         }
+        if block_size > MAX_DSF_BLOCK {
+            return Err(fail_limit("DSF block size (max 256 KiB/kanal)"));
+        }
+        let block_size = block_size as usize;
         if bits_per_sample != 1 && bits_per_sample != 8 {
             return Err(EngineError::msg(format!(
                 "DSF bits/sample {bits_per_sample} stöds inte (väntat 1 eller 8)."
@@ -206,6 +233,9 @@ impl DsdReader {
         let data_chunk_size = u64::from_le_bytes(data_hdr[4..12].try_into().unwrap());
         let data_start = file.stream_position()?;
         let payload = data_chunk_size.saturating_sub(12);
+        if data_start.saturating_add(payload) > file_len.saturating_add(1) {
+            return Err(EngineError::msg("DSF data-chunk är större än filen."));
+        }
         let data_end = data_start + payload;
         let duration_ms = if sample_rate > 0 {
             (sample_count as u128 * 1000 / sample_rate as u128) as u64
@@ -242,15 +272,28 @@ impl DsdReader {
                 "Ogiltig DSDIFF-header (FRM8/DSD). DST-komprimerad DFF stöds inte här.",
             ));
         }
-        let form_end = 12 + u64::from_be_bytes(hdr[4..12].try_into().unwrap());
+        let form_size = u64::from_be_bytes(hdr[4..12].try_into().unwrap());
+        if form_size > MAX_DFF_FORM {
+            return Err(fail_limit("DSDIFF FRM8-storlek (max 64 GiB)"));
+        }
+        let form_end = 12u64.saturating_add(form_size);
+        let file_len = file.metadata()?.len();
+        if form_end > file_len {
+            return Err(EngineError::msg("DSDIFF FRM8 är större än filen."));
+        }
         let mut sample_rate = 0u32;
         let mut channels = 0u16;
         let mut compressed = false;
         let mut data_start = 0u64;
         let mut data_end = 0u64;
         let mut found_data = false;
+        let mut chunks = 0u32;
 
         while file.stream_position()? + 12 <= form_end {
+            chunks += 1;
+            if chunks > MAX_DFF_CHUNKS {
+                return Err(fail_limit("antal DFF-chunkar"));
+            }
             let mut id = [0u8; 4];
             if file.read_exact(&mut id).is_err() {
                 break;
@@ -258,10 +301,19 @@ impl DsdReader {
             let mut sz = [0u8; 8];
             file.read_exact(&mut sz)?;
             let size = u64::from_be_bytes(sz);
+            if size == 0 {
+                return Err(EngineError::msg("DSDIFF har en tom chunk (ogiltig)."));
+            }
+            if size > MAX_DFF_FORM {
+                return Err(fail_limit("DFF-chunkstorlek"));
+            }
             let chunk_data = file.stream_position()?;
-            let next = align2(chunk_data + size);
+            let next = align2(chunk_data.saturating_add(size));
             match &id {
                 b"PROP" => {
+                    if size > MAX_DFF_PROP_SPAN {
+                        return Err(fail_limit("DFF PROP-chunk"));
+                    }
                     let mut prop = [0u8; 4];
                     file.read_exact(&mut prop)?;
                     if &prop == b"SND " {
@@ -298,9 +350,9 @@ impl DsdReader {
                 "DSDIFF är DST-komprimerad. Native-motorn avkodar bara rå DSD. Filen rörs inte.",
             ));
         }
-        if !found_data || sample_rate == 0 || channels == 0 {
+        if !found_data || sample_rate == 0 || channels == 0 || channels > MAX_CHANNELS {
             return Err(EngineError::msg(
-                "DSDIFF saknar DSD-data, samplingsfrekvens eller kanaler.",
+                "DSDIFF saknar DSD-data, samplingsfrekvens eller giltiga kanaler.",
             ));
         }
         let payload = data_end.saturating_sub(data_start);
@@ -346,12 +398,23 @@ fn parse_dff_prop(
     compressed: &mut bool,
 ) -> Result<(), EngineError> {
     file.seek(SeekFrom::Start(start))?;
+    let mut n = 0u32;
     while file.stream_position()? + 12 <= end {
+        n += 1;
+        if n > MAX_DFF_CHUNKS {
+            return Err(fail_limit("antal DFF PROP-chunkar"));
+        }
         let mut id = [0u8; 4];
         file.read_exact(&mut id)?;
         let mut sz = [0u8; 8];
         file.read_exact(&mut sz)?;
         let size = u64::from_be_bytes(sz);
+        if size == 0 {
+            return Err(EngineError::msg("DSDIFF PROP har en tom chunk (ogiltig)."));
+        }
+        if size > MAX_DFF_PROP_SPAN {
+            return Err(fail_limit("DFF PROP-del"));
+        }
         let data_pos = file.stream_position()?;
         let next = align2(data_pos + size);
         match &id {
@@ -673,5 +736,25 @@ mod tests {
     fn dop_rate_dsd256() {
         assert_eq!(dop_pcm_rate(11_289_600), 705_600);
         assert_eq!(native_dsd_byte_rate(11_289_600), 1_411_200);
+    }
+
+    #[test]
+    fn huge_fmt_chunk_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("evil.dsf");
+        let mut v = Vec::new();
+        v.extend(b"DSD ");
+        v.extend(28u64.to_le_bytes());
+        v.extend(200u64.to_le_bytes());
+        v.extend(0u64.to_le_bytes());
+        v.extend(b"fmt ");
+        v.extend((12u64 + 50_000).to_le_bytes());
+        std::fs::write(&path, v).unwrap();
+        let err = DsdReader::open(&path).err().expect("limit");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("överskrider") || msg.contains("fmt"),
+            "{msg}"
+        );
     }
 }

@@ -246,6 +246,7 @@ export type EngineStatus = {
   dsd_rate: string;
   output_path: string;
   output_path_sv: string;
+  callback_reentries: number;
 };
 
 export type ProbeInfo = {
