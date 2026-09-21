@@ -2,7 +2,7 @@
 
 use super::byte_ring::ByteRing;
 use super::decode::{to_stereo, Decoder};
-use super::dsd::{self, DsdReader, BitOrder};
+use super::dsd::{self, BitOrder, DsdReader};
 use super::exclusive::ExclusiveStream;
 use super::formats::{self, FormatKind, FormatSupport};
 use super::output::{self, OutputDeviceInfo, SharedStream};
@@ -59,6 +59,8 @@ pub struct EngineStatus {
     pub output_path_sv: String,
     /// Nested ASIO `bufferSwitch` (not underruns).
     pub callback_reentries: u64,
+    /// Raw native-DSD negotiation (CanDo/Set/Get, rates, sample_type). Kept when DoP wins.
+    pub dsd_diag: String,
 }
 
 impl Default for EngineStatus {
@@ -87,6 +89,7 @@ impl Default for EngineStatus {
             output_path: "pcm".into(),
             output_path_sv: "PCM".into(),
             callback_reentries: 0,
+            dsd_diag: String::new(),
         }
     }
 }
@@ -293,6 +296,7 @@ impl Handle {
                 },
                 output_path_sv: "PCM (f32-kedja)".into(),
                 callback_reentries: 0,
+                dsd_diag: opened.dsd_diag.clone(),
             };
         }
 
@@ -366,10 +370,18 @@ impl Handle {
                 "Native DSD via ASIO ({}) — bit-perfect DSD-bytes, inte PCM-omkodning.",
                 opened.device_name
             ),
-            "dop" => format!(
-                "DoP (DSD over PCM) via {} — inte native DSD. Markörer 0x05/0xFA, 24-bit.",
-                opened.api
-            ),
+            "dop" => {
+                let mut s = format!(
+                    "DoP (DSD over PCM) via {} — inte native DSD. Markörer 0x05/0xFA, 24-bit.",
+                    opened.api
+                );
+                if opened.dsd_diag.contains("native_attempt_failed")
+                    || opened.dsd_diag.contains("asio_failed")
+                {
+                    s.push_str(" Native ASIO misslyckades (dsd_diag).");
+                }
+                s
+            }
             other => format!("Okänd DSD-väg ({other})."),
         };
 
@@ -399,6 +411,7 @@ impl Handle {
                 output_path: opened.io_path.clone(),
                 output_path_sv: path_sv,
                 callback_reentries: 0,
+                dsd_diag: opened.dsd_diag.clone(),
             };
         }
 
@@ -493,6 +506,7 @@ struct OpenedOutput {
     api: String,
     device_name: String,
     io_path: String,
+    dsd_diag: String,
 }
 
 fn wasapi_device_name(name: &str) -> Option<&str> {
@@ -597,6 +611,7 @@ fn open_asio(
     let out_rate = stream.sample_rate;
     let device_name = stream.driver_name.clone();
     let io_path = stream.io_path.clone();
+    let dsd_diag = stream.dsd_diag.clone();
     Ok(OpenedOutput {
         shared: None,
         exclusive_stream: None,
@@ -606,6 +621,7 @@ fn open_asio(
         api: "asio".into(),
         device_name,
         io_path,
+        dsd_diag,
     })
 }
 
@@ -628,6 +644,7 @@ fn open_exclusive(
         api: "wasapi_exclusive".into(),
         device_name: name.unwrap_or("").to_string(),
         io_path: "pcm".into(),
+        dsd_diag: String::new(),
     })
 }
 
@@ -650,6 +667,7 @@ fn open_shared(
         device_name: name.unwrap_or("").to_string(),
         shared: Some(stream),
         io_path: "pcm".into(),
+        dsd_diag: String::new(),
     })
 }
 
@@ -687,7 +705,10 @@ fn open_dsd_output(
                     playing,
                     file_lsb,
                 ) {
-                    Ok(s) => Ok(s),
+                    Ok(mut s) => {
+                        s.dsd_diag = format!("asio_failed: {asio_err} | {}", s.dsd_diag);
+                        Ok(s)
+                    }
                     Err(wasapi_err) => Err(EngineError::msg(format!(
                         "DSD kunde inte öppnas. ASIO native/DoP: {asio_err} WASAPI exclusive DoP: {wasapi_err} Ingen tyst PCM-omkodning. Delat WASAPI används inte."
                     ))),
@@ -695,6 +716,10 @@ fn open_dsd_output(
             }
         }
     }
+}
+
+fn merge_native_probe_into_dop(native_err: &EngineError, dop_diag: &str) -> String {
+    format!("native_attempt_failed: {native_err} | dop: {dop_diag}")
 }
 
 fn combine_dsd_open_errors(native: &EngineError, dop: &EngineError) -> EngineError {
@@ -727,7 +752,11 @@ fn open_dsd_asio(
                 return match super::asio_host::start_asio_dop(
                     name, dsd_hz, hwnd, ring, playing, file_lsb,
                 ) {
-                    Ok(stream) => wrap_asio_dsd(stream),
+                    Ok(stream) => {
+                        let mut out = wrap_asio_dsd(stream)?;
+                        out.dsd_diag = merge_native_probe_into_dop(&native_err, &out.dsd_diag);
+                        Ok(out)
+                    }
                     Err(dop_err) => Err(combine_dsd_open_errors(&native_err, &dop_err)),
                 };
             }
@@ -743,6 +772,7 @@ fn wrap_asio_dsd(stream: super::asio_host::AsioStream) -> Result<OpenedOutput, E
         let out_rate = stream.sample_rate;
         let device_name = stream.driver_name.clone();
         let io_path = stream.io_path.clone();
+        let dsd_diag = stream.dsd_diag.clone();
         return Ok(OpenedOutput {
             shared: None,
             exclusive_stream: None,
@@ -752,6 +782,7 @@ fn wrap_asio_dsd(stream: super::asio_host::AsioStream) -> Result<OpenedOutput, E
             api: "asio".into(),
             device_name,
             io_path,
+            dsd_diag,
         });
     }
     Err(EngineError::msg(
@@ -766,10 +797,10 @@ fn open_dsd_wasapi_dop(
     playing: Arc<AtomicBool>,
     file_lsb: bool,
 ) -> Result<OpenedOutput, EngineError> {
-    let name = wasapi_name_for_auto_fallback(device_name).or_else(|| wasapi_device_name(device_name));
+    let name =
+        wasapi_name_for_auto_fallback(device_name).or_else(|| wasapi_device_name(device_name));
     let dop_rate = dsd::dop_pcm_rate(dsd_hz);
-    let stream =
-        super::exclusive::start_exclusive_dop(name, dop_rate, 2, ring, playing, file_lsb)?;
+    let stream = super::exclusive::start_exclusive_dop(name, dop_rate, 2, ring, playing, file_lsb)?;
     Ok(OpenedOutput {
         shared: None,
         exclusive_stream: Some(stream),
@@ -779,6 +810,7 @@ fn open_dsd_wasapi_dop(
         api: "wasapi_exclusive".into(),
         device_name: name.unwrap_or("").to_string(),
         io_path: "dop".into(),
+        dsd_diag: format!("wasapi_exclusive_dop rate={dop_rate}"),
     })
 }
 
@@ -1086,6 +1118,20 @@ mod tests {
         assert!(combined.contains("Native DSD"), "{combined}");
         assert!(combined.contains("kan inte sätta DSD-format"), "{combined}");
         assert!(combined.contains("DoP"), "{combined}");
-        assert!(combined.contains("ingen 24-bit DoP-hastighet"), "{combined}");
+        assert!(
+            combined.contains("ingen 24-bit DoP-hastighet"),
+            "{combined}"
+        );
+    }
+
+    #[test]
+    fn dop_success_keeps_native_failure_diagnostics() {
+        let native = EngineError::msg("can=ASIOTrue(1) set=ASE_SUCCESS(0x3f4847a0) switch=Denied");
+        let merged = merge_native_probe_into_dop(&native, "rate_ok=705600 sample_type_post=18");
+        assert!(merged.contains("native_attempt_failed"), "{merged}");
+        assert!(merged.contains("0x3f4847a0"), "{merged}");
+        assert!(merged.contains("dop:"), "{merged}");
+        assert!(merged.contains("705600"), "{merged}");
+        assert!(!merged.contains("native_dsd"), "{merged}");
     }
 }

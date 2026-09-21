@@ -134,6 +134,8 @@ pub struct AsioStream {
     pub driver_name: String,
     /// `pcm`, `native_dsd`, or `dop` — never claim native DSD for DoP.
     pub io_path: String,
+    /// Raw kAsioCanDo/Set/GetIoFormat, rates, and channel sample_type (QA).
+    pub dsd_diag: String,
 }
 
 impl Drop for AsioStream {
@@ -282,9 +284,22 @@ fn uninstall_rt_host() {
 /// `init` is `ASIOBool` (`ASIOTrue` = 1, `ASIOFalse` = 0) — not an error code.
 #[allow(dead_code)] // used by the Windows host path and unit tests
 const ASE_OK: i32 = 0;
+/// `asio.h` `ASE_SUCCESS` — **required** success code for `IASIO::future` / `ASIOFuture`.
+/// Distinct from `ASE_OK`. SDK DSD sample: `if (ASE_SUCCESS != ASIOFuture(kAsioSetIoFormat, …))`.
+#[allow(dead_code)]
+const ASE_SUCCESS: i32 = 0x3f48_47a0;
 /// `asio.h` `ASE_NotPresent` — selector/method not implemented.
 #[allow(dead_code)]
 const ASE_NOT_PRESENT: i32 = -1000;
+/// `asio.h` `ASIOTrue` — some drivers return this from CanDo instead of ASE_SUCCESS.
+#[allow(dead_code)]
+const ASIO_TRUE: i32 = 1;
+/// `kASIOIoFormatInvalid` — driver overwrites the requested type when it refuses.
+#[allow(dead_code)]
+const ASIO_IO_INVALID: i32 = -1;
+/// `kASIODSDFormat`
+#[allow(dead_code)]
+const ASIO_IO_DSD: i32 = 1;
 
 /// Steinberg `IASIO::canSampleRate` / `ASIOCanSampleRate`.
 ///
@@ -309,16 +324,84 @@ enum IoFormatSwitch {
     Denied,
 }
 
-/// Native DSD requires a successful Set. CanDo may be ASE_OK or NotPresent (then Set is the gate).
+/// Steinberg: `ASE_OK` for ordinary IASIO methods; `ASE_SUCCESS` for `future()`.
 #[allow(dead_code)]
-fn classify_io_format_switch(can: i32, set: i32) -> IoFormatSwitch {
-    if set == ASE_OK && (can == ASE_OK || can == ASE_NOT_PRESENT) {
+fn asio_future_succeeded(code: i32) -> bool {
+    code == ASE_OK || code == ASE_SUCCESS
+}
+
+/// Snapshot of kAsioCanDoIoFormat / Set / Get used for gating and QA diagnostics.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
+struct IoFormatProbe {
+    can: i32,
+    set: i32,
+    set_format_type: i32,
+    get: Option<i32>,
+    get_format_type: Option<i32>,
+    requested: i32,
+}
+
+/// Native DSD requires a successful Set (ASE_OK **or** ASE_SUCCESS) that left the
+/// requested type unchanged, or a successful GetIoFormat read-back of that type.
+/// CanDo is not a hard gate: SDK sample only checks Set; some drivers return
+/// ASIOTrue(1) from CanDo. Both NotPresent → extension missing (PCM/DoP may continue).
+#[allow(dead_code)]
+fn classify_io_format_probe(p: &IoFormatProbe) -> IoFormatSwitch {
+    if p.can == ASE_NOT_PRESENT && p.set == ASE_NOT_PRESENT {
+        return IoFormatSwitch::NotImplemented;
+    }
+    let set_format_ok = p.set_format_type == p.requested && p.set_format_type != ASIO_IO_INVALID;
+    let set_applied = asio_future_succeeded(p.set) && set_format_ok;
+    let get_applied = set_format_ok
+        && p.get.map(asio_future_succeeded).unwrap_or(false)
+        && p.get_format_type == Some(p.requested);
+    if set_applied || get_applied {
         IoFormatSwitch::Applied
-    } else if can == ASE_NOT_PRESENT && set == ASE_NOT_PRESENT {
-        IoFormatSwitch::NotImplemented
     } else {
         IoFormatSwitch::Denied
     }
+}
+
+/// Convenience for tests that only vary CanDo/Set (format assumed kept as DSD).
+#[allow(dead_code)]
+fn classify_io_format_switch(can: i32, set: i32) -> IoFormatSwitch {
+    classify_io_format_probe(&IoFormatProbe {
+        can,
+        set,
+        set_format_type: ASIO_IO_DSD,
+        get: None,
+        get_format_type: None,
+        requested: ASIO_IO_DSD,
+    })
+}
+
+#[allow(dead_code)]
+fn format_asio_code(code: i32) -> String {
+    match code {
+        ASE_OK => "ASE_OK(0)".into(),
+        ASE_SUCCESS => "ASE_SUCCESS(0x3f4847a0)".into(),
+        ASE_NOT_PRESENT => "ASE_NotPresent(-1000)".into(),
+        ASIO_TRUE => "ASIOTrue(1)".into(),
+        other => format!("{other}"),
+    }
+}
+
+#[allow(dead_code)]
+fn format_io_format_diag(p: &IoFormatProbe, sw: IoFormatSwitch) -> String {
+    let get = p.get.map(format_asio_code).unwrap_or_else(|| "n/a".into());
+    let get_ty = p
+        .get_format_type
+        .map(|t| t.to_string())
+        .unwrap_or_else(|| "n/a".into());
+    format!(
+        "can={} set={} set_type={} get={} get_type={} switch={sw:?}",
+        format_asio_code(p.can),
+        format_asio_code(p.set),
+        p.set_format_type,
+        get,
+        get_ty
+    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -454,7 +537,13 @@ fn install_session_host(
         RtFillMode::Pcm => {
             let ring = pcm_ring.unwrap_or_else(|| Arc::new(FrameRing::new(channels.max(1))));
             install_rt_host(new_rt_host(
-                ring, playing, stop, buffers, frames, sample_type, channels,
+                ring,
+                playing,
+                stop,
+                buffers,
+                frames,
+                sample_type,
+                channels,
             ));
         }
         _ => {
@@ -923,7 +1012,10 @@ mod windows_impl {
                     ptr::copy_nonoverlapping(v.to_le_bytes().as_ptr(), ptr.add(i * 4), 4);
                 }
             }
-            SampleType::DsdLsb | SampleType::DsdMsb | SampleType::DsdNer8 | SampleType::Other(_) => {
+            SampleType::DsdLsb
+            | SampleType::DsdMsb
+            | SampleType::DsdNer8
+            | SampleType::Other(_) => {
                 for i in 0..frames {
                     ptr::write(ptr.add(i), DSD_MUTE);
                 }
@@ -980,9 +1072,9 @@ mod windows_impl {
     }
 
     const K_ASIO_SET_IO_FORMAT: c_long = 0x2311_1961;
+    const K_ASIO_GET_IO_FORMAT: c_long = 0x2311_1983;
     const K_ASIO_CAN_DO_IO_FORMAT: c_long = 0x2311_2004;
     const ASIO_IO_PCM: i32 = 0;
-    const ASIO_IO_DSD: i32 = 1;
 
     #[repr(C)]
     struct AsioIoFormat {
@@ -1007,7 +1099,13 @@ mod windows_impl {
         },
     }
 
-    type Opened = (u32, u16, String, String);
+    struct Opened {
+        rate: u32,
+        channels: u16,
+        name: String,
+        io_path: String,
+        dsd_diag: String,
+    }
 
     pub fn start(
         driver_name: Option<&str>,
@@ -1084,13 +1182,14 @@ mod windows_impl {
             .map_err(|e| EngineError::msg(format!("ASIO-tråd: {e}")))?;
 
         match rx.recv() {
-            Ok(Ok((rate, ch, name, io_path))) => Ok(AsioStream {
+            Ok(Ok(opened)) => Ok(AsioStream {
                 stop,
                 thread: Some(thread),
-                sample_rate: rate,
-                channels: ch,
-                driver_name: name,
-                io_path,
+                sample_rate: opened.rate,
+                channels: opened.channels,
+                driver_name: opened.name,
+                io_path: opened.io_path,
+                dsd_diag: opened.dsd_diag,
             }),
             Ok(Err(err)) => {
                 stop.store(true, Ordering::Relaxed);
@@ -1105,9 +1204,10 @@ mod windows_impl {
         }
     }
 
-    fn set_io_format(driver: *mut Iasio, vtbl: &IasioVtbl, dsd: bool) -> IoFormatSwitch {
+    fn probe_io_format(driver: *mut Iasio, vtbl: &IasioVtbl, dsd: bool) -> IoFormatProbe {
+        let requested = if dsd { ASIO_IO_DSD } else { ASIO_IO_PCM };
         let mut fmt = AsioIoFormat {
-            format_type: if dsd { ASIO_IO_DSD } else { ASIO_IO_PCM },
+            format_type: requested,
             reserved: [0; 508],
         };
         let can = unsafe {
@@ -1117,7 +1217,7 @@ mod windows_impl {
                 &mut fmt as *mut AsioIoFormat as *mut c_void,
             )
         };
-        fmt.format_type = if dsd { ASIO_IO_DSD } else { ASIO_IO_PCM };
+        fmt.format_type = requested;
         let set = unsafe {
             (vtbl.future)(
                 driver,
@@ -1125,7 +1225,42 @@ mod windows_impl {
                 &mut fmt as *mut AsioIoFormat as *mut c_void,
             )
         };
-        classify_io_format_switch(can, set)
+        let set_format_type = fmt.format_type;
+        // Seed Invalid so a no-op Get cannot look like a confirmation of the request.
+        let mut got = AsioIoFormat {
+            format_type: ASIO_IO_INVALID,
+            reserved: [0; 508],
+        };
+        let get = unsafe {
+            (vtbl.future)(
+                driver,
+                K_ASIO_GET_IO_FORMAT,
+                &mut got as *mut AsioIoFormat as *mut c_void,
+            )
+        };
+        IoFormatProbe {
+            can,
+            set,
+            set_format_type,
+            get: Some(get),
+            get_format_type: Some(got.format_type),
+            requested,
+        }
+    }
+
+    fn read_channel_sample_type(driver: *mut Iasio, vtbl: &IasioVtbl) -> Result<i32, EngineError> {
+        let mut info = ChannelInfo {
+            channel: 0,
+            is_input: 0,
+            is_active: 0,
+            channel_group: 0,
+            sample_type: 0,
+            name: [0; 32],
+        };
+        if unsafe { (vtbl.get_channel_info)(driver, &mut info) } != 0 {
+            return Err(err_of(driver, "getChannelInfo misslyckades."));
+        }
+        Ok(info.sample_type)
     }
 
     fn try_set_rate(
@@ -1244,39 +1379,51 @@ mod windows_impl {
                 ),
             };
 
-        let io_sw = set_io_format(driver, vtbl, want_dsd_io);
+        let io_probe = probe_io_format(driver, vtbl, want_dsd_io);
+        let io_sw = classify_io_format_probe(&io_probe);
+        let mut dsd_diag = format_io_format_diag(&io_probe, io_sw);
         if native_dsd && io_sw != IoFormatSwitch::Applied {
             unsafe { (vtbl.release)(driver) };
             return Err(EngineError::msg(format!(
-                "{display_name} bekräftade inte native DSD (kAsioCanDoIoFormat/kAsioSetIoFormat = {io_sw:?}). Native DSD avbryts — prova DoP. Filen rörs inte."
+                "{display_name} bekräftade inte native DSD ({dsd_diag}). Native DSD avbryts — prova DoP. Filen rörs inte."
             )));
         }
 
         let mut rate_err = String::new();
         let mut rate = 0u32;
         let mut got_rate = false;
-        for cand in rate_candidates {
-            if cand == 0 {
+        let mut rejected_rates: Vec<String> = Vec::new();
+        for cand in &rate_candidates {
+            if *cand == 0 {
                 continue;
             }
-            match try_set_rate(driver, vtbl, display_name, cand) {
+            match try_set_rate(driver, vtbl, display_name, *cand) {
                 Ok(r) => {
                     rate = r;
                     got_rate = true;
+                    dsd_diag.push_str(&format!(" rate_ok={r} (asked {cand})"));
                     break;
                 }
-                Err(e) => rate_err = e.to_string(),
+                Err(e) => {
+                    rejected_rates.push(format!("{cand}:{e}"));
+                    rate_err = e.to_string();
+                }
             }
+        }
+        if !rejected_rates.is_empty() && !got_rate {
+            dsd_diag.push_str(&format!(" rate_fail=[{}]", rejected_rates.join("; ")));
+        } else if !rejected_rates.is_empty() {
+            dsd_diag.push_str(&format!(" rate_skipped=[{}]", rejected_rates.join("; ")));
         }
         if !got_rate {
             unsafe { (vtbl.release)(driver) };
             return Err(EngineError::msg(if native_dsd {
                 format!(
-                    "{display_name} tog inte native DSD-hastighet (bit/byte). {rate_err} Ingen tyst PCM-omkodning."
+                    "{display_name} tog inte native DSD-hastighet (bit/byte). {dsd_diag} {rate_err} Ingen tyst PCM-omkodning."
                 )
             } else if dop {
                 format!(
-                    "{display_name} tog inte DoP-hastighet ({}/16 Hz). {rate_err} Delat WASAPI används inte för DSD.",
+                    "{display_name} tog inte DoP-hastighet ({}/16 Hz). {dsd_diag} {rate_err} Delat WASAPI används inte för DSD.",
                     match &kind {
                         StreamKind::Dop { dsd_hz, .. } => *dsd_hz,
                         _ => 0,
@@ -1289,37 +1436,24 @@ mod windows_impl {
             }));
         }
 
-        let mut info = ChannelInfo {
-            channel: 0,
-            is_input: 0,
-            is_active: 0,
-            channel_group: 0,
-            sample_type: 0,
-            name: [0; 32],
-        };
-        if unsafe { (vtbl.get_channel_info)(driver, &mut info) } != 0 {
-            let err = err_of(driver, "getChannelInfo misslyckades.");
-            unsafe { (vtbl.release)(driver) };
-            return Err(err);
-        }
-        let sample_type = SampleType::from_asio(info.sample_type);
-        if native_dsd {
-            if !sample_type.is_dsd() {
+        let sample_type_pre = match read_channel_sample_type(driver, vtbl) {
+            Ok(v) => v,
+            Err(err) => {
                 unsafe { (vtbl.release)(driver) };
-                return Err(EngineError::msg(format!(
-                    "{display_name} växlar inte till DSD-sampletyp (fick {}). Native DSD avbryts — prova DoP om DAC:n stöder det. Filen rörs inte.",
-                    info.sample_type
-                )));
+                return Err(EngineError::msg(format!("{err} {dsd_diag}")));
             }
-        } else if dop {
+        };
+        dsd_diag.push_str(&format!(" sample_type_pre={sample_type_pre}"));
+        let sample_type = SampleType::from_asio(sample_type_pre);
+        // Native DSD: some drivers keep PCM sample_type until createBuffers — do not abort yet.
+        if dop {
             if !sample_type.dop_ok() {
                 unsafe { (vtbl.release)(driver) };
                 return Err(EngineError::msg(format!(
-                    "{display_name} DoP kräver 24/32-bit PCM (inte f32/i16/DSD). Sampletyp {}. Filen rörs inte.",
-                    info.sample_type
+                    "{display_name} DoP kräver 24/32-bit PCM (inte f32/i16/DSD). Sampletyp {sample_type_pre}. {dsd_diag} Filen rörs inte.",
                 )));
             }
-        } else {
+        } else if !native_dsd {
             if sample_type.is_dsd() {
                 unsafe { (vtbl.release)(driver) };
                 return Err(EngineError::msg(
@@ -1327,13 +1461,9 @@ mod windows_impl {
                 ));
             }
             if !sample_type.is_pcm() {
-                let code = match sample_type {
-                    SampleType::Other(v) => v,
-                    _ => info.sample_type,
-                };
                 unsafe { (vtbl.release)(driver) };
                 return Err(EngineError::msg(format!(
-                    "ASIO-kanalen har okänd sampletyp ({code}). Native-motorn vägrar tyst uppspelning — använd PCM/FLAC eller en drivrutin med i16/i24/i32/f32. Filen rörs inte."
+                    "ASIO-kanalen har okänd sampletyp ({sample_type_pre}). Native-motorn vägrar tyst uppspelning — använd PCM/FLAC eller en drivrutin med i16/i24/i32/f32. Filen rörs inte."
                 )));
             }
         }
@@ -1378,7 +1508,25 @@ mod windows_impl {
                 &format!("{display_name} createBuffers misslyckades."),
             );
             unsafe { (vtbl.release)(driver) };
-            return Err(err);
+            return Err(EngineError::msg(format!("{err} {dsd_diag}")));
+        }
+
+        let sample_type_post = match read_channel_sample_type(driver, vtbl) {
+            Ok(v) => v,
+            Err(err) => {
+                let _ = unsafe { (vtbl.dispose_buffers)(driver) };
+                unsafe { (vtbl.release)(driver) };
+                return Err(EngineError::msg(format!("{err} {dsd_diag}")));
+            }
+        };
+        dsd_diag.push_str(&format!(" sample_type_post={sample_type_post}"));
+        let sample_type = SampleType::from_asio(sample_type_post);
+        if native_dsd && !sample_type.is_dsd() {
+            let _ = unsafe { (vtbl.dispose_buffers)(driver) };
+            unsafe { (vtbl.release)(driver) };
+            return Err(EngineError::msg(format!(
+                "{display_name} växlar inte till DSD-sampletyp efter createBuffers (fick {sample_type_post}). {dsd_diag} Native DSD avbryts — prova DoP om DAC:n stöder det. Filen rörs inte."
+            )));
         }
 
         let buffers: Vec<[*mut u8; 2]> = buf_infos
@@ -1429,12 +1577,13 @@ mod windows_impl {
             return Err(err);
         }
 
-        let _ = tx.send(Ok((
+        let _ = tx.send(Ok(Opened {
             rate,
-            channels as u16,
-            display_name.to_string(),
-            io_path.to_string(),
-        )));
+            channels: channels as u16,
+            name: display_name.to_string(),
+            io_path: io_path.to_string(),
+            dsd_diag: dsd_diag.clone(),
+        }));
 
         while !stop.load(Ordering::Relaxed) {
             if ASIO_RESET.swap(false, Ordering::AcqRel) {
@@ -1515,9 +1664,116 @@ mod tests {
             IoFormatSwitch::NotImplemented
         );
         assert_eq!(classify_io_format_switch(0, -1), IoFormatSwitch::Denied);
-        assert_eq!(classify_io_format_switch(1, 0), IoFormatSwitch::Denied);
+        // Set ASE_OK is the gate; CanDo=ASIOTrue(1) must not deny (FiiO-style).
+        assert_eq!(classify_io_format_switch(1, 0), IoFormatSwitch::Applied);
         assert_ne!(IoFormatSwitch::NotImplemented, IoFormatSwitch::Applied);
         assert_ne!(IoFormatSwitch::Denied, IoFormatSwitch::Applied);
+    }
+
+    #[test]
+    fn classify_io_format_accepts_ase_success_future_codes() {
+        assert!(asio_future_succeeded(ASE_SUCCESS));
+        assert!(asio_future_succeeded(ASE_OK));
+        assert!(!asio_future_succeeded(ASIO_TRUE));
+        assert!(!asio_future_succeeded(ASE_NOT_PRESENT));
+        // Steinberg asio.h: ASIOFuture DSD switch succeeds with ASE_SUCCESS, not ASE_OK.
+        assert_eq!(
+            classify_io_format_switch(ASE_SUCCESS, ASE_SUCCESS),
+            IoFormatSwitch::Applied
+        );
+        assert_eq!(
+            classify_io_format_switch(ASE_OK, ASE_SUCCESS),
+            IoFormatSwitch::Applied
+        );
+        assert_eq!(
+            classify_io_format_switch(ASE_SUCCESS, ASE_OK),
+            IoFormatSwitch::Applied
+        );
+        assert_eq!(
+            classify_io_format_switch(ASIO_TRUE, ASE_SUCCESS),
+            IoFormatSwitch::Applied
+        );
+        assert_eq!(
+            classify_io_format_switch(ASIO_TRUE, ASE_OK),
+            IoFormatSwitch::Applied
+        );
+        // Set not implemented and CanDo not implemented: PCM-only driver.
+        assert_eq!(
+            classify_io_format_switch(ASE_NOT_PRESENT, ASE_NOT_PRESENT),
+            IoFormatSwitch::NotImplemented
+        );
+        // Hard refuse.
+        assert_eq!(
+            classify_io_format_switch(ASE_OK, ASE_NOT_PRESENT),
+            IoFormatSwitch::Denied
+        );
+    }
+
+    #[test]
+    fn classify_io_format_invalidated_type_is_denied() {
+        let denied = IoFormatProbe {
+            can: ASE_OK,
+            set: ASE_OK,
+            set_format_type: ASIO_IO_INVALID,
+            get: Some(ASE_OK),
+            get_format_type: Some(ASIO_IO_DSD),
+            requested: ASIO_IO_DSD,
+        };
+        assert_eq!(classify_io_format_probe(&denied), IoFormatSwitch::Denied);
+        let kept_but_set_failed = IoFormatProbe {
+            can: ASE_OK,
+            set: -998, // ASE_InvalidParameter-ish
+            set_format_type: ASIO_IO_DSD,
+            get: None,
+            get_format_type: None,
+            requested: ASIO_IO_DSD,
+        };
+        assert_eq!(
+            classify_io_format_probe(&kept_but_set_failed),
+            IoFormatSwitch::Denied
+        );
+    }
+
+    #[test]
+    fn classify_io_format_get_readback_can_confirm() {
+        // Set return odd but format kept and GetIoFormat reports DSD with ASE_SUCCESS.
+        let p = IoFormatProbe {
+            can: ASIO_TRUE,
+            set: ASIO_TRUE,
+            set_format_type: ASIO_IO_DSD,
+            get: Some(ASE_SUCCESS),
+            get_format_type: Some(ASIO_IO_DSD),
+            requested: ASIO_IO_DSD,
+        };
+        assert_eq!(classify_io_format_probe(&p), IoFormatSwitch::Applied);
+        // Get no-op leaving Invalid must not confirm.
+        let stub_get = IoFormatProbe {
+            can: ASE_OK,
+            set: -1,
+            set_format_type: ASIO_IO_DSD,
+            get: Some(ASE_OK),
+            get_format_type: Some(ASIO_IO_INVALID),
+            requested: ASIO_IO_DSD,
+        };
+        assert_eq!(classify_io_format_probe(&stub_get), IoFormatSwitch::Denied);
+    }
+
+    #[test]
+    fn io_format_diag_includes_raw_codes() {
+        let p = IoFormatProbe {
+            can: ASE_SUCCESS,
+            set: ASE_SUCCESS,
+            set_format_type: ASIO_IO_DSD,
+            get: Some(ASE_OK),
+            get_format_type: Some(ASIO_IO_DSD),
+            requested: ASIO_IO_DSD,
+        };
+        let s = format_io_format_diag(&p, IoFormatSwitch::Applied);
+        assert!(s.contains("ASE_SUCCESS(0x3f4847a0)"), "{s}");
+        assert!(s.contains("get_type=1"), "{s}");
+        assert!(s.contains("switch=Applied"), "{s}");
+        assert_eq!(format_asio_code(1), "ASIOTrue(1)");
+        assert_eq!(format_asio_code(-1000), "ASE_NotPresent(-1000)");
     }
 
     #[test]
@@ -1527,8 +1783,14 @@ mod tests {
             CallbackBusyAction::ReentryMute
         );
         assert_eq!(callback_busy_action(false, false), CallbackBusyAction::Fill);
-        assert_eq!(callback_busy_action(true, true), CallbackBusyAction::StopMute);
-        assert_eq!(callback_busy_action(true, false), CallbackBusyAction::StopMute);
+        assert_eq!(
+            callback_busy_action(true, true),
+            CallbackBusyAction::StopMute
+        );
+        assert_eq!(
+            callback_busy_action(true, false),
+            CallbackBusyAction::StopMute
+        );
     }
 
     #[test]
