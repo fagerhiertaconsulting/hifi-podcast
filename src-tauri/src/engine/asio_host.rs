@@ -13,7 +13,7 @@ use serde::Serialize;
 use std::cell::UnsafeCell;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct AsioDriverInfo {
@@ -69,6 +69,16 @@ impl SampleType {
             self,
             Self::F32Le | Self::I16Le | Self::I24Le | Self::I32Le | Self::I32Le24
         )
+    }
+
+    fn bytes_per_sample(self) -> Option<usize> {
+        match self {
+            Self::I16Le => Some(2),
+            Self::I24Le => Some(3),
+            Self::F32Le | Self::I32Le | Self::I32Le24 => Some(4),
+            Self::DsdLsb | Self::DsdMsb | Self::DsdNer8 => Some(1),
+            Self::Other(_) => None,
+        }
     }
 }
 
@@ -244,6 +254,8 @@ struct RtHost {
     /// True when file bit order must be reversed for this output (DSF→DoP/MSB, etc.).
     dsd_reverse: bool,
     reentries: AtomicU64,
+    /// Max bytes we may write per channel half-buffer (never past ASIO allocation).
+    buffer_bytes: usize,
 }
 
 unsafe impl Send for RtHost {}
@@ -387,8 +399,8 @@ fn format_asio_code(code: i32) -> String {
     }
 }
 
-/// Pick a legal ASIO `createBuffers` length. DSD mode can report a nonsense
-/// `preferredSize` (even the bit-rate); writing that many bytes is an AV.
+/// Pick a legal ASIO `createBuffers` length.
+/// `granularity == -1` means **only power-of-two sizes** (FiiO PCM QA: gran-1 / pref 64).
 #[allow(dead_code)]
 fn pick_buffer_frames(min: i32, max: i32, preferred: i32, gran: i32) -> usize {
     const CAP: i32 = 65_536;
@@ -418,14 +430,77 @@ fn pick_buffer_frames(min: i32, max: i32, preferred: i32, gran: i32) -> usize {
                 n = gran;
             }
         }
+    } else if gran < 0 {
+        if !is_pow2_i32(n) {
+            n = floor_pow2_i32(n);
+        }
+        if min > 0 && n < min {
+            n = if is_pow2_i32(min) {
+                min
+            } else {
+                let up = ceil_pow2_i32(min);
+                if max > 0 && up > max {
+                    min
+                } else {
+                    up
+                }
+            };
+        }
+        if max > 0 && n > max {
+            n = floor_pow2_i32(max);
+        }
     }
     if n > CAP && !(min > CAP) {
         n = if max > 0 { max.min(CAP) } else { CAP };
+        if gran < 0 && !is_pow2_i32(n) {
+            n = floor_pow2_i32(n);
+        }
         if min > 0 && n < min {
             n = min;
         }
     }
     n.max(1) as usize
+}
+
+#[allow(dead_code)]
+fn is_pow2_i32(n: i32) -> bool {
+    n > 0 && (n & (n - 1)) == 0
+}
+
+#[allow(dead_code)]
+fn floor_pow2_i32(n: i32) -> i32 {
+    if n <= 0 {
+        return 1;
+    }
+    if is_pow2_i32(n) {
+        return n;
+    }
+    let z = (n as u32).leading_zeros();
+    if z >= 31 {
+        1
+    } else {
+        1 << (31 - z)
+    }
+}
+
+#[allow(dead_code)]
+fn ceil_pow2_i32(n: i32) -> i32 {
+    if n <= 1 {
+        return 1;
+    }
+    if is_pow2_i32(n) {
+        return n;
+    }
+    let f = floor_pow2_i32(n);
+    f.saturating_mul(2).max(1)
+}
+
+/// Native DSD must not `createBuffers` until the channel type is already a DSD
+/// type. createBuffers in DSD IoFormat with a PCM sample_type is what armed
+/// the FiiO ACCESS_VIOLATION (in-proc driver + first bufferSwitch).
+#[allow(dead_code)]
+fn native_dsd_may_create_buffers(sample_type: SampleType) -> bool {
+    sample_type.is_dsd()
 }
 
 #[allow(dead_code)]
@@ -467,6 +542,27 @@ fn callback_busy_action(stopped: bool, already_busy: bool) -> CallbackBusyAction
 }
 
 static ASIO_REENTRIES: AtomicU64 = AtomicU64::new(0);
+
+pub type AsioDiagHook = Arc<dyn Fn(&str) + Send + Sync>;
+static DIAG_HOOK: Mutex<Option<AsioDiagHook>> = Mutex::new(None);
+
+/// UI/QA hook invoked from the ASIO thread **before** `start()` so a later AV
+/// can still have shown `dsd_diag`.
+pub fn set_asio_diag_hook(hook: Option<AsioDiagHook>) {
+    if let Ok(mut g) = DIAG_HOOK.lock() {
+        *g = hook;
+    }
+}
+
+#[allow(dead_code)]
+fn publish_dsd_diag(s: &str) {
+    eprintln!("hifi-asio: {s}");
+    if let Ok(g) = DIAG_HOOK.lock() {
+        if let Some(h) = g.as_ref() {
+            h(s);
+        }
+    }
+}
 
 /// Nested `bufferSwitch` count (not underruns). Reset when an ASIO stream is installed.
 #[allow(dead_code)]
@@ -512,6 +608,15 @@ fn new_rt_host_ex(
         RtFillMode::Dop => n.saturating_mul(2),
         _ => n,
     };
+    let bps = match fill {
+        RtFillMode::NativeDsd { .. } => 1,
+        RtFillMode::Dop => match sample_type {
+            SampleType::I24Le => 3,
+            _ => 4,
+        },
+        RtFillMode::Pcm => sample_type.bytes_per_sample().unwrap_or(4),
+    };
+    let buffer_bytes = frames.saturating_mul(bps).max(1);
     Box::new(RtHost {
         pcm_ring,
         dsd_ring,
@@ -531,6 +636,7 @@ fn new_rt_host_ex(
             _ => false,
         },
         reentries: AtomicU64::new(0),
+        buffer_bytes,
     })
 }
 
@@ -752,8 +858,11 @@ mod windows_impl {
         })
     }
 
-    static POST_OUTPUT: AtomicBool = AtomicBool::new(false);
-    static DRIVER_FOR_READY: AtomicPtr<Iasio> = AtomicPtr::new(ptr::null_mut());
+    static SUPPORT_TIME_INFO: AtomicBool = AtomicBool::new(true);
+
+    unsafe extern "C" {
+        fn hifi_asio_seh_invoke(cb: unsafe extern "C" fn(i32), index: i32) -> i32;
+    }
 
     unsafe extern "C" fn buffer_switch(index: c_long, _direct: c_long) {
         fill_buffers(index);
@@ -779,7 +888,13 @@ mod windows_impl {
                 ASIO_RESET.store(true, Ordering::Release);
                 1
             }
-            7 => 1,
+            7 => {
+                if SUPPORT_TIME_INFO.load(Ordering::Relaxed) {
+                    1
+                } else {
+                    0
+                }
+            }
             _ => 0,
         }
     }
@@ -793,19 +908,16 @@ mod windows_impl {
         params
     }
 
+    unsafe extern "C" fn fill_buffers_c(index: i32) {
+        fill_buffers_inner(index as c_long);
+    }
+
     fn fill_buffers(index: c_long) {
         RT_IN_FLIGHT.fetch_add(1, Ordering::AcqRel);
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            fill_buffers_inner(index);
-        }));
-        if POST_OUTPUT.load(Ordering::Relaxed) {
-            let d = DRIVER_FOR_READY.load(Ordering::Acquire);
-            if !d.is_null() {
-                unsafe {
-                    let vtbl = &*(*d).vtbl;
-                    let _ = (vtbl.output_ready)(d);
-                }
-            }
+        // ACCESS_VIOLATION is SEH, not a Rust panic — catch_unwind cannot save us.
+        let code = unsafe { hifi_asio_seh_invoke(fill_buffers_c, index as i32) };
+        if code != 0 {
+            eprintln!("hifi-asio: bufferSwitch SEH exception {code:#x} (process kept alive)");
         }
         RT_IN_FLIGHT.fetch_sub(1, Ordering::Release);
     }
@@ -858,7 +970,7 @@ mod windows_impl {
                     continue;
                 }
                 unsafe {
-                    write_channel(p, st.sample_type, frames, |_| 0.0);
+                    write_channel(p, st.sample_type, frames, st.buffer_bytes, |_| 0.0);
                 }
             }
             return;
@@ -875,7 +987,9 @@ mod windows_impl {
                 continue;
             }
             unsafe {
-                write_channel(p, st.sample_type, frames, |i| dest[i * ch + c]);
+                write_channel(p, st.sample_type, frames, st.buffer_bytes, |i| {
+                    dest[i * ch + c]
+                });
             }
         }
     }
@@ -897,13 +1011,14 @@ mod windows_impl {
         } else {
             dest.fill(DSD_MUTE);
         }
+        let nbytes = frames.min(st.buffer_bytes);
         for c in 0..ch {
             let p = st.buffers.get(c).map(|b| b[idx]).unwrap_or(ptr::null_mut());
             if p.is_null() {
                 continue;
             }
             unsafe {
-                for i in 0..frames {
+                for i in 0..nbytes {
                     let mut b = dest[i * ch + c];
                     if reverse {
                         b = dsd::reverse_bits_byte(b);
@@ -934,7 +1049,9 @@ mod windows_impl {
         }
         let reverse = st.dsd_reverse;
         let mut marker_a = st.dop_marker_a.load(Ordering::Relaxed);
-        for i in 0..frames {
+        let bps = st.sample_type.bytes_per_sample().unwrap_or(4).max(1);
+        let max_frames = (st.buffer_bytes / bps).min(frames);
+        for i in 0..max_frames {
             let marker = if marker_a {
                 dsd::DOP_MARKER_A
             } else {
@@ -968,23 +1085,26 @@ mod windows_impl {
                     if p.is_null() {
                         continue;
                     }
-                    write_channel(p, st.sample_type, frames, |_| 0.0);
+                    write_channel(p, st.sample_type, frames, st.buffer_bytes, |_| 0.0);
                 }
             }
             RtFillMode::NativeDsd { .. } => {
+                let nbytes = frames.min(st.buffer_bytes);
                 for c in 0..ch {
                     let p = st.buffers.get(c).map(|b| b[idx]).unwrap_or(ptr::null_mut());
                     if p.is_null() {
                         continue;
                     }
-                    for i in 0..frames {
+                    for i in 0..nbytes {
                         ptr::write(p.add(i), DSD_MUTE);
                     }
                 }
             }
             RtFillMode::Dop => {
                 let mut marker_a = st.dop_marker_a.load(Ordering::Relaxed);
-                for i in 0..frames {
+                let bps = st.sample_type.bytes_per_sample().unwrap_or(4).max(1);
+                let max_frames = (st.buffer_bytes / bps).min(frames);
+                for i in 0..max_frames {
                     let marker = if marker_a {
                         dsd::DOP_MARKER_A
                     } else {
@@ -1036,8 +1156,13 @@ mod windows_impl {
         ptr: *mut u8,
         ty: SampleType,
         frames: usize,
+        max_bytes: usize,
         sample: impl Fn(usize) -> f32,
     ) {
+        let Some(bps) = ty.bytes_per_sample() else {
+            return;
+        };
+        let frames = frames.min(max_bytes / bps.max(1));
         match ty {
             SampleType::F32Le => {
                 for i in 0..frames {
@@ -1335,8 +1460,7 @@ mod windows_impl {
         created_buffers: bool,
         restore_pcm: bool,
     ) {
-        POST_OUTPUT.store(false, Ordering::Release);
-        DRIVER_FOR_READY.store(ptr::null_mut(), Ordering::Release);
+        SUPPORT_TIME_INFO.store(true, Ordering::Release);
         let _ = unsafe { (vtbl.stop)(driver) };
         uninstall_rt_host();
         if created_buffers {
@@ -1470,6 +1594,7 @@ mod windows_impl {
         let io_probe = probe_io_format(driver, vtbl, want_dsd_io);
         let io_sw = classify_io_format_probe(&io_probe);
         let mut dsd_diag = format_io_format_diag(&io_probe, io_sw);
+        publish_dsd_diag(&dsd_diag);
         // Native always calls Set(DSD); restore PCM before release if we abort.
         let restore_pcm = native_dsd;
         if native_dsd && io_sw != IoFormatSwitch::Applied {
@@ -1534,8 +1659,17 @@ mod windows_impl {
             }
         };
         dsd_diag.push_str(&format!(" sample_type_pre={sample_type_pre}"));
+        publish_dsd_diag(&dsd_diag);
         let sample_type = SampleType::from_asio(sample_type_pre);
         // Native DSD: some drivers keep PCM sample_type until createBuffers — do not abort yet.
+        if native_dsd && !native_dsd_may_create_buffers(sample_type) {
+            dsd_diag.push_str(" refuse_createBuffers=sample_type_not_dsd_pre");
+            publish_dsd_diag(&dsd_diag);
+            teardown_asio(driver, vtbl, false, true);
+            return Err(EngineError::msg(format!(
+                "{display_name} native DSD: sampletyp {sample_type_pre} före createBuffers (inte DSD 32/33/40). Hoppar createBuffers/start (FiiO AV). {dsd_diag} Native DSD avbryts — prova DoP. Filen rörs inte."
+            )));
+        }
         if dop {
             if !sample_type.dop_ok() {
                 teardown_asio(driver, vtbl, false, false);
@@ -1573,6 +1707,9 @@ mod windows_impl {
         dsd_diag.push_str(&format!(
             " buf=min{min}/max{max}/pref{preferred}/gran{gran}/used{frames}"
         ));
+        publish_dsd_diag(&dsd_diag);
+
+        SUPPORT_TIME_INFO.store(!native_dsd, Ordering::Release);
 
         let mut callbacks = make_callbacks();
         let mut buf_infos: Vec<BufferInfo> = (0..channels)
@@ -1607,40 +1744,6 @@ mod windows_impl {
             )));
         }
 
-        let buffers: Vec<[*mut u8; 2]> = buf_infos
-            .iter()
-            .map(|b| [b.buffers[0] as *mut u8, b.buffers[1] as *mut u8])
-            .collect();
-        // DSD IoFormat: fill as native bytes even if sample_type has not flipped yet.
-        let fill_pre = if native_dsd {
-            RtFillMode::NativeDsd {
-                reverse: file_lsb != SampleType::from_asio(sample_type_pre).dsd_lsb_first(),
-            }
-        } else if dop {
-            RtFillMode::Dop
-        } else {
-            RtFillMode::Pcm
-        };
-        let reverse_pre = if native_dsd {
-            file_lsb != SampleType::from_asio(sample_type_pre).dsd_lsb_first()
-        } else if dop {
-            file_lsb
-        } else {
-            false
-        };
-        install_session_host(
-            pcm_ring.clone(),
-            dsd_ring.clone(),
-            playing.clone(),
-            stop.clone(),
-            buffers,
-            frames,
-            SampleType::from_asio(sample_type_pre),
-            channels,
-            fill_pre,
-            reverse_pre,
-        );
-
         let sample_type_post = match read_channel_sample_type(driver, vtbl) {
             Ok(v) => v,
             Err(err) => {
@@ -1649,6 +1752,7 @@ mod windows_impl {
             }
         };
         dsd_diag.push_str(&format!(" sample_type_post={sample_type_post}"));
+        publish_dsd_diag(&dsd_diag);
         let sample_type = SampleType::from_asio(sample_type_post);
         if native_dsd && !sample_type.is_dsd() {
             teardown_asio(driver, vtbl, true, true);
@@ -1697,11 +1801,8 @@ mod windows_impl {
             reverse,
         );
 
-        POST_OUTPUT.store(
-            unsafe { (vtbl.output_ready)(driver) } == ASE_OK,
-            Ordering::Release,
-        );
-        DRIVER_FOR_READY.store(driver, Ordering::Release);
+        dsd_diag.push_str(" pre_start_ok");
+        publish_dsd_diag(&dsd_diag);
 
         if unsafe { (vtbl.start)(driver) } != 0 {
             let err = err_of(driver, &format!("{display_name} start() misslyckades."));
@@ -1719,8 +1820,6 @@ mod windows_impl {
 
         while !stop.load(Ordering::Relaxed) {
             if ASIO_RESET.swap(false, Ordering::AcqRel) {
-                POST_OUTPUT.store(false, Ordering::Release);
-                DRIVER_FOR_READY.store(ptr::null_mut(), Ordering::Release);
                 let _ = unsafe { (vtbl.stop)(driver) };
                 uninstall_rt_host();
                 let _ = unsafe { (vtbl.dispose_buffers)(driver) };
@@ -1760,11 +1859,6 @@ mod windows_impl {
                     fill,
                     reverse,
                 );
-                POST_OUTPUT.store(
-                    unsafe { (vtbl.output_ready)(driver) } == ASE_OK,
-                    Ordering::Release,
-                );
-                DRIVER_FOR_READY.store(driver, Ordering::Release);
                 if unsafe { (vtbl.start)(driver) } != 0 {
                     let err = err_of(
                         driver,
@@ -1920,6 +2014,22 @@ mod tests {
         assert_eq!(pick_buffer_frames(64, 2048, 11_289_600, 0), 2048);
         assert_eq!(pick_buffer_frames(0, 0, 11_289_600, 0), 65_536);
         assert_eq!(pick_buffer_frames(64, 2048, 100, 64), 64);
+        // FiiO PCM QA: gran-1 = power-of-two sizes only.
+        assert_eq!(pick_buffer_frames(8, 2048, 64, -1), 64);
+        assert_eq!(pick_buffer_frames(8, 2048, 100, -1), 64);
+        assert_eq!(pick_buffer_frames(8, 2048, 63, -1), 32);
+    }
+
+    #[test]
+    fn native_dsd_does_not_create_buffers_on_pcm_sample_type() {
+        assert!(native_dsd_may_create_buffers(SampleType::DsdLsb));
+        assert!(native_dsd_may_create_buffers(SampleType::DsdMsb));
+        assert!(native_dsd_may_create_buffers(SampleType::DsdNer8));
+        assert!(!native_dsd_may_create_buffers(SampleType::I32Le));
+        assert!(!native_dsd_may_create_buffers(SampleType::F32Le));
+        assert!(!native_dsd_may_create_buffers(SampleType::I24Le));
+        assert_eq!(SampleType::I32Le.bytes_per_sample(), Some(4));
+        assert_eq!(SampleType::DsdLsb.bytes_per_sample(), Some(1));
     }
 
     #[test]

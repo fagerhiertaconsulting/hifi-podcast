@@ -1986,6 +1986,7 @@ name = "hifi-podcast"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "cc",
  "chrono",
  "cpal",
  "futures-util",

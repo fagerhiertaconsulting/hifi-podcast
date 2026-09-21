@@ -355,6 +355,26 @@ impl Handle {
         let ring = Arc::new(ByteRing::new(2));
         let hwnd = *self.hwnd.lock().expect("engine hwnd");
 
+        struct DiagHookGuard;
+        impl Drop for DiagHookGuard {
+            fn drop(&mut self) {
+                super::asio_host::set_asio_diag_hook(None);
+            }
+        }
+        let _diag_guard = DiagHookGuard;
+        {
+            let status = self.status.clone();
+            let app = self.app.clone();
+            super::asio_host::set_asio_diag_hook(Some(Arc::new(move |diag: &str| {
+                if let Ok(mut st) = status.lock() {
+                    st.dsd_diag = diag.to_string();
+                    st.format = "dsd".into();
+                    st.loaded = true;
+                }
+                emit_tick(&app, &status);
+            })));
+        }
+
         let opened = open_dsd_output(
             &output_api,
             &device_name,
