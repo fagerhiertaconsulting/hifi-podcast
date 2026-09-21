@@ -313,7 +313,8 @@ export default function App() {
                       engineSettings.output_api === "auto"
                     ? "ASIO/WASAPI"
                     : engineSettings.output_api;
-            statusLine = `Spelar native (${apiLabel}): ${next.episode.title}`;
+            const diag = st.dsd_diag ? ` [${st.dsd_diag}]` : "";
+            statusLine = `Spelar native (${apiLabel}): ${next.episode.title}${diag}`;
           } catch (nativeErr) {
             const isDsd = /\.(dsf|dff|dsd)$/i.test(filePath);
             if (isDsd) {
@@ -395,7 +396,7 @@ export default function App() {
         const re =
           st.callback_reentries > 0 ? ` · re-entry ${st.callback_reentries} (inte underrun)` : "";
         setEngineQa(
-          `${st.dsd_rate} · ${st.output_path} · ${st.output_path_sv} · underrun ${st.underruns}${re}`,
+          `${st.dsd_rate} · ${st.output_path} · ${st.output_path_sv} · ${st.dsd_diag} · underrun ${st.underruns}${re}`,
         );
       } else if (st.loaded) {
         const re =
