@@ -5,8 +5,9 @@ use crate::error::AppResult;
 use crate::feeds;
 use crate::models::{
     AdSegment, AppPaths, AsrStatus, Bookmark, Chapter, Download, Episode, ImportOutcome, InboxItem,
-    JobRow, LibraryStats, PlaybackState, Podcast, PodcastSettings, QueueItem, SubscribeOutcome,
-    Transcript, TranscriptSegment, UpnpSettings, UpnpStatus,
+    JobRow, LibraryStats, MusicAlbum, MusicImportOutcome, MusicPlaybackState, MusicPlayerPayload,
+    MusicTrack, PlaybackState, Podcast, PodcastSettings, QueueItem, SubscribeOutcome, Transcript,
+    TranscriptSegment, UpnpSettings, UpnpStatus,
 };
 use crate::AppState;
 use tauri::State;
@@ -690,6 +691,51 @@ pub fn engine_stop(state: State<AppState>) -> AppResult<()> {
 #[tauri::command]
 pub fn engine_status(state: State<AppState>) -> crate::engine::EngineStatus {
     state.engine.status()
+}
+
+#[tauri::command]
+pub fn list_music_albums(state: State<AppState>) -> AppResult<Vec<MusicAlbum>> {
+    crate::music::list_albums(&conn(&state))
+}
+
+#[tauri::command]
+pub fn list_music_tracks(
+    state: State<AppState>,
+    album_id: Option<i64>,
+) -> AppResult<Vec<MusicTrack>> {
+    crate::music::list_tracks(&conn(&state), album_id)
+}
+
+#[tauri::command]
+pub fn import_music_folder(state: State<AppState>, path: String) -> AppResult<MusicImportOutcome> {
+    let folder = std::path::PathBuf::from(path);
+    crate::music::import_folder(&conn(&state), &state.media_root, &folder)
+}
+
+#[tauri::command]
+pub fn music_track_for_player(state: State<AppState>, track_id: i64) -> AppResult<MusicPlayerPayload> {
+    let conn = conn(&state);
+    let track = db::get_music_track(&conn, track_id)?;
+    if track.file_path.trim().is_empty() {
+        return Err(crate::error::AppError::msg("Spåret saknar lokal fil."));
+    }
+    let album = db::get_music_album(&conn, track.album_id)?;
+    let playback = db::get_music_playback(&conn, track_id)?;
+    Ok(MusicPlayerPayload {
+        track,
+        album,
+        playback,
+    })
+}
+
+#[tauri::command]
+pub fn save_music_playback(state: State<AppState>, playback: MusicPlaybackState) -> AppResult<()> {
+    db::save_music_playback(&conn(&state), &playback)
+}
+
+#[tauri::command]
+pub fn next_music_track(state: State<AppState>, track_id: i64) -> AppResult<Option<MusicTrack>> {
+    db::next_music_track(&conn(&state), track_id)
 }
 
 #[cfg(test)]

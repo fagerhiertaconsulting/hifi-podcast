@@ -1,7 +1,8 @@
 use crate::error::AppResult;
 use crate::models::{
     AdSegment, Bookmark, Chapter, Download, Episode, InboxItem, JobRow, LibraryStats,
-    PlaybackState, Podcast, PodcastSettings, QueueItem, Transcript, TranscriptSegment,
+    MusicAlbum, MusicPlaybackState, MusicTrack, PlaybackState, Podcast, PodcastSettings, QueueItem,
+    Transcript, TranscriptSegment,
 };
 use rusqlite::{params, Connection, OptionalExtension};
 
@@ -79,9 +80,61 @@ pub fn initialize(conn: &Connection) -> AppResult<()> {
         );
         "#,
     )?;
-    migrate_v1(conn)?;
+        migrate_v1(conn)?;
     migrate_episode_guid_scope(conn)?;
     migrate_upnp(conn)?;
+    migrate_music(conn)?;
+    Ok(())
+}
+
+fn migrate_music(conn: &Connection) -> AppResult<()> {
+    conn.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS music_folder (
+          id INTEGER PRIMARY KEY,
+          path TEXT NOT NULL UNIQUE,
+          last_imported_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS music_album (
+          id INTEGER PRIMARY KEY,
+          title TEXT NOT NULL,
+          artist TEXT NOT NULL,
+          key TEXT NOT NULL UNIQUE,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS music_track (
+          id INTEGER PRIMARY KEY,
+          album_id INTEGER NOT NULL REFERENCES music_album(id) ON DELETE CASCADE,
+          source_path TEXT NOT NULL UNIQUE,
+          file_path TEXT NOT NULL DEFAULT '',
+          title TEXT NOT NULL,
+          artist TEXT NOT NULL,
+          album TEXT NOT NULL,
+          track_no INTEGER,
+          duration_ms INTEGER,
+          format TEXT NOT NULL,
+          codec TEXT,
+          sample_rate INTEGER,
+          bits_per_sample INTEGER,
+          channels INTEGER,
+          bytes INTEGER,
+          created_at TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_music_track_album
+          ON music_track(album_id, track_no, title);
+
+        CREATE TABLE IF NOT EXISTS music_playback_state (
+          track_id INTEGER PRIMARY KEY REFERENCES music_track(id) ON DELETE CASCADE,
+          position_ms INTEGER NOT NULL DEFAULT 0,
+          completed INTEGER NOT NULL DEFAULT 0,
+          last_played_at TEXT
+        );
+        "#,
+    )?;
     Ok(())
 }
 
@@ -1281,6 +1334,315 @@ pub fn download_is_done(conn: &Connection, episode_id: i64) -> bool {
     matches!(get_download(conn, episode_id), Ok(Some(d)) if d.state == "done")
 }
 
+fn music_album_key(title: &str, artist: &str) -> String {
+    format!(
+        "{}|||{}",
+        artist.trim().to_lowercase(),
+        title.trim().to_lowercase()
+    )
+}
+
+pub fn upsert_music_folder(conn: &Connection, path: &str) -> AppResult<i64> {
+    let ts = now_rfc3339();
+    conn.execute(
+        r#"
+        INSERT INTO music_folder (path, last_imported_at) VALUES (?1, ?2)
+        ON CONFLICT(path) DO UPDATE SET last_imported_at = excluded.last_imported_at
+        "#,
+        params![path, ts],
+    )?;
+    let id: i64 = conn.query_row(
+        "SELECT id FROM music_folder WHERE path = ?1",
+        params![path],
+        |r| r.get(0),
+    )?;
+    Ok(id)
+}
+
+pub fn upsert_music_album(conn: &Connection, title: &str, artist: &str) -> AppResult<i64> {
+    let ts = now_rfc3339();
+    let key = music_album_key(title, artist);
+    conn.execute(
+        r#"
+        INSERT INTO music_album (title, artist, key, created_at, updated_at)
+        VALUES (?1, ?2, ?3, ?4, ?4)
+        ON CONFLICT(key) DO UPDATE SET
+          title = excluded.title,
+          artist = excluded.artist,
+          updated_at = excluded.updated_at
+        "#,
+        params![title, artist, key, ts],
+    )?;
+    let id: i64 = conn.query_row(
+        "SELECT id FROM music_album WHERE key = ?1",
+        params![key],
+        |r| r.get(0),
+    )?;
+    Ok(id)
+}
+
+pub fn insert_music_track_placeholder(
+    conn: &Connection,
+    album_id: i64,
+    source_path: &str,
+    title: &str,
+    artist: &str,
+    album: &str,
+    track_no: Option<i64>,
+    duration_ms: Option<i64>,
+    format: &str,
+    codec: Option<&str>,
+    sample_rate: Option<i64>,
+    bits_per_sample: Option<i64>,
+    channels: Option<i64>,
+) -> AppResult<i64> {
+    let ts = now_rfc3339();
+    conn.execute(
+        r#"
+        INSERT INTO music_track (
+          album_id, source_path, file_path, title, artist, album, track_no,
+          duration_ms, format, codec, sample_rate, bits_per_sample, channels, created_at
+        ) VALUES (?1, ?2, '', ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+        "#,
+        params![
+            album_id,
+            source_path,
+            title,
+            artist,
+            album,
+            track_no,
+            duration_ms,
+            format,
+            codec,
+            sample_rate,
+            bits_per_sample,
+            channels,
+            ts
+        ],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+pub fn set_music_track_file(
+    conn: &Connection,
+    track_id: i64,
+    file_path: &str,
+    bytes: Option<i64>,
+) -> AppResult<()> {
+    conn.execute(
+        "UPDATE music_track SET file_path = ?1, bytes = ?2 WHERE id = ?3",
+        params![file_path, bytes, track_id],
+    )?;
+    Ok(())
+}
+
+pub fn delete_music_track(conn: &Connection, track_id: i64) -> AppResult<()> {
+    conn.execute("DELETE FROM music_track WHERE id = ?1", params![track_id])?;
+    Ok(())
+}
+
+pub fn music_track_by_source(conn: &Connection, source_path: &str) -> AppResult<Option<MusicTrack>> {
+    let mut stmt = conn.prepare(
+        r#"
+        SELECT id, album_id, source_path, file_path, title, artist, album, track_no,
+               duration_ms, format, codec, sample_rate, bits_per_sample, channels, bytes, created_at
+        FROM music_track WHERE source_path = ?1
+        "#,
+    )?;
+    let row = stmt
+        .query_row(params![source_path], map_music_track)
+        .optional()?;
+    Ok(row)
+}
+
+pub fn get_music_track(conn: &Connection, id: i64) -> AppResult<MusicTrack> {
+    conn.query_row(
+        r#"
+        SELECT id, album_id, source_path, file_path, title, artist, album, track_no,
+               duration_ms, format, codec, sample_rate, bits_per_sample, channels, bytes, created_at
+        FROM music_track WHERE id = ?1
+        "#,
+        params![id],
+        map_music_track,
+    )
+    .map_err(|_| crate::error::AppError::msg("Spåret finns inte."))
+}
+
+pub fn get_music_album(conn: &Connection, id: i64) -> AppResult<MusicAlbum> {
+    conn.query_row(
+        r#"
+        SELECT a.id, a.title, a.artist,
+               (SELECT COUNT(*) FROM music_track t WHERE t.album_id = a.id),
+               a.created_at, a.updated_at
+        FROM music_album a WHERE a.id = ?1
+        "#,
+        params![id],
+        map_music_album,
+    )
+    .map_err(|_| crate::error::AppError::msg("Albumet finns inte."))
+}
+
+pub fn list_music_albums(conn: &Connection) -> AppResult<Vec<MusicAlbum>> {
+    let mut stmt = conn.prepare(
+        r#"
+        SELECT a.id, a.title, a.artist,
+               (SELECT COUNT(*) FROM music_track t WHERE t.album_id = a.id),
+               a.created_at, a.updated_at
+        FROM music_album a
+        ORDER BY a.artist COLLATE NOCASE, a.title COLLATE NOCASE
+        "#,
+    )?;
+    let rows = stmt.query_map([], map_music_album)?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+pub fn list_music_tracks(conn: &Connection, album_id: Option<i64>) -> AppResult<Vec<MusicTrack>> {
+    if let Some(album_id) = album_id {
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT id, album_id, source_path, file_path, title, artist, album, track_no,
+                   duration_ms, format, codec, sample_rate, bits_per_sample, channels, bytes, created_at
+            FROM music_track WHERE album_id = ?1
+            ORDER BY track_no IS NULL, track_no, title COLLATE NOCASE, id
+            "#,
+        )?;
+        let rows = stmt.query_map(params![album_id], map_music_track)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        return Ok(out);
+    }
+    let mut stmt = conn.prepare(
+        r#"
+        SELECT id, album_id, source_path, file_path, title, artist, album, track_no,
+               duration_ms, format, codec, sample_rate, bits_per_sample, channels, bytes, created_at
+        FROM music_track
+        ORDER BY artist COLLATE NOCASE, album COLLATE NOCASE, track_no IS NULL, track_no, title COLLATE NOCASE, id
+        "#,
+    )?;
+    let rows = stmt.query_map([], map_music_track)?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+pub fn count_music_albums(conn: &Connection) -> AppResult<i64> {
+    Ok(conn.query_row("SELECT COUNT(*) FROM music_album", [], |r| r.get(0))?)
+}
+
+pub fn count_music_tracks(conn: &Connection) -> AppResult<i64> {
+    Ok(conn.query_row("SELECT COUNT(*) FROM music_track", [], |r| r.get(0))?)
+}
+
+pub fn save_music_playback(conn: &Connection, state: &MusicPlaybackState) -> AppResult<()> {
+    conn.execute(
+        r#"
+        INSERT INTO music_playback_state (track_id, position_ms, completed, last_played_at)
+        VALUES (?1, ?2, ?3, ?4)
+        ON CONFLICT(track_id) DO UPDATE SET
+          position_ms = excluded.position_ms,
+          completed = excluded.completed,
+          last_played_at = excluded.last_played_at
+        "#,
+        params![
+            state.track_id,
+            state.position_ms,
+            state.completed as i64,
+            state.last_played_at
+        ],
+    )?;
+    Ok(())
+}
+
+pub fn get_music_playback(conn: &Connection, track_id: i64) -> AppResult<Option<MusicPlaybackState>> {
+    let mut stmt = conn.prepare(
+        r#"
+        SELECT track_id, position_ms, completed, last_played_at
+        FROM music_playback_state WHERE track_id = ?1
+        "#,
+    )?;
+    let row = stmt
+        .query_row(params![track_id], |row| {
+            Ok(MusicPlaybackState {
+                track_id: row.get(0)?,
+                position_ms: row.get(1)?,
+                completed: row.get::<_, i64>(2)? != 0,
+                last_played_at: row.get(3)?,
+            })
+        })
+        .optional()?;
+    Ok(row)
+}
+
+pub fn next_music_track(conn: &Connection, track_id: i64) -> AppResult<Option<MusicTrack>> {
+    let current = get_music_track(conn, track_id)?;
+    let mut stmt = conn.prepare(
+        r#"
+        SELECT id, album_id, source_path, file_path, title, artist, album, track_no,
+               duration_ms, format, codec, sample_rate, bits_per_sample, channels, bytes, created_at
+        FROM music_track
+        WHERE album_id = ?1 AND (
+          (COALESCE(track_no, 999999) > COALESCE(?2, 999999))
+          OR (
+            COALESCE(track_no, 999999) = COALESCE(?2, 999999)
+            AND (
+              title COLLATE NOCASE > ?3 COLLATE NOCASE
+              OR (title COLLATE NOCASE = ?3 COLLATE NOCASE AND id > ?4)
+            )
+          )
+        )
+        ORDER BY track_no IS NULL, track_no, title COLLATE NOCASE, id
+        LIMIT 1
+        "#,
+    )?;
+    let row = stmt
+        .query_row(
+            params![current.album_id, current.track_no, current.title, current.id],
+            map_music_track,
+        )
+        .optional()?;
+    Ok(row)
+}
+
+fn map_music_album(row: &rusqlite::Row<'_>) -> rusqlite::Result<MusicAlbum> {
+    Ok(MusicAlbum {
+        id: row.get(0)?,
+        title: row.get(1)?,
+        artist: row.get(2)?,
+        track_count: row.get(3)?,
+        created_at: row.get(4)?,
+        updated_at: row.get(5)?,
+    })
+}
+
+fn map_music_track(row: &rusqlite::Row<'_>) -> rusqlite::Result<MusicTrack> {
+    Ok(MusicTrack {
+        id: row.get(0)?,
+        album_id: row.get(1)?,
+        source_path: row.get(2)?,
+        file_path: row.get(3)?,
+        title: row.get(4)?,
+        artist: row.get(5)?,
+        album: row.get(6)?,
+        track_no: row.get(7)?,
+        duration_ms: row.get(8)?,
+        format: row.get(9)?,
+        codec: row.get(10)?,
+        sample_rate: row.get(11)?,
+        bits_per_sample: row.get(12)?,
+        channels: row.get(13)?,
+        bytes: row.get(14)?,
+        created_at: row.get(15)?,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1613,5 +1975,71 @@ mod tests {
         assert_eq!(s.device_name, "FiiO ASIO Driver");
         assert!(s.exclusive);
         assert!(s.skip_silence);
+    }
+
+    #[test]
+    fn music_tables_are_separate_from_episodes() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize(&conn).unwrap();
+        let album = upsert_music_album(&conn, "Kind of Blue", "Miles Davis").unwrap();
+        let tid = insert_music_track_placeholder(
+            &conn,
+            album,
+            "/tmp/source.flac",
+            "So What",
+            "Miles Davis",
+            "Kind of Blue",
+            Some(1),
+            Some(5000),
+            "flac",
+            Some("FLAC"),
+            Some(96000),
+            Some(24),
+            Some(2),
+        )
+        .unwrap();
+        set_music_track_file(&conn, tid, "/media/music/1/1.flac", Some(12)).unwrap();
+        let albums = list_music_albums(&conn).unwrap();
+        assert_eq!(albums.len(), 1);
+        assert_eq!(albums[0].track_count, 1);
+        let eps: i64 = conn
+            .query_row("SELECT COUNT(*) FROM episode", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(eps, 0);
+        let next = next_music_track(&conn, tid).unwrap();
+        assert!(next.is_none());
+    }
+
+    #[test]
+    fn next_music_track_uses_nocase_title_order() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize(&conn).unwrap();
+        let album = upsert_music_album(&conn, "Untit", "A").unwrap();
+        let mut ids = Vec::new();
+        for title in ["alpha", "Beta", "gamma"] {
+            ids.push(
+                insert_music_track_placeholder(
+                    &conn,
+                    album,
+                    &format!("/tmp/{title}.flac"),
+                    title,
+                    "A",
+                    "Untit",
+                    None,
+                    Some(1000),
+                    "flac",
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap(),
+            );
+        }
+        // NOCASE order: alpha, Beta, gamma. Binary `title > 'alpha'` would skip Beta.
+        let nxt = next_music_track(&conn, ids[0]).unwrap().unwrap();
+        assert_eq!(nxt.title, "Beta");
+        let nxt = next_music_track(&conn, nxt.id).unwrap().unwrap();
+        assert_eq!(nxt.title, "gamma");
     }
 }

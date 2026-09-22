@@ -26,6 +26,11 @@ import type {
   EngineStatus,
   OutputDeviceInfo,
   ProbeInfo,
+  MusicAlbum,
+  MusicTrack,
+  MusicPlayerPayload,
+  MusicPlaybackState,
+  MusicImportOutcome,
 } from "./types";
 
 export const api = {
@@ -123,4 +128,15 @@ export const api = {
     invoke<void>("engine_set_skip_silence", { enabled }),
   engineStop: () => invoke<void>("engine_stop"),
   engineStatus: () => invoke<EngineStatus>("engine_status"),
+  listMusicAlbums: () => invoke<MusicAlbum[]>("list_music_albums"),
+  listMusicTracks: (albumId?: number | null) =>
+    invoke<MusicTrack[]>("list_music_tracks", { albumId: albumId ?? null }),
+  importMusicFolder: (path: string) =>
+    invoke<MusicImportOutcome>("import_music_folder", { path }),
+  musicTrackForPlayer: (trackId: number) =>
+    invoke<MusicPlayerPayload>("music_track_for_player", { trackId }),
+  saveMusicPlayback: (playback: MusicPlaybackState) =>
+    invoke<void>("save_music_playback", { playback }),
+  nextMusicTrack: (trackId: number) =>
+    invoke<MusicTrack | null>("next_music_track", { trackId }),
 };

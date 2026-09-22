@@ -66,6 +66,14 @@ pub fn music_dir(media_root: &Path) -> PathBuf {
     media_root.join("music")
 }
 
+pub fn music_track_file(media_root: &Path, album_id: i64, track_id: i64, ext: &str) -> PathBuf {
+    let ext = ext.trim().trim_start_matches('.').to_ascii_lowercase();
+    let ext = if ext.is_empty() { "bin".into() } else { ext };
+    music_dir(media_root)
+        .join(album_id.to_string())
+        .join(format!("{track_id}.{ext}"))
+}
+
 pub fn media_file_path(media_root: &Path, podcast_id: i64, episode_id: i64, url: &str) -> PathBuf {
     let ext = extension_from_url(url);
     episode_file(media_root, podcast_id, episode_id, &ext)
@@ -239,5 +247,12 @@ mod tests {
         assert!(moved.is_empty());
         assert_eq!(std::fs::read(old.join("8.mp3")).unwrap(), b"OLD");
         assert_eq!(std::fs::read(dest.join("8.mp3")).unwrap(), b"KEEP");
+    }
+
+    #[test]
+    fn music_files_live_under_media_music() {
+        let root = PathBuf::from("/data/media");
+        let dest = music_track_file(&root, 7, 3, "dsf");
+        assert_eq!(dest, root.join("music").join("7").join("3.dsf"));
     }
 }

@@ -27,7 +27,7 @@ HIFI podcast          (id 0)
  ├─ Podcasts          (id podcasts)
  │   └─ <show>        (id show:<podcast_id>)
  │       └─ <episode> (id ep:<episode_id>, originalfil)
- └─ Music             (id music, tom stub — ingen musikimplementation)
+ └─ Music             (id music, tom stub — musik spelas i appen, inte via UPnP i MVP)
 ```
 
 Titlar, duration och MIME kommer från **SQLite** (`episode.title`, `episode.duration_ms`, `download.mime`), inte från filnamn. `res`-URL: `http://<lan-ip>:<port>/media/episode/<id>`.
@@ -43,7 +43,7 @@ Layout efter PR #3 (med migrering från MVP):
 ```
 media/
   podcasts/<podcast_id>/<episode_id>.<ext>
-  music/          (tom katalog, för senare)
+  music/<album_id>/<track_id>.<ext>   (appens musikbibliotek; UPnP Music-stub tom)
 ```
 
 Befintliga `media/<podcast_id>/…` flyttas till `media/podcasts/<podcast_id>/…` och `download.file_path` uppdateras **bara om filen faktiskt flyttades**. Om målet redan finns lämnas källfil och DB-sökväg orörda.

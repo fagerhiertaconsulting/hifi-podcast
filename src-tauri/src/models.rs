@@ -253,3 +253,58 @@ pub struct ImportOutcome {
     pub podcasts: Vec<Podcast>,
     pub warnings: Vec<String>,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MusicAlbum {
+    pub id: i64,
+    pub title: String,
+    pub artist: String,
+    pub track_count: i64,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MusicTrack {
+    pub id: i64,
+    pub album_id: i64,
+    pub source_path: String,
+    pub file_path: String,
+    pub title: String,
+    pub artist: String,
+    pub album: String,
+    pub track_no: Option<i64>,
+    pub duration_ms: Option<i64>,
+    pub format: String,
+    pub codec: Option<String>,
+    pub sample_rate: Option<i64>,
+    pub bits_per_sample: Option<i64>,
+    pub channels: Option<i64>,
+    pub bytes: Option<i64>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MusicPlaybackState {
+    pub track_id: i64,
+    pub position_ms: i64,
+    pub completed: bool,
+    pub last_played_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MusicPlayerPayload {
+    pub track: MusicTrack,
+    pub album: MusicAlbum,
+    pub playback: Option<MusicPlaybackState>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MusicImportOutcome {
+    pub imported_tracks: i64,
+    pub skipped_tracks: i64,
+    pub failed_tracks: i64,
+    pub album_count: i64,
+    pub track_count: i64,
+    pub errors: Vec<String>,
+}

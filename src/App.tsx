@@ -25,6 +25,9 @@ import type {
   InboxItem,
   JobRow,
   LibraryStats,
+  MusicAlbum,
+  MusicPlayerPayload,
+  MusicTrack,
   PlayerPayload,
   Podcast,
   QueueItem,
@@ -78,6 +81,11 @@ export default function App() {
   const [queue, setQueue] = useState<QueueItem[]>([]);
   const [paths, setPaths] = useState<AppPaths | null>(null);
   const [payload, setPayload] = useState<PlayerPayload | null>(null);
+  const [musicPayload, setMusicPayload] = useState<MusicPlayerPayload | null>(null);
+  const [musicAlbums, setMusicAlbums] = useState<MusicAlbum[]>([]);
+  const [musicTracks, setMusicTracks] = useState<MusicTrack[]>([]);
+  const [selectedAlbumId, setSelectedAlbumId] = useState<number | null>(null);
+  const [musicFilter, setMusicFilter] = useState("");
   const [playing, setPlaying] = useState(false);
   playingRef.current = playing;
   const [position, setPosition] = useState(0);
@@ -99,8 +107,11 @@ export default function App() {
     [podcasts, selectedId],
   );
 
+  const musicPlayingRef = useRef(false);
+  musicPlayingRef.current = musicPayload != null;
   const skipSilenceActive =
-    globalSkipSilence || Boolean(payload?.podcast.skip_silence);
+    musicPayload == null &&
+    (globalSkipSilence || Boolean(payload?.podcast.skip_silence));
   const skipEnabledRef = useRef(skipSilenceActive);
   skipEnabledRef.current = skipSilenceActive;
   const skipModeRef = useRef(skipSilenceActive);
@@ -133,13 +144,31 @@ export default function App() {
     }
   }, [selectedId]);
 
+  const refreshMusic = useCallback(async () => {
+    const albums = await api.listMusicAlbums();
+    setMusicAlbums(albums);
+    setSelectedAlbumId((current) => {
+      if (current != null && albums.some((a) => a.id === current)) return current;
+      return albums.length ? albums[0].id : null;
+    });
+  }, []);
+
   const loadEpisodes = useCallback(async (podcastId: number) => {
     setEpisodes(await api.listEpisodes(podcastId));
   }, []);
 
   useEffect(() => {
     void refreshLibrary().catch((err) => setStatus(String(err)));
-  }, [refreshLibrary]);
+    void refreshMusic().catch((err) => setStatus(String(err)));
+  }, [refreshLibrary, refreshMusic]);
+
+  useEffect(() => {
+    if (selectedAlbumId == null) {
+      setMusicTracks([]);
+      return;
+    }
+    void api.listMusicTracks(selectedAlbumId).then(setMusicTracks).catch((err) => setStatus(String(err)));
+  }, [selectedAlbumId]);
 
   useEffect(() => {
     if (selectedId != null) {
@@ -218,6 +247,14 @@ export default function App() {
   );
 
   useEffect(() => {
+    if (musicPayload) {
+      skipEnabledRef.current = false;
+      skipModeRef.current = false;
+      if (nativeRef.current) {
+        void api.engineSetSkipSilence(false).catch((err) => setStatus(String(err)));
+      }
+      return;
+    }
     if (skipModeRef.current === skipSilenceActive) return;
     skipModeRef.current = skipSilenceActive;
     const audio = audioRef.current;
@@ -237,22 +274,33 @@ export default function App() {
         }
       })
       .catch((err) => setStatus(String(err)));
-  }, [skipSilenceActive, loadPlaybackSource, speed]);
+  }, [skipSilenceActive, musicPayload, loadPlaybackSource, speed]);
 
   const persistNow = useCallback(async () => {
-    const episode = payload?.episode;
-    if (!episode) return;
     const audio = audioRef.current;
     const posSec = nativeRef.current ? positionRef.current : (audio?.currentTime ?? positionRef.current);
     const dur = duration;
+    const completed = dur > 0 && posSec >= dur - 2;
+    const last = new Date().toISOString();
+    if (musicPayload) {
+      await api.saveMusicPlayback({
+        track_id: musicPayload.track.id,
+        position_ms: Math.floor(posSec * 1000),
+        completed,
+        last_played_at: last,
+      });
+      return;
+    }
+    const episode = payload?.episode;
+    if (!episode) return;
     await api.savePlaybackState({
       episode_id: episode.id,
       position_ms: Math.floor(posSec * 1000),
       speed,
-      completed: dur > 0 && posSec >= dur - 2,
-      last_played_at: new Date().toISOString(),
+      completed,
+      last_played_at: last,
     });
-  }, [payload, speed, duration]);
+  }, [payload, musicPayload, speed, duration]);
 
   const playEpisode = useCallback(
     async (episodeId: number, enqueue = true) => {
@@ -287,6 +335,7 @@ export default function App() {
         filePathRef.current = filePath;
         const useNative = (engineSettings?.backend ?? "native") !== "webview";
         nativeRef.current = useNative;
+        setMusicPayload(null);
         let statusLine: string;
         if (useNative) {
           audio.pause();
@@ -371,11 +420,125 @@ export default function App() {
     [loadEpisodes, loadPlaybackSource, refreshLibrary, selectedId, globalSkipSilence, engineSettings],
   );
 
+  const playMusicTrack = useCallback(
+    async (trackId: number) => {
+      setBusy(true);
+      try {
+        const next = await api.musicTrackForPlayer(trackId);
+        const filePath = next.track.file_path;
+        if (!filePath) {
+          throw new Error("Ingen lokal fil att spela.");
+        }
+        const audio = audioRef.current;
+        if (!audio) return;
+        const startSec =
+          next.playback && !next.playback.completed ? next.playback.position_ms / 1000 : 0;
+        setSpeed(1);
+        setPayload(null);
+        adsRef.current = [];
+        setMusicPayload(next);
+        void api.smtcNowPlaying(next.track.title, next.track.artist, true);
+        skipModeRef.current = false;
+        filePathRef.current = filePath;
+        const useNative = (engineSettings?.backend ?? "native") !== "webview";
+        nativeRef.current = useNative;
+        let statusLine: string;
+        if (useNative) {
+          audio.pause();
+          audio.removeAttribute("src");
+          audio.load();
+          try {
+            const st = await api.engineOpen({
+              path: filePath,
+              speed: 1,
+              skipSilence: false,
+              outputApi: engineSettings?.output_api,
+              deviceName: engineSettings?.device_name,
+            });
+            const startMs = Math.max(0, startSec) * 1000;
+            await api.engineSeek(Math.floor(startMs));
+            await api.enginePlay();
+            setDuration((st.duration_ms || 0) / 1000);
+            setPosition(startSec);
+            positionRef.current = startSec;
+            const apiLabel =
+              st.output_path === "native_dsd"
+                ? `native DSD ${st.dsd_rate} / ${st.device_name}`
+                : st.output_path === "dop"
+                  ? `DoP ${st.dsd_rate} (inte native DSD) / ${st.output_api}`
+                  : engineSettings?.output_api === "asio" ||
+                      !engineSettings?.output_api ||
+                      engineSettings.output_api === "auto"
+                    ? "ASIO/WASAPI"
+                    : engineSettings.output_api;
+            const diag = st.dsd_diag ? ` [${st.dsd_diag}]` : "";
+            statusLine = `Musik native (${apiLabel}): ${next.track.title}${diag}`;
+            setEngineStatus(st);
+            setOutputIsWebview(false);
+          } catch (nativeErr) {
+            const isDsd = /\.(dsf|dff|dsd)$/i.test(filePath);
+            if (isDsd) {
+              nativeRef.current = true;
+              await api.engineStop();
+              setPlaying(false);
+              setEngineStatus(null);
+              setEngineQa("");
+              setOutputIsWebview(false);
+              setStatus(
+                `DSD kunde inte spelas: ${String(nativeErr)}. Ingen WebView2-fallback (skulle bli tystnad).`,
+              );
+              return;
+            }
+            nativeRef.current = false;
+            await api.engineStop();
+            setOutputIsWebview(true);
+            setEngineStatus(await probeFileQuality(filePath));
+            await loadPlaybackSource(audio, filePath, false, 1);
+            audio.currentTime = Math.max(0, startSec);
+            await audio.play();
+            setDuration(Number.isFinite(audio.duration) ? audio.duration : 0);
+            setPosition(startSec);
+            positionRef.current = startSec;
+            statusLine = `Native utgång misslyckades (${String(nativeErr)}). Spelar via WebView2: ${next.track.title}`;
+          }
+        } else {
+          await api.engineStop();
+          setOutputIsWebview(true);
+          setEngineStatus(await probeFileQuality(filePath));
+          await loadPlaybackSource(audio, filePath, false, 1);
+          audio.currentTime = Math.max(0, startSec);
+          await audio.play();
+          statusLine = `Spelar (WebView2): ${next.track.title}`;
+        }
+        setPlaying(true);
+        setStatus(statusLine);
+        if (selectedAlbumId !== next.album.id) {
+          setSelectedAlbumId(next.album.id);
+        }
+      } catch (err) {
+        setStatus(String(err));
+      } finally {
+        setBusy(false);
+      }
+    },
+    [engineSettings, loadPlaybackSource, selectedAlbumId],
+  );
+
   const onEnded = useCallback(async () => {
     await persistNow();
     if (sleepMode === "episode") {
       setSleepMode("off");
-      setStatus("Sovtimer: avsnittet är slut.");
+      setStatus("Sovtimer: spåret är slut.");
+      return;
+    }
+    if (musicPayload) {
+      const next = await api.nextMusicTrack(musicPayload.track.id);
+      if (next) {
+        await playMusicTrack(next.id);
+      } else {
+        setPlaying(false);
+        setStatus("Albumet är slut.");
+      }
       return;
     }
     const currentId = payload?.episode.id;
@@ -386,7 +549,7 @@ export default function App() {
       setPlaying(false);
       setStatus("Kön är tom.");
     }
-  }, [persistNow, playEpisode, payload, queue, sleepMode]);
+  }, [persistNow, playEpisode, playMusicTrack, payload, musicPayload, queue, sleepMode]);
 
   const playEpisodeRef = useRef(playEpisode);
   playEpisodeRef.current = playEpisode;
@@ -529,6 +692,9 @@ export default function App() {
         <nav>
           <button className={view === "library" ? "active" : ""} onClick={() => setView("library")}>
             Bibliotek
+          </button>
+          <button className={view === "music" ? "active" : ""} onClick={() => setView("music")}>
+            Musik
           </button>
           <button className={view === "inbox" ? "active" : ""} onClick={() => setView("inbox")}>
             Inkorg ({inbox.length})
@@ -691,6 +857,47 @@ export default function App() {
           />
         )}
 
+        {view === "music" && (
+          <MusicView
+            albums={musicAlbums}
+            tracks={musicTracks}
+            selectedAlbumId={selectedAlbumId}
+            filter={musicFilter}
+            setFilter={setMusicFilter}
+            busy={busy}
+            onSelectAlbum={setSelectedAlbumId}
+            onPlay={(id) => void playMusicTrack(id)}
+            onImport={async () => {
+              const path = await open({
+                directory: true,
+                multiple: false,
+                title: "Välj mapp med FLAC/DSD",
+              });
+              if (!path || Array.isArray(path)) return;
+              setBusy(true);
+              try {
+                const result = await api.importMusicFolder(path);
+                await refreshMusic();
+                if (result.failed_tracks > 0) {
+                  const detail = result.errors.slice(0, 3).join(" ");
+                  setStatus(
+                    `Import misslyckades: ${result.failed_tracks} fil(er). ${result.imported_tracks} importerade, ${result.skipped_tracks} hoppades över. ${detail}`,
+                  );
+                  return;
+                }
+                setStatus(
+                  `Importerade ${result.imported_tracks} spår (${result.skipped_tracks} hoppades över). ${result.album_count} album, ${result.track_count} i biblioteket.`,
+                );
+              } catch (err) {
+                await refreshMusic().catch(() => undefined);
+                setStatus(String(err));
+              } finally {
+                setBusy(false);
+              }
+            }}
+          />
+        )}
+
         {view === "inbox" && (
           <InboxView
             items={inbox}
@@ -739,7 +946,9 @@ export default function App() {
             globalSkipSilence={globalSkipSilence}
             setGlobalSkipSilence={(v) => {
               setGlobalSkipSilence(v);
-              if (nativeRef.current) void api.engineSetSkipSilence(v);
+              if (nativeRef.current && !musicPlayingRef.current) {
+                void api.engineSetSkipSilence(v);
+              }
             }}
             engineSettings={engineSettings}
             onEngineSettings={setEngineSettings}
@@ -877,14 +1086,22 @@ export default function App() {
             void persistNow();
             if (payload) {
               void api.smtcNowPlaying(payload.episode.title, payload.podcast.title, false);
+            } else if (musicPayload) {
+              void api.smtcNowPlaying(musicPayload.track.title, musicPayload.track.artist, false);
             }
           }}
           onEnded={() => void onEnded()}
           onLoadedMetadata={(e) => setDuration(e.currentTarget.duration || 0)}
         />
         <div className="now">
-          <strong>{payload?.episode.title ?? "Inget avsnitt"}</strong>
-          <span>{payload?.podcast.title ?? "Välj ett avsnitt att spela"}</span>
+          <strong>
+            {musicPayload?.track.title ?? payload?.episode.title ?? "Inget spår"}
+          </strong>
+          <span>
+            {musicPayload
+              ? `${musicPayload.track.artist} · ${musicPayload.album.title}`
+              : (payload?.podcast.title ?? "Välj ett avsnitt eller ett musikspår")}
+          </span>
         </div>
         <div className="transport">
           <button onClick={() => skipSeconds(-30)} title="Bakåt 30 s">
@@ -895,7 +1112,7 @@ export default function App() {
           </button>
           <button
             className="play"
-            disabled={!payload}
+            disabled={!payload && !musicPayload}
             onClick={() => {
               if (nativeRef.current) {
                 if (playing) void api.enginePause();
@@ -997,7 +1214,11 @@ export default function App() {
         <QualityStrip status={engineStatus} webview={outputIsWebview} />
         <div className="status">
           {status}
-          {nativeRef.current && payload ? " · Native" : payload ? " · WebView2" : ""}
+          {nativeRef.current && (payload || musicPayload)
+            ? " · Native"
+            : payload || musicPayload
+              ? " · WebView2"
+              : ""}
           {engineQa ? ` · ${engineQa}` : ""}
         </div>
       </footer>
@@ -1348,6 +1569,115 @@ function Library(props: {
   );
 }
 
+function formatDurationMs(ms: number | null) {
+  if (ms == null || ms <= 0) return "";
+  return formatTime(ms / 1000);
+}
+
+function MusicView(props: {
+  albums: MusicAlbum[];
+  tracks: MusicTrack[];
+  selectedAlbumId: number | null;
+  filter: string;
+  setFilter: (v: string) => void;
+  busy: boolean;
+  onSelectAlbum: (id: number) => void;
+  onPlay: (id: number) => void;
+  onImport: () => void;
+}) {
+  const selected = props.albums.find((a) => a.id === props.selectedAlbumId) ?? null;
+  const q = props.filter.trim().toLowerCase();
+  const visible = props.tracks.filter((t) => {
+    if (!q) return true;
+    return (
+      t.title.toLowerCase().includes(q) ||
+      t.artist.toLowerCase().includes(q) ||
+      t.album.toLowerCase().includes(q) ||
+      t.format.toLowerCase().includes(q)
+    );
+  });
+  return (
+    <section className="library">
+      <header className="toolbar">
+        <h1 className="toolbar-title">Musik</h1>
+        <button className="primary" disabled={props.busy} onClick={props.onImport}>
+          Importera mapp…
+        </button>
+      </header>
+      <p className="empty music-lead">
+        Eget bibliotek, skilt från podcasts. Importera mappar med FLAC/DSD (t.ex. under
+        Downloads). Originalfiler kopieras till media/music utan omkodning och spelas i
+        samma hi-fi-motor (ASIO/FiiO, WASAPI, native DSD). SACD-ISO rippning ingår inte.
+      </p>
+      <div className="toolbar">
+        <input
+          placeholder="Filtrera spår"
+          value={props.filter}
+          onChange={(e) => props.setFilter(e.target.value)}
+        />
+      </div>
+      <div className="split">
+        <ul className="podcast-list">
+          {props.albums.length === 0 && (
+            <li className="empty">Inga album ännu. Importera en mapp.</li>
+          )}
+          {props.albums.map((album) => (
+            <li key={album.id}>
+              <button
+                className={selected?.id === album.id ? "active" : ""}
+                onClick={() => props.onSelectAlbum(album.id)}
+              >
+                <strong>{album.title}</strong>
+                <span>
+                  {album.artist} · {album.track_count} spår
+                </span>
+              </button>
+            </li>
+          ))}
+        </ul>
+        <div className="detail">
+          {selected ? (
+            <>
+              <div className="podcast-head">
+                <div>
+                  <h1>{selected.title}</h1>
+                  <p>{selected.artist}</p>
+                </div>
+              </div>
+              <ul className="episodes">
+                {visible.map((track) => (
+                  <li key={track.id}>
+                    <div>
+                      <strong>
+                        {track.track_no != null ? `${track.track_no}. ` : ""}
+                        {track.title}
+                      </strong>
+                      <span>
+                        {track.artist}
+                        {track.format ? ` · ${track.format.toUpperCase()}` : ""}
+                        {track.sample_rate ? ` · ${track.sample_rate} Hz` : ""}
+                        {track.bits_per_sample ? ` / ${track.bits_per_sample}-bit` : ""}
+                        {track.duration_ms ? ` · ${formatDurationMs(track.duration_ms)}` : ""}
+                      </span>
+                    </div>
+                    <div className="ep-actions">
+                      <button className="primary" onClick={() => props.onPlay(track.id)}>
+                        Spela
+                      </button>
+                    </div>
+                  </li>
+                ))}
+              </ul>
+            </>
+          ) : (
+            <p className="empty">Importera en mapp för att bygga musikbiblioteket.</p>
+          )}
+        </div>
+      </div>
+    </section>
+  );
+}
+
 function QueueView(props: {
   queue: QueueItem[];
   onPlay: (episodeId: number) => void;
@@ -1654,7 +1984,8 @@ function UpnpSettingsPanel(props: { onStatus: (s: string) => void }) {
       <p>
         HIFI podcast är servern. Onkyo TX-RZ50 (eller annan renderer) bläddrar i{" "}
         <strong>Podcasts</strong> och spelar originalfilerna. Mappen{" "}
-        <strong>Music</strong> är tom tills musikmodulen finns. Ingen omkodning.
+        <strong>Music</strong> i UPnP är fortfarande en tom stub i den här versionen
+        — musik spelas i appens Musik-flik via samma motor. Ingen omkodning.
       </p>
       <p className="upnp-warn">
         Servern är bara för ett <strong>betrott hemmanät (LAN)</strong>. SOAP, katalog

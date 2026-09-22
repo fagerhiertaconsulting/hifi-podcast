@@ -15,7 +15,7 @@ mod skip;
 mod stretch;
 
 #[cfg(test)]
-mod test_wav;
+pub(crate) mod test_wav;
 
 #[allow(unused_imports)]
 pub use asio_host::{is_preferred_hi_fi_name, list_asio_drivers, AsioDriverInfo};
