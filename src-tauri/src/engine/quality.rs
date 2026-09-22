@@ -89,10 +89,11 @@ pub fn file_quality_sv(
         } else {
             dsd_rate.to_string()
         };
-        if codec.is_empty() {
-            format!("DSD · {rate}")
+        let name = if codec.is_empty() { "DSD" } else { codec };
+        if rate.is_empty() {
+            name.to_string()
         } else {
-            format!("{codec} · {rate}")
+            format!("{name} · {rate}")
         }
     } else {
         let mut s = if codec.is_empty() {
@@ -112,6 +113,21 @@ pub fn file_quality_sv(
     }
 }
 
+/// Short Swedish name for `output_path` (internal enum values stay English).
+pub fn output_path_label_sv(output_path: &str) -> &'static str {
+    match output_path {
+        "native_dsd" => "Native DSD",
+        "dop" => "DoP",
+        "pcm" => "PCM",
+        "webview" => "WebView2",
+        _ => "utgång",
+    }
+}
+
+pub fn output_pending_sv() -> &'static str {
+    "Förhandlar ASIO/WASAPI…"
+}
+
 pub fn output_quality_sv(
     output_path: &str,
     output_api: &str,
@@ -120,6 +136,9 @@ pub fn output_quality_sv(
     output_sample: &str,
     dsd_rate: &str,
 ) -> String {
+    if output_path.is_empty() {
+        return output_pending_sv().to_string();
+    }
     let api = api_label_sv(output_api);
     match output_path {
         "native_dsd" => {
@@ -128,7 +147,7 @@ pub fn output_quality_sv(
             } else {
                 dsd_rate.to_string()
             };
-            format!("native_dsd · {rate} · {api}")
+            format!("{} · {rate} · {api}", output_path_label_sv(output_path))
         }
         "dop" => {
             let file = if dsd_rate.is_empty() {
@@ -240,9 +259,19 @@ mod tests {
             "96 kHz / 32-bit f32 · ASIO"
         );
         assert_eq!(
-            output_quality_sv("native_dsd", "asio", 11_289_600, 1, "dsd_lsb", "DSD256"),
-            "native_dsd · DSD256 · ASIO"
+            file_quality_sv("pcm", "FLAC", 96_000, 0, ""),
+            "FLAC · 96 kHz"
         );
+        assert_eq!(file_quality_sv("dsd", "DSD", 0, 1, "DSD64"), "DSD · DSD64");
+        assert_eq!(
+            output_quality_sv("native_dsd", "asio", 11_289_600, 1, "dsd_lsb", "DSD256"),
+            "Native DSD · DSD256 · ASIO"
+        );
+        assert_eq!(
+            output_quality_sv("", "asio", 0, 0, "", ""),
+            "Förhandlar ASIO/WASAPI…"
+        );
+        assert_eq!(output_path_label_sv("native_dsd"), "Native DSD");
         assert_eq!(
             output_quality_sv("dop", "wasapi_exclusive", 705_600, 24, "i24", "DSD256"),
             "DoP · DSD256 · 705.6 kHz / 24-bit · WASAPI exclusive"

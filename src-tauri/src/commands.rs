@@ -707,6 +707,11 @@ pub fn list_music_tracks(
 }
 
 #[tauri::command]
+pub fn last_music_import_root(state: State<AppState>) -> AppResult<Option<String>> {
+    db::last_music_import_root(&conn(&state))
+}
+
+#[tauri::command]
 pub fn import_music_folder(state: State<AppState>, path: String) -> AppResult<MusicImportOutcome> {
     let folder = std::path::PathBuf::from(path);
     crate::music::import_folder(&conn(&state), &state.media_root, &folder)

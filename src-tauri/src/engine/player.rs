@@ -283,6 +283,22 @@ impl Handle {
         let ring = Arc::new(FrameRing::new(2));
         let hwnd = *self.hwnd.lock().expect("engine hwnd");
 
+        {
+            let mut st = self.status.lock().expect("engine status");
+            stamp_pending(
+                &mut st,
+                &path,
+                "pcm",
+                spec.codec.clone(),
+                spec.sample_rate,
+                spec.channels,
+                spec.duration_ms.unwrap_or(0),
+                spec.bits_per_sample,
+                "",
+            );
+        }
+        emit_tick(&self.app, &self.status);
+
         let opened = open_output(
             &params.output_api,
             &params.device_name,
@@ -391,6 +407,22 @@ impl Handle {
         let ring = Arc::new(ByteRing::new(2));
         let hwnd = *self.hwnd.lock().expect("engine hwnd");
 
+        {
+            let mut st = self.status.lock().expect("engine status");
+            stamp_pending(
+                &mut st,
+                &path,
+                "dsd",
+                spec.codec.clone(),
+                spec.sample_rate,
+                spec.channels,
+                spec.duration_ms,
+                1,
+                &spec.rate_label,
+            );
+        }
+        emit_tick(&self.app, &self.status);
+
         struct DiagHookGuard;
         impl Drop for DiagHookGuard {
             fn drop(&mut self) {
@@ -406,6 +438,14 @@ impl Handle {
                     st.dsd_diag = diag.to_string();
                     st.format = "dsd".into();
                     st.loaded = true;
+                    if st.file_quality_sv.is_empty() {
+                        stamp_quality(&mut st);
+                    }
+                    if st.output_quality_sv.is_empty() || st.output_path.is_empty() {
+                        st.output_quality_sv = quality::output_pending_sv().into();
+                        st.output_path_sv =
+                            "Öppnar utgång, väntar på enhet.".into();
+                    }
                 }
                 emit_tick(&app, &status);
             })));
@@ -1151,6 +1191,47 @@ fn dsd_loop(
     }
 }
 
+fn stamp_pending(
+    st: &mut EngineStatus,
+    path: &Path,
+    format: &str,
+    codec: String,
+    sample_rate: u32,
+    channels: u16,
+    duration_ms: u64,
+    file_bits: u32,
+    dsd_rate: &str,
+) {
+    st.loaded = true;
+    st.playing = false;
+    st.ended = false;
+    st.error = None;
+    st.path = path.display().to_string();
+    st.format = format.into();
+    st.codec = codec;
+    st.sample_rate = sample_rate;
+    st.channels = channels;
+    st.duration_ms = duration_ms;
+    st.file_bits = file_bits;
+    st.dsd_rate = dsd_rate.to_string();
+    st.output_path.clear();
+    st.output_rate = 0;
+    st.output_bits = 0;
+    st.output_sample.clear();
+    st.device_name.clear();
+    st.file_quality_sv = quality::file_quality_sv(
+        &st.format,
+        &st.codec,
+        st.sample_rate,
+        st.file_bits,
+        &st.dsd_rate,
+    );
+    st.output_quality_sv = quality::output_pending_sv().into();
+    st.output_path_sv = "Öppnar utgång, väntar på enhet.".into();
+    st.quality_delta.clear();
+    st.quality_delta_sv.clear();
+}
+
 fn stamp_quality(st: &mut EngineStatus) {
     st.file_quality_sv = quality::file_quality_sv(
         &st.format,
@@ -1236,6 +1317,34 @@ mod tests {
             combined.contains("ingen 24-bit DoP-hastighet"),
             "{combined}"
         );
+    }
+
+    #[test]
+    fn pending_status_keeps_file_label_and_swedish_output() {
+        let mut st = EngineStatus::default();
+        stamp_pending(
+            &mut st,
+            Path::new("x.dsf"),
+            "dsd",
+            "DSD".into(),
+            11_289_600,
+            2,
+            1000,
+            1,
+            "DSD256",
+        );
+        assert!(st.loaded);
+        assert_eq!(st.output_path, "");
+        assert_eq!(st.file_quality_sv, "DSD · DSD256");
+        assert_eq!(st.output_quality_sv, quality::output_pending_sv());
+        assert!(st.quality_delta.is_empty());
+        st.output_path = "native_dsd".into();
+        st.output_api = "asio".into();
+        st.output_rate = 11_289_600;
+        st.output_bits = 1;
+        stamp_quality(&mut st);
+        assert_eq!(st.output_quality_sv, "Native DSD · DSD256 · ASIO");
+        assert!(!st.output_quality_sv.contains("native_dsd"));
     }
 
     #[test]

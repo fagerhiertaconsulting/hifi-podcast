@@ -33,38 +33,63 @@ pub fn import_folder(
         return Err(AppError::msg("Mappen finns inte."));
     }
     let root = fs::canonicalize(folder)?;
-    db::upsert_music_folder(conn, &normalize_path(&root))?;
     let files = collect_audio_files(&root)?;
-    let mut imported = 0i64;
-    let mut skipped = 0i64;
-    let mut errors = Vec::new();
-    for src in files {
-        match import_one(conn, media_root, &root, &src) {
-            Ok(true) => imported += 1,
-            Ok(false) => skipped += 1,
-            Err(err) => {
-                errors.push(format!("{}: {err}", src.display()));
+    let mut copied_new: Vec<PathBuf> = Vec::new();
+    conn.execute("BEGIN IMMEDIATE", [])?;
+    let outcome = (|| {
+        let mut imported = 0i64;
+        let mut skipped = 0i64;
+        let mut errors = Vec::new();
+        for src in &files {
+            match import_one(conn, media_root, &root, src, &mut copied_new) {
+                Ok(true) => imported += 1,
+                Ok(false) => skipped += 1,
+                Err(err) => {
+                    errors.push(format!("{}: {err}", src.display()));
+                }
             }
         }
+        let outcome = MusicImportOutcome {
+            imported_tracks: imported,
+            skipped_tracks: skipped,
+            failed_tracks: errors.len() as i64,
+            album_count: db::count_music_albums(conn)?,
+            track_count: db::count_music_tracks(conn)?,
+            errors,
+        };
+        if outcome.failed_tracks > 0 {
+            return Err(AppError::msg(format!(
+                "Import misslyckades: {} fil(er). {} importerade, {} hoppades över. {}",
+                outcome.failed_tracks,
+                outcome.imported_tracks,
+                outcome.skipped_tracks,
+                outcome.errors.join(" ")
+            )));
+        }
+        db::upsert_music_folder(conn, &normalize_path(&root))?;
+        db::set_setting(conn, "music_last_import_root", &root.display().to_string())?;
+        Ok(outcome)
+    })();
+    match outcome {
+        Ok(ok) => {
+            conn.execute("COMMIT", [])?;
+            Ok(ok)
+        }
+        Err(err) => {
+            let _ = conn.execute("ROLLBACK", []);
+            cleanup_copied_files(&copied_new);
+            Err(err)
+        }
     }
-    let outcome = MusicImportOutcome {
-        imported_tracks: imported,
-        skipped_tracks: skipped,
-        failed_tracks: errors.len() as i64,
-        album_count: db::count_music_albums(conn)?,
-        track_count: db::count_music_tracks(conn)?,
-        errors,
-    };
-    if outcome.failed_tracks > 0 {
-        return Err(AppError::msg(format!(
-            "Import misslyckades: {} fil(er). {} importerade, {} hoppades över. {}",
-            outcome.failed_tracks,
-            outcome.imported_tracks,
-            outcome.skipped_tracks,
-            outcome.errors.join(" ")
-        )));
+}
+
+fn cleanup_copied_files(paths: &[PathBuf]) {
+    for dest in paths {
+        let _ = fs::remove_file(dest);
+        if let Some(dir) = dest.parent() {
+            let _ = fs::remove_dir(dir);
+        }
     }
-    Ok(outcome)
 }
 
 fn import_one(
@@ -72,6 +97,7 @@ fn import_one(
     media_root: &Path,
     import_root: &Path,
     src: &Path,
+    copied_new: &mut Vec<PathBuf>,
 ) -> AppResult<bool> {
     ensure_importable_file(src)?;
     let ext = src
@@ -128,7 +154,10 @@ fn import_one(
         channels,
     )?;
     match finish_copy(conn, media_root, src, album_id, track_id, &ext) {
-        Ok(()) => Ok(true),
+        Ok(dest) => {
+            copied_new.push(dest);
+            Ok(true)
+        }
         Err(err) => {
             let _ = db::delete_music_track(conn, track_id);
             Err(err)
@@ -148,11 +177,11 @@ fn finish_copy(
     album_id: i64,
     track_id: i64,
     ext: &str,
-) -> AppResult<()> {
+) -> AppResult<PathBuf> {
     let dest = download::music_track_file(media_root, album_id, track_id, ext);
     let bytes = copy_regular_limited(src, &dest, MAX_MEDIA_BYTES)?;
     db::set_music_track_file(conn, track_id, &dest.display().to_string(), Some(bytes as i64))?;
-    Ok(())
+    Ok(dest)
 }
 
 fn ensure_importable_file(path: &Path) -> AppResult<fs::Metadata> {
@@ -272,6 +301,53 @@ fn walk(dir: &Path, out: &mut Vec<PathBuf>, depth: u32) -> AppResult<()> {
 }
 
 fn apply_path_fallback(tags: &mut Tags, import_root: &Path, src: &Path) {
+    let parts = folder_chain(import_root, src);
+    let meaningful: Vec<String> = parts
+        .iter()
+        .filter(|p| !is_generic_release_folder(p))
+        .cloned()
+        .collect();
+    let album_folder = meaningful.last().or(parts.last());
+    if tags.album.is_none() {
+        if let Some(name) = album_folder {
+            if let Some((artist, album)) = split_artist_title(name) {
+                tags.album = Some(album);
+                if tags.artist.is_none() {
+                    tags.artist = Some(artist);
+                }
+            } else {
+                tags.album = Some(name.clone());
+            }
+        }
+    }
+    if tags.artist.is_none() {
+        if meaningful.len() >= 2 {
+            tags.artist = Some(meaningful[meaningful.len() - 2].clone());
+        } else if parts.len() >= 2 {
+            tags.artist = Some(parts[parts.len() - 2].clone());
+        }
+    }
+    if tags.title.is_none() {
+        if let Some(stem) = src.file_stem().and_then(|s| s.to_str()) {
+            let (num, title) = split_track_prefix(stem);
+            if tags.track_no.is_none() {
+                tags.track_no = num;
+            }
+            if tags.artist.is_none() {
+                if let Some((artist, rest)) = split_artist_title(&title) {
+                    tags.artist = Some(artist);
+                    tags.title = Some(rest);
+                } else {
+                    tags.title = Some(title);
+                }
+            } else {
+                tags.title = Some(title);
+            }
+        }
+    }
+}
+
+fn folder_chain(import_root: &Path, src: &Path) -> Vec<String> {
     let rel = src.strip_prefix(import_root).unwrap_or(src);
     let mut parts: Vec<String> = rel
         .parent()
@@ -282,23 +358,57 @@ fn apply_path_fallback(tags: &mut Tags, import_root: &Path, src: &Path) {
         })
         .unwrap_or_default();
     parts.retain(|p| !p.is_empty() && p != ".");
-    if tags.album.is_none() {
-        if let Some(album) = parts.last() {
-            tags.album = Some(album.clone());
-        }
-    }
-    if tags.artist.is_none() && parts.len() >= 2 {
-        tags.artist = Some(parts[parts.len() - 2].clone());
-    }
-    if tags.title.is_none() {
-        if let Some(stem) = src.file_stem().and_then(|s| s.to_str()) {
-            let (num, title) = split_track_prefix(stem);
-            tags.title = Some(title);
-            if tags.track_no.is_none() {
-                tags.track_no = num;
+    if parts.is_empty() {
+        if let Some(name) = import_root.file_name().and_then(|s| s.to_str()) {
+            if !name.is_empty() && name != "." {
+                parts.push(name.to_string());
             }
         }
     }
+    parts
+}
+
+fn is_generic_release_folder(name: &str) -> bool {
+    let compact: String = name
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .map(|c| c.to_ascii_lowercase())
+        .collect();
+    matches!(
+        compact.as_str(),
+        "stereo"
+            | "multichannel"
+            | "multi"
+            | "scans"
+            | "artwork"
+            | "covers"
+            | "bonus"
+            | "sacd"
+            | "iso"
+            | "dsd"
+            | "dsd64"
+            | "dsd128"
+            | "dsd256"
+            | "dsd512"
+    ) || compact
+        .strip_prefix("cd")
+        .or_else(|| compact.strip_prefix("disc"))
+        .or_else(|| compact.strip_prefix("disk"))
+        .or_else(|| compact.strip_prefix("skiva"))
+        .is_some_and(|rest| rest.is_empty() || rest.chars().all(|c| c.is_ascii_digit()))
+}
+
+fn split_artist_title(name: &str) -> Option<(String, String)> {
+    let (left, right) = name.split_once(" - ")?;
+    let left = left.trim();
+    let right = right.trim();
+    if left.is_empty() || right.is_empty() {
+        return None;
+    }
+    if left.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    Some((left.to_string(), right.to_string()))
 }
 
 fn split_track_prefix(stem: &str) -> (Option<i64>, String) {
@@ -470,6 +580,48 @@ mod tests {
     }
 
     #[test]
+    fn path_fallback_uses_folders_filename_and_skips_disc() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("lib");
+        let src = root
+            .join("Miles Davis")
+            .join("Kind of Blue")
+            .join("Disc 1")
+            .join("DSD256")
+            .join("01 - So What.dsf");
+        let mut tags = Tags::default();
+        apply_path_fallback(&mut tags, &root, &src);
+        assert_eq!(tags.artist.as_deref(), Some("Miles Davis"));
+        assert_eq!(tags.album.as_deref(), Some("Kind of Blue"));
+        assert_eq!(tags.title.as_deref(), Some("So What"));
+        assert_eq!(tags.track_no, Some(1));
+    }
+
+    #[test]
+    fn path_fallback_splits_artist_album_folder_and_filename() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("Bill Evans - Waltz for Debby");
+        let src = root.join("02 Bill Evans - My Foolish Heart.flac");
+        let mut tags = Tags::default();
+        apply_path_fallback(&mut tags, &root, &src);
+        assert_eq!(tags.artist.as_deref(), Some("Bill Evans"));
+        assert_eq!(tags.album.as_deref(), Some("Waltz for Debby"));
+        assert_eq!(tags.title.as_deref(), Some("My Foolish Heart"));
+        assert_eq!(tags.track_no, Some(2));
+    }
+
+    #[test]
+    fn path_fallback_uses_import_root_name_when_files_are_flat() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("Kind of Blue");
+        let src = root.join("So What.dsf");
+        let mut tags = Tags::default();
+        apply_path_fallback(&mut tags, &root, &src);
+        assert_eq!(tags.album.as_deref(), Some("Kind of Blue"));
+        assert_eq!(tags.title.as_deref(), Some("So What"));
+    }
+
+    #[test]
     fn import_uses_music_tables_not_episodes() {
         let db = conn();
         let tmp = tempfile::tempdir().unwrap();
@@ -574,6 +726,58 @@ mod tests {
         let err = import_folder(&db, &media, &folder).unwrap_err();
         assert!(err.to_string().contains("Import misslyckades"));
         assert_eq!(db::count_music_tracks(&db).unwrap(), 0);
+        assert!(db::last_music_import_root(&db).unwrap().is_none());
+    }
+
+    #[test]
+    fn import_rolls_back_earlier_tracks_and_copied_files() {
+        let db = conn();
+        let tmp = tempfile::tempdir().unwrap();
+        let media = tmp.path().join("media");
+        download::ensure_media_layout(&media).unwrap();
+        let folder = tmp.path().join("mix");
+        fs::create_dir_all(&folder).unwrap();
+        let a = folder.join("a.wav");
+        let b = folder.join("b.wav");
+        crate::engine::test_wav::write_sine_wav(&a, 44100, 1, 440.0, 0.05, 0.2);
+        crate::engine::test_wav::write_sine_wav(&b, 44100, 1, 440.0, 0.05, 0.2);
+        fs::create_dir_all(media.join("music").join("1").join("2.wav")).unwrap();
+        let err = import_folder(&db, &media, &folder).unwrap_err();
+        assert!(err.to_string().contains("Import misslyckades"));
+        assert_eq!(db::count_music_tracks(&db).unwrap(), 0);
+        assert_eq!(db::count_music_albums(&db).unwrap(), 0);
+        assert!(!media.join("music").join("1").join("1.wav").is_file());
+        assert!(db::last_music_import_root(&db).unwrap().is_none());
+    }
+
+    #[test]
+    fn successful_import_remembers_root_and_failed_run_keeps_previous() {
+        let db = conn();
+        let tmp = tempfile::tempdir().unwrap();
+        let media = tmp.path().join("media");
+        download::ensure_media_layout(&media).unwrap();
+        let good = tmp.path().join("good");
+        fs::create_dir_all(&good).unwrap();
+        let wav = good.join("tune.wav");
+        crate::engine::test_wav::write_sine_wav(&wav, 44100, 1, 440.0, 0.05, 0.2);
+        import_folder(&db, &media, &good).unwrap();
+        let remembered = db::last_music_import_root(&db).unwrap().unwrap();
+        assert!(remembered.contains("good"));
+
+        let bad = tmp.path().join("bad");
+        fs::create_dir_all(&bad).unwrap();
+        let ok = bad.join("ok.wav");
+        let later = bad.join("later.wav");
+        crate::engine::test_wav::write_sine_wav(&ok, 44100, 1, 440.0, 0.05, 0.2);
+        crate::engine::test_wav::write_sine_wav(&later, 44100, 1, 440.0, 0.05, 0.2);
+        fs::create_dir_all(media.join("music").join("2").join("3.wav")).unwrap();
+        let err = import_folder(&db, &media, &bad).unwrap_err();
+        assert!(err.to_string().contains("Import misslyckades"));
+        assert_eq!(db::count_music_tracks(&db).unwrap(), 1);
+        assert_eq!(
+            db::last_music_import_root(&db).unwrap().as_deref(),
+            Some(remembered.as_str())
+        );
     }
 
     #[cfg(unix)]
