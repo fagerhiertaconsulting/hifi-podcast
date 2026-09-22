@@ -333,9 +333,11 @@ fn apply_path_fallback(tags: &mut Tags, import_root: &Path, src: &Path) {
             if tags.track_no.is_none() {
                 tags.track_no = num;
             }
-            if tags.artist.is_none() {
-                if let Some((artist, rest)) = split_artist_title(&title) {
+            if let Some((artist, rest)) = split_artist_title(&title) {
+                if tags.artist.is_none() {
                     tags.artist = Some(artist);
+                    tags.title = Some(rest);
+                } else if tags.artist.as_deref() == Some(artist.as_str()) {
                     tags.title = Some(rest);
                 } else {
                     tags.title = Some(title);
