@@ -303,7 +303,8 @@ pub struct MusicPlayerPayload {
 pub struct MusicImportOutcome {
     pub imported_tracks: i64,
     pub skipped_tracks: i64,
+    pub failed_tracks: i64,
     pub album_count: i64,
     pub track_count: i64,
-    pub warnings: Vec<String>,
+    pub errors: Vec<String>,
 }

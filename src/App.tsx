@@ -107,8 +107,11 @@ export default function App() {
     [podcasts, selectedId],
   );
 
+  const musicPlayingRef = useRef(false);
+  musicPlayingRef.current = musicPayload != null;
   const skipSilenceActive =
-    globalSkipSilence || Boolean(payload?.podcast.skip_silence);
+    musicPayload == null &&
+    (globalSkipSilence || Boolean(payload?.podcast.skip_silence));
   const skipEnabledRef = useRef(skipSilenceActive);
   skipEnabledRef.current = skipSilenceActive;
   const skipModeRef = useRef(skipSilenceActive);
@@ -244,6 +247,14 @@ export default function App() {
   );
 
   useEffect(() => {
+    if (musicPayload) {
+      skipEnabledRef.current = false;
+      skipModeRef.current = false;
+      if (nativeRef.current) {
+        void api.engineSetSkipSilence(false).catch((err) => setStatus(String(err)));
+      }
+      return;
+    }
     if (skipModeRef.current === skipSilenceActive) return;
     skipModeRef.current = skipSilenceActive;
     const audio = audioRef.current;
@@ -263,7 +274,7 @@ export default function App() {
         }
       })
       .catch((err) => setStatus(String(err)));
-  }, [skipSilenceActive, loadPlaybackSource, speed]);
+  }, [skipSilenceActive, musicPayload, loadPlaybackSource, speed]);
 
   const persistNow = useCallback(async () => {
     const audio = audioRef.current;
@@ -867,13 +878,18 @@ export default function App() {
               try {
                 const result = await api.importMusicFolder(path);
                 await refreshMusic();
-                const warn = result.warnings.length
-                  ? ` Varningar: ${result.warnings.slice(0, 3).join(" ")}`
-                  : "";
+                if (result.failed_tracks > 0) {
+                  const detail = result.errors.slice(0, 3).join(" ");
+                  setStatus(
+                    `Import misslyckades: ${result.failed_tracks} fil(er). ${result.imported_tracks} importerade, ${result.skipped_tracks} hoppades över. ${detail}`,
+                  );
+                  return;
+                }
                 setStatus(
-                  `Importerade ${result.imported_tracks} spår (${result.skipped_tracks} hoppades över). ${result.album_count} album, ${result.track_count} i biblioteket.${warn}`,
+                  `Importerade ${result.imported_tracks} spår (${result.skipped_tracks} hoppades över). ${result.album_count} album, ${result.track_count} i biblioteket.`,
                 );
               } catch (err) {
+                await refreshMusic().catch(() => undefined);
                 setStatus(String(err));
               } finally {
                 setBusy(false);
@@ -930,7 +946,9 @@ export default function App() {
             globalSkipSilence={globalSkipSilence}
             setGlobalSkipSilence={(v) => {
               setGlobalSkipSilence(v);
-              if (nativeRef.current) void api.engineSetSkipSilence(v);
+              if (nativeRef.current && !musicPlayingRef.current) {
+                void api.engineSetSkipSilence(v);
+              }
             }}
             engineSettings={engineSettings}
             onEngineSettings={setEngineSettings}

@@ -321,9 +321,10 @@ export type MusicPlayerPayload = {
 export type MusicImportOutcome = {
   imported_tracks: number;
   skipped_tracks: number;
+  failed_tracks: number;
   album_count: number;
   track_count: number;
-  warnings: string[];
+  errors: string[];
 };
 
 export type SubscribeOutcome = {

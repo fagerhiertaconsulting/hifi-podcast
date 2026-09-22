@@ -1436,6 +1436,11 @@ pub fn set_music_track_file(
     Ok(())
 }
 
+pub fn delete_music_track(conn: &Connection, track_id: i64) -> AppResult<()> {
+    conn.execute("DELETE FROM music_track WHERE id = ?1", params![track_id])?;
+    Ok(())
+}
+
 pub fn music_track_by_source(conn: &Connection, source_path: &str) -> AppResult<Option<MusicTrack>> {
     let mut stmt = conn.prepare(
         r#"
@@ -1585,7 +1590,13 @@ pub fn next_music_track(conn: &Connection, track_id: i64) -> AppResult<Option<Mu
         FROM music_track
         WHERE album_id = ?1 AND (
           (COALESCE(track_no, 999999) > COALESCE(?2, 999999))
-          OR (COALESCE(track_no, 999999) = COALESCE(?2, 999999) AND (title > ?3 OR (title = ?3 AND id > ?4)))
+          OR (
+            COALESCE(track_no, 999999) = COALESCE(?2, 999999)
+            AND (
+              title COLLATE NOCASE > ?3 COLLATE NOCASE
+              OR (title COLLATE NOCASE = ?3 COLLATE NOCASE AND id > ?4)
+            )
+          )
         )
         ORDER BY track_no IS NULL, track_no, title COLLATE NOCASE, id
         LIMIT 1
@@ -1997,5 +2008,38 @@ mod tests {
         assert_eq!(eps, 0);
         let next = next_music_track(&conn, tid).unwrap();
         assert!(next.is_none());
+    }
+
+    #[test]
+    fn next_music_track_uses_nocase_title_order() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize(&conn).unwrap();
+        let album = upsert_music_album(&conn, "Untit", "A").unwrap();
+        let mut ids = Vec::new();
+        for title in ["alpha", "Beta", "gamma"] {
+            ids.push(
+                insert_music_track_placeholder(
+                    &conn,
+                    album,
+                    &format!("/tmp/{title}.flac"),
+                    title,
+                    "A",
+                    "Untit",
+                    None,
+                    Some(1000),
+                    "flac",
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap(),
+            );
+        }
+        // NOCASE order: alpha, Beta, gamma. Binary `title > 'alpha'` would skip Beta.
+        let nxt = next_music_track(&conn, ids[0]).unwrap().unwrap();
+        assert_eq!(nxt.title, "Beta");
+        let nxt = next_music_track(&conn, nxt.id).unwrap().unwrap();
+        assert_eq!(nxt.title, "gamma");
     }
 }
