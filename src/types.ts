@@ -275,7 +275,56 @@ export type ProbeInfo = {
   bits_per_sample: number | null;
 };
 
-export type View = "library" | "inbox" | "queue" | "stats" | "settings";
+export type View = "library" | "music" | "inbox" | "queue" | "stats" | "settings";
+
+export type MusicAlbum = {
+  id: number;
+  title: string;
+  artist: string;
+  track_count: number;
+  created_at: string;
+  updated_at: string;
+};
+
+export type MusicTrack = {
+  id: number;
+  album_id: number;
+  source_path: string;
+  file_path: string;
+  title: string;
+  artist: string;
+  album: string;
+  track_no: number | null;
+  duration_ms: number | null;
+  format: string;
+  codec: string | null;
+  sample_rate: number | null;
+  bits_per_sample: number | null;
+  channels: number | null;
+  bytes: number | null;
+  created_at: string;
+};
+
+export type MusicPlaybackState = {
+  track_id: number;
+  position_ms: number;
+  completed: boolean;
+  last_played_at: string | null;
+};
+
+export type MusicPlayerPayload = {
+  track: MusicTrack;
+  album: MusicAlbum;
+  playback: MusicPlaybackState | null;
+};
+
+export type MusicImportOutcome = {
+  imported_tracks: number;
+  skipped_tracks: number;
+  album_count: number;
+  track_count: number;
+  warnings: string[];
+};
 
 export type SubscribeOutcome = {
   podcast: Podcast;

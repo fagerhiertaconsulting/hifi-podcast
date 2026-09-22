@@ -6,7 +6,7 @@
 |-----|-----|--------|
 | **MVP** | Lokal podcatcher + hi-fi-policy | Ja (skal) |
 | **v1** | Lokal ASR, kapitel, reklam-skip | Roadmap |
-| **Musik** | Separat modul, foobar2000-ambition | Roadmap (PR #5+) |
+| **Musik** | Separat modul, foobar2000-ambition | MVP: `music_*`-tabeller + Musik-flik, delad engine |
 | **Native engine** | Symphonia PCM + DSD (.dsf/.dff) → ASIO (FiiO native/DoP) / WASAPI | PR #4 PCM; DSD native i efterföljande PR |
 | **UPnP** | Media Server mot Onkyo TX-RZ50 | PR #3: SSDP + CDS + HTTP Range; `Music/` stub |
 
@@ -29,12 +29,12 @@ UI ska inte avkoda feeds eller skriva SQLite direkt.
 - DB: app local data `db.sqlite`
 - Media-root: `media/podcasts/<id>/…` och `media/music/` (migrering från `media/<id>/`)
 
-**Podcast-library** använder `media/<podcast_id>/<episode_id>.<ext>` i MVP. När musikmodulen kommer:
+**Podcast-library** ligger under `media/podcasts/<podcast_id>/<episode_id>.<ext>`. Musikbiblioteket:
 
 ```
 media/
   podcasts/<podcast_id>/<episode_id>.<ext>
-  music/<album_hash>/...
+  music/<album_id>/<track_id>.<ext>
 ```
 
 Migrera podcast-sökvägar i en explicit version. UPnP-servern ska peka på **media-root**, inte på en hårdkodad “podcasts only”-mapp i Windows-firewall/URL-yta.
@@ -47,7 +47,7 @@ Tabeller: `podcast`, `episode`, `download`, `playback_state`, `queue_item`.
 
 v1 lägger till `transcript`, `transcript_segment`, `chapter`, `ad_segment`, `job`, `bookmark`.
 
-Musik får egna tabeller (`music_track`, `music_album`, …) eller en separat SQLite-fil under samma data-dir. Preferens: **samma fil, strikt prefix**, så backup är en fil — men inga FK mellan podcast-kö och spår.
+Musik får egna tabeller (`music_track`, `music_album`, `music_folder`, `music_playback_state`) i samma `db.sqlite` med strikt prefix — inga FK mot `episode` / podcast-kö.
 
 ## Varför Tauri 2 + Rust (inte Electron/Next)
 

@@ -43,9 +43,9 @@ Tauri lägger appdata under `%LOCALAPPDATA%\consulting.fagerhierta.hifi-podcast\
 
 | Sökväg | Innehåll |
 |--------|----------|
-| `db.sqlite` | Prenumerationer, avsnitt, kö, transkript, jobb, UPnP-inställningar |
+| `db.sqlite` | Prenumerationer, avsnitt, kö, transkript, jobb, UPnP-inställningar, **musikbibliotek** |
 | `media/podcasts/<podcast_id>/<episode_id>.<ext>` | **Original** enclosure-filer |
-| `media/music/` | Reserverad (tom) för senare musikmodul |
+| `media/music/<album_id>/<track_id>.<ext>` | **Original** importerade musikfiler |
 | `models/ggml-small.bin` | Whisper-modell (nedladdas av användaren) |
 | `bin/whisper-cli.exe` | whisper.cpp sidecar (Windows: Inställningar → Ladda ner whisper-cli) |
 
@@ -59,8 +59,9 @@ Tauri lägger appdata under `%LOCALAPPDATA%\consulting.fagerhierta.hifi-podcast\
 - Nedladdning utan omkodning + SHA-256-checksumma
 - Spelare: native Symphonia PCM + DSD (.dsf/.dff) → **ASIO (FiiO native DSD / DoP) / WASAPI exclusive DoP**, med WebView2 som omkopplare för podd (inte DSD)
 - Per-podcast: hastighet, auto-nedladdning, intro/outro-skip, opt-in hoppa tystnad
+- **Musik:** separat flik, import av mapp (FLAC/DSD), uppspelning i samma native-motor
 
-**Inte i koden ännu:** musikbibliotek-UI, SACD-ISO-rippning, reklam-cut, moln-ASR, in-app UPnP-renderer.
+**Inte i koden ännu:** SACD-ISO-rippning, reklam-cut, moln-ASR, in-app UPnP-renderer, UPnP-träd för musik.
 
 v1 (lokal intelligens) finns i appen: se [docs/v1-asr.md](docs/v1-asr.md).
 
@@ -75,7 +76,7 @@ Inställningar → **UPnP/DLNA-mediaserver** → **Starta mediaserver** (port 82
 - [docs/audio.md](docs/audio.md) — ljudstack och varför
 - [docs/architecture.md](docs/architecture.md) — faser och modulgränser
 - [docs/podcast-player-sketch.md](docs/podcast-player-sketch.md) — produkt- och arkitekturskiss
-- [docs/music-roadmap.md](docs/music-roadmap.md) — musikmodul (senare)
+- [docs/music-roadmap.md](docs/music-roadmap.md) — musikmodul (MVP + senare SACD)
 - [docs/upnp-mediaserver.md](docs/upnp-mediaserver.md) — UPnP/DLNA mot Onkyo
 - [docs/roadmap.md](docs/roadmap.md) — backlog efter MVP
 

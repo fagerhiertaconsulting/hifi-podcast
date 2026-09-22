@@ -16,9 +16,9 @@ Implementerat i appen (se [v1-asr.md](v1-asr.md)):
 
 Symphonia-avkodning + **ASIO som primär utgång** (FiiO ASIO Driver, samma som Qobuz) med WASAPI delat/exclusive som fallback. WebView2 kvar som omkopplare. Musikbibliotek-UI är **inte** med — tomma hyllor väntar på PR #5+. Se [audio.md](audio.md).
 
-## Musikmodul (senare, separat)
+## Musikmodul (MVP, separat från podcast)
 
-Se [music-roadmap.md](music-roadmap.md). Inte i podkastabeller. Delad engine enligt [audio.md](audio.md).
+Se [music-roadmap.md](music-roadmap.md). Egna `music_*`-tabeller. Delad engine enligt [audio.md](audio.md). Inte i podkastabeller.
 
 ## UPnP/DLNA (PR #3 — podcastträd)
 
@@ -26,4 +26,6 @@ Se [upnp-mediaserver.md](upnp-mediaserver.md). **Media Server** mot Onkyo TX-RZ5
 
 ## Medvetet utanför
 
-Musikbibliotek / taggar / albumvy, SACD-ISO-rippning, moln-ASR, reklam-cut ML, Chromecast/Sonos-specifikt, in-app UPnP-renderer.
+## Medvetet utanför
+
+foobar-skinn, SACD-ISO-rippning, moln-ASR, reklam-cut ML, Chromecast/Sonos-specifikt, in-app UPnP-renderer, UPnP-träd för musik (stub kvar).

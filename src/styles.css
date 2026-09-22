@@ -187,8 +187,21 @@ textarea {
 
 .podcast-head h1,
 .settings h1,
-.queue h1 {
+.queue h1,
+.toolbar-title {
   margin: 0 0 0.35rem;
+}
+
+.toolbar-title {
+  font-size: 1.35rem;
+  margin: 0;
+  margin-right: auto;
+}
+
+.music-lead {
+  margin: 0.75rem 0 0.25rem;
+  max-width: 62ch;
+  line-height: 1.45;
 }
 
 .settings-grid {

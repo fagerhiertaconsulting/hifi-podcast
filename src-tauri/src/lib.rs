@@ -9,6 +9,7 @@ mod intel;
 mod jobs;
 mod media_mime;
 mod models;
+mod music;
 mod net;
 mod smtc;
 mod upnp;
@@ -151,6 +152,12 @@ pub fn run() {
             commands::engine_set_skip_silence,
             commands::engine_stop,
             commands::engine_status,
+            commands::list_music_albums,
+            commands::list_music_tracks,
+            commands::import_music_folder,
+            commands::music_track_for_player,
+            commands::save_music_playback,
+            commands::next_music_track,
         ])
         .run(tauri::generate_context!())
         .expect("kunde inte starta HIFI podcast");
