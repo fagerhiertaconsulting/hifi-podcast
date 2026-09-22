@@ -20,6 +20,7 @@ import type {
   AsrStatus,
   AudioEngineSettings,
   Bookmark,
+  EngineStatus,
   Episode,
   InboxItem,
   JobRow,
@@ -85,6 +86,8 @@ export default function App() {
   const [globalSkipSilence, setGlobalSkipSilence] = useState(false);
   const [engineSettings, setEngineSettings] = useState<AudioEngineSettings | null>(null);
   const [engineQa, setEngineQa] = useState("");
+  const [engineStatus, setEngineStatus] = useState<EngineStatus | null>(null);
+  const [outputIsWebview, setOutputIsWebview] = useState(false);
   const nativeRef = useRef(true);
   const [sleepMode, setSleepMode] = useState<"off" | "minutes" | "episode">("off");
   const [sleepMinutes, setSleepMinutes] = useState(30);
@@ -315,12 +318,17 @@ export default function App() {
                     : engineSettings.output_api;
             const diag = st.dsd_diag ? ` [${st.dsd_diag}]` : "";
             statusLine = `Spelar native (${apiLabel}): ${next.episode.title}${diag}`;
+            setEngineStatus(st);
+            setOutputIsWebview(false);
           } catch (nativeErr) {
             const isDsd = /\.(dsf|dff|dsd)$/i.test(filePath);
             if (isDsd) {
               nativeRef.current = true;
               await api.engineStop();
               setPlaying(false);
+              setEngineStatus(null);
+              setEngineQa("");
+              setOutputIsWebview(false);
               setStatus(
                 `DSD kunde inte spelas: ${String(nativeErr)}. Ingen WebView2-fallback (skulle bli tystnad).`,
               );
@@ -328,6 +336,8 @@ export default function App() {
             }
             nativeRef.current = false;
             await api.engineStop();
+            setOutputIsWebview(true);
+            setEngineStatus(await probeFileQuality(filePath));
             await loadPlaybackSource(audio, filePath, useSkip, nextSpeed);
             audio.currentTime = Math.max(0, startSec);
             await audio.play();
@@ -338,6 +348,8 @@ export default function App() {
           }
         } else {
           await api.engineStop();
+          setOutputIsWebview(true);
+          setEngineStatus(await probeFileQuality(filePath));
           await loadPlaybackSource(audio, filePath, useSkip, nextSpeed);
           audio.currentTime = Math.max(0, startSec);
           await audio.play();
@@ -392,16 +404,17 @@ export default function App() {
       setPosition(pos);
       setDuration((st.duration_ms || 0) / 1000);
       setPlaying(st.playing);
+      if (st.loaded) {
+        setEngineStatus(st);
+      }
       if (st.format === "dsd") {
         const re =
           st.callback_reentries > 0 ? ` · re-entry ${st.callback_reentries} (inte underrun)` : "";
-        setEngineQa(
-          `${st.dsd_rate} · ${st.output_path} · ${st.output_path_sv} · ${st.dsd_diag} · underrun ${st.underruns}${re}`,
-        );
+        setEngineQa(`underrun ${st.underruns}${re}${st.dsd_diag ? ` · ${st.dsd_diag}` : ""}`);
       } else if (st.loaded) {
         const re =
           st.callback_reentries > 0 ? ` · re-entry ${st.callback_reentries} (inte underrun)` : "";
-        setEngineQa(`PCM ${st.sample_rate} Hz · ${st.output_api} · underrun ${st.underruns}${re}`);
+        setEngineQa(`underrun ${st.underruns}${re}`);
       }
       if (st.error) {
         setStatus(st.error);
@@ -981,12 +994,126 @@ export default function App() {
           >
             Bokmärke
           </button>
+        <QualityStrip status={engineStatus} webview={outputIsWebview} />
         <div className="status">
           {status}
           {nativeRef.current && payload ? " · Native" : payload ? " · WebView2" : ""}
           {engineQa ? ` · ${engineQa}` : ""}
         </div>
       </footer>
+    </div>
+  );
+}
+
+async function probeFileQuality(path: string): Promise<EngineStatus | null> {
+  try {
+    const p = await api.engineProbe(path);
+    const dsd = p.support.kind === "dsd";
+    const rate = p.sample_rate ?? 0;
+    const bits = p.bits_per_sample ?? 0;
+    const codec = p.codec ?? (dsd ? "DSD" : "");
+    const dsdRate = dsd ? dsdRateLabel(rate) : "";
+    return {
+      loaded: true,
+      playing: false,
+      ended: false,
+      position_ms: 0,
+      duration_ms: p.duration_ms ?? 0,
+      sample_rate: rate,
+      channels: p.channels ?? 0,
+      codec,
+      path,
+      exclusive: false,
+      output_api: "webview",
+      device_name: "",
+      output_rate: 0,
+      resampled: false,
+      speed: 1,
+      skip_silence: false,
+      underruns: 0,
+      error: null,
+      format: dsd ? "dsd" : "pcm",
+      dsd_rate: dsdRate,
+      output_path: "webview",
+      output_path_sv: "WebView2 (systemmixer) — inte native ASIO/WASAPI.",
+      callback_reentries: 0,
+      dsd_diag: "",
+      file_bits: bits,
+      output_bits: 0,
+      output_sample: "",
+      file_quality_sv: fileQualityFromProbe(dsd, codec, rate, bits, dsdRate),
+      output_quality_sv: "WebView2 (systemmixer)",
+      quality_delta: [],
+      quality_delta_sv: "",
+    };
+  } catch {
+    return null;
+  }
+}
+
+function dsdRateLabel(hz: number): string {
+  switch (hz) {
+    case 2_822_400:
+      return "DSD64";
+    case 5_644_800:
+      return "DSD128";
+    case 11_289_600:
+      return "DSD256";
+    case 22_579_200:
+      return "DSD512";
+    default:
+      return hz ? `${hz} Hz` : "";
+  }
+}
+
+function fileQualityFromProbe(
+  dsd: boolean,
+  codec: string,
+  rate: number,
+  bits: number,
+  dsdRate: string,
+): string {
+  if (dsd) {
+    const label = dsdRate || (rate ? `${rate} Hz` : "");
+    return codec ? `${codec} · ${label}` : `DSD · ${label}`;
+  }
+  const khz =
+    rate % 1000 === 0
+      ? `${rate / 1000} kHz`
+      : rate
+        ? `${(rate / 1000).toLocaleString("sv-SE", { maximumFractionDigits: 1 })} kHz`
+        : "";
+  let s = codec || "PCM";
+  if (khz) s += ` · ${khz}`;
+  if (bits > 0) s += ` / ${bits}-bit`;
+  return s;
+}
+
+function QualityStrip(props: { status: EngineStatus | null; webview: boolean }) {
+  const st = props.status;
+  if (!st?.loaded || !st.file_quality_sv) return null;
+  const changed = !props.webview && (st.quality_delta?.length ?? 0) > 0;
+  const output = props.webview ? "WebView2 (systemmixer)" : st.output_quality_sv;
+  return (
+    <div
+      className={`quality${changed ? " quality-changed" : ""}`}
+      title={st.output_path_sv || undefined}
+    >
+      <span className="quality-pair">
+        <span className="quality-k">Original</span>
+        <strong>{st.file_quality_sv}</strong>
+      </span>
+      <span className="quality-arrow" aria-hidden>
+        →
+      </span>
+      <span className="quality-pair">
+        <span className="quality-k">Utgång</span>
+        <strong>{output}</strong>
+      </span>
+      {changed ? <span className="quality-delta">{st.quality_delta_sv}</span> : null}
+      {!props.webview && st.device_name ? (
+        <span className="quality-dev">{st.device_name}</span>
+      ) : null}
     </div>
   );
 }

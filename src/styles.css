@@ -267,6 +267,56 @@ textarea {
   font-size: 0.85rem;
 }
 
+.quality {
+  width: 100%;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0.45rem 0.85rem;
+  font-size: 0.82rem;
+  color: var(--muted);
+  padding: 0.15rem 0 0.1rem;
+}
+
+.quality-pair {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 0.4rem;
+}
+
+.quality-k {
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  font-size: 0.68rem;
+  color: var(--accent-2);
+}
+
+.quality strong {
+  font-weight: 600;
+  color: var(--text);
+}
+
+.quality-arrow {
+  color: var(--line);
+}
+
+.quality-changed .quality-arrow,
+.quality-changed .quality-delta {
+  color: var(--accent);
+}
+
+.quality-delta {
+  font-size: 0.78rem;
+}
+
+.quality-dev {
+  margin-left: auto;
+  max-width: 28ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .paths {
   display: grid;
   grid-template-columns: 120px 1fr;

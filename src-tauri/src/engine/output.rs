@@ -68,6 +68,8 @@ pub struct SharedStream {
     thread: Option<std::thread::JoinHandle<()>>,
     pub sample_rate: u32,
     pub channels: u16,
+    pub output_bits: u32,
+    pub output_sample: String,
 }
 
 impl Drop for SharedStream {
@@ -120,6 +122,8 @@ pub fn start_shared(
             thread: Some(thread),
             sample_rate,
             channels,
+            output_bits: 32,
+            output_sample: "f32".into(),
         }),
         Ok(Err(err)) => {
             stop.store(true, Ordering::Relaxed);

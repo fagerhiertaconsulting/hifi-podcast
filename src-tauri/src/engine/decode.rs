@@ -5,7 +5,7 @@ use super::EngineError;
 use std::fs::File;
 use std::path::Path;
 use symphonia::core::audio::{AudioBufferRef, SampleBuffer};
-use symphonia::core::codecs::{DecoderOptions, CODEC_TYPE_NULL};
+use symphonia::core::codecs::{CodecType, DecoderOptions, CODEC_TYPE_NULL};
 use symphonia::core::errors::Error as SymphoniaError;
 use symphonia::core::formats::{FormatOptions, FormatReader, SeekMode, SeekTo};
 use symphonia::core::io::MediaSourceStream;
@@ -19,6 +19,8 @@ pub struct AudioSpec {
     pub channels: u16,
     pub duration_ms: Option<u64>,
     pub codec: String,
+    /// Container/codec bits (0 if unknown). Intern kedja är ändå f32.
+    pub bits_per_sample: u32,
 }
 
 pub struct Decoder {
@@ -105,7 +107,12 @@ impl Decoder {
         let duration_ms = track.codec_params.n_frames.map(|frames| {
             (frames as u128 * 1000 / sample_rate as u128) as u64
         });
-        let codec = format!("{:?}", track.codec_params.codec);
+        let codec = codec_label(track.codec_params.codec);
+        let bits_per_sample = track
+            .codec_params
+            .bits_per_sample
+            .or(track.codec_params.bits_per_coded_sample)
+            .unwrap_or(0);
 
         Ok(Self {
             format,
@@ -116,6 +123,7 @@ impl Decoder {
                 channels,
                 duration_ms,
                 codec,
+                bits_per_sample,
             },
             sample_buf: None,
             leftover: Vec::new(),
@@ -225,6 +233,61 @@ fn copy_f32<'a>(
     buf.samples()
 }
 
+fn codec_label(codec: CodecType) -> String {
+    let raw = format!("{codec:?}");
+    let key = raw.to_ascii_lowercase();
+    if key.contains("flac") {
+        return "FLAC".into();
+    }
+    if key.contains("mp3") || key.contains("mpeg") {
+        return "MP3".into();
+    }
+    if key.contains("aac") {
+        return "AAC".into();
+    }
+    if key.contains("alac") {
+        return "ALAC".into();
+    }
+    if key.contains("vorbis") {
+        return "Vorbis".into();
+    }
+    if key.contains("opus") {
+        return "Opus".into();
+    }
+    if key.contains("pcm") || key.contains("wav") {
+        return "PCM".into();
+    }
+    if let Some(n) = raw
+        .strip_prefix("CodecType(")
+        .and_then(|s| s.strip_suffix(')'))
+        .and_then(|s| s.parse::<u32>().ok())
+    {
+        // Symphonia PCM family is 0x100..=0x125; FLAC is 0x2000.
+        if (0x100..=0x125).contains(&n) {
+            return "PCM".into();
+        }
+        if n == 0x2000 {
+            return "FLAC".into();
+        }
+        if n == 0x1000 {
+            return "MP3".into();
+        }
+        if n == 0x1001 {
+            return "AAC".into();
+        }
+        if n == 0x1002 {
+            return "Vorbis".into();
+        }
+        if n == 0x1003 {
+            return "Opus".into();
+        }
+        if n == 0x2003 {
+            return "ALAC".into();
+        }
+    }
+    raw
+}
+
 /// Downmix/upmix to stereo without extra gain. Mono is doubled; >2 channels fold to L/R.
 pub fn to_stereo(interleaved: &[f32], channels: u16) -> Vec<f32> {
     match channels {
@@ -261,6 +324,8 @@ mod tests {
         let mut dec = Decoder::open(&path).unwrap();
         assert_eq!(dec.spec().sample_rate, 44100);
         assert_eq!(dec.spec().channels, 1);
+        assert_eq!(dec.spec().bits_per_sample, 16);
+        assert_eq!(dec.spec().codec, "PCM");
         let samples = dec.read_interleaved(1000).unwrap();
         assert!(samples.len() >= 1000);
         let peak = samples.iter().fold(0.0f32, |a, s| a.max(s.abs()));

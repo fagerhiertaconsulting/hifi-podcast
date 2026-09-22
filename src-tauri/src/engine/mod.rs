@@ -8,6 +8,7 @@ mod exclusive;
 mod formats;
 mod output;
 mod player;
+mod quality;
 mod resample;
 mod ring;
 mod skip;
@@ -71,6 +72,8 @@ mod tests {
         assert_eq!(probe.support.kind, FormatKind::Pcm);
         assert_eq!(probe.sample_rate, Some(48000));
         assert_eq!(probe.channels, Some(2));
+        assert_eq!(probe.bits_per_sample, Some(16));
+        assert_eq!(probe.codec.as_deref(), Some("PCM"));
         assert!(probe.support.native_decode);
     }
 
@@ -117,6 +120,7 @@ mod tests {
         assert!(probe.support.native_decode);
         assert_eq!(probe.sample_rate, Some(11_289_600));
         assert_eq!(probe.codec.as_deref(), Some("DSD"));
+        assert_eq!(probe.bits_per_sample, Some(1));
         let h = Handle::new();
         let err = h
             .open(OpenParams {
