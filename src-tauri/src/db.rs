@@ -1,12 +1,18 @@
 use crate::error::AppResult;
 use crate::models::{
-    AdSegment, Bookmark, Chapter, DeleteEpisodeFileOutcome, Download, Episode, InboxItem, JobRow,
-    LibraryStats, MusicAlbum, MusicPlaybackState, MusicTrack, PlaybackState, Podcast,
-    PodcastSettings, QueueItem, Transcript, TranscriptSegment, UnsubscribeOutcome,
+    AdSegment, Bookmark, Chapter, DeleteEpisodeFileOutcome, Download, Episode,
+    FinishedCleanupOutcome, FinishedCleanupSettings, InboxItem, JobRow, LibraryStats, MusicAlbum,
+    MusicPlaybackState, MusicTrack, PlaybackState, Podcast, PodcastSettings, QueueItem, Transcript,
+    TranscriptSegment, UnsubscribeOutcome,
 };
 use rusqlite::{params, Connection, OptionalExtension};
 
 const SIDELOAD_FEED_URL: &str = "local://sideload";
+const FINISHED_CLEANUP_ENABLED_KEY: &str = "delete_finished_enabled";
+const FINISHED_CLEANUP_DAYS_KEY: &str = "delete_finished_days";
+const FINISHED_CLEANUP_DEFAULT_DAYS: i64 = 7;
+const FINISHED_CLEANUP_MIN_DAYS: i64 = 1;
+const FINISHED_CLEANUP_MAX_DAYS: i64 = 365;
 
 pub fn initialize(conn: &Connection) -> AppResult<()> {
     conn.execute_batch(
@@ -246,6 +252,33 @@ pub fn save_audio_engine_settings(
         "audio_skip_silence",
         if settings.skip_silence { "1" } else { "0" },
     )?;
+    Ok(())
+}
+
+pub fn finished_cleanup_settings(conn: &Connection) -> AppResult<FinishedCleanupSettings> {
+    let enabled = get_setting(conn, FINISHED_CLEANUP_ENABLED_KEY)?.as_deref() == Some("1");
+    let days = get_setting(conn, FINISHED_CLEANUP_DAYS_KEY)?
+        .and_then(|raw| raw.trim().parse::<i64>().ok())
+        .filter(|days| (FINISHED_CLEANUP_MIN_DAYS..=FINISHED_CLEANUP_MAX_DAYS).contains(days))
+        .unwrap_or(FINISHED_CLEANUP_DEFAULT_DAYS);
+    Ok(FinishedCleanupSettings { enabled, days })
+}
+
+pub fn save_finished_cleanup_settings(
+    conn: &Connection,
+    settings: &FinishedCleanupSettings,
+) -> AppResult<()> {
+    if !(FINISHED_CLEANUP_MIN_DAYS..=FINISHED_CLEANUP_MAX_DAYS).contains(&settings.days) {
+        return Err(crate::error::AppError::msg(
+            "Antal dagar måste vara mellan 1 och 365.",
+        ));
+    }
+    set_setting(
+        conn,
+        FINISHED_CLEANUP_ENABLED_KEY,
+        if settings.enabled { "1" } else { "0" },
+    )?;
+    set_setting(conn, FINISHED_CLEANUP_DAYS_KEY, &settings.days.to_string())?;
     Ok(())
 }
 
@@ -731,6 +764,98 @@ pub fn delete_episode_local_file(
         files_removed: deleted.removed_files,
         warnings: deleted.warnings,
     })
+}
+
+fn playback_finished_before(
+    finished: chrono::DateTime<chrono::Utc>,
+    now: chrono::DateTime<chrono::Utc>,
+    days: i64,
+) -> bool {
+    if !(FINISHED_CLEANUP_MIN_DAYS..=FINISHED_CLEANUP_MAX_DAYS).contains(&days) {
+        return false;
+    }
+    match finished.checked_add_signed(chrono::Duration::days(days)) {
+        Some(limit) => limit < now,
+        None => false,
+    }
+}
+
+/// When the setting is on, delete local files for episodes whose playback
+/// `completed` flag is set and whose `last_played_at` is strictly older than
+/// N days. Each file goes through the single-episode delete path.
+pub fn purge_finished_episode_files(
+    conn: &Connection,
+    media_root: &std::path::Path,
+    now: chrono::DateTime<chrono::Utc>,
+) -> AppResult<FinishedCleanupOutcome> {
+    let settings = finished_cleanup_settings(conn)?;
+    if !settings.enabled {
+        return Ok(FinishedCleanupOutcome {
+            enabled: false,
+            days: settings.days,
+            files_removed: 0,
+            warnings: Vec::new(),
+        });
+    }
+
+    let mut stmt =
+        conn.prepare("SELECT episode_id, last_played_at FROM playback_state WHERE completed = 1")?;
+    let rows = stmt.query_map([], |row| {
+        Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?))
+    })?;
+    let mut due = Vec::new();
+    for row in rows {
+        let (episode_id, last_played_at) = row?;
+        let Some(raw) = last_played_at
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            continue;
+        };
+        let Some(finished) = parse_utc_timestamp(raw) else {
+            continue;
+        };
+        if playback_finished_before(finished, now, settings.days) {
+            due.push(episode_id);
+        }
+    }
+    drop(stmt);
+
+    let mut files_removed = 0i64;
+    let mut warnings = Vec::new();
+    for episode_id in due {
+        match delete_episode_local_file(conn, media_root, episode_id) {
+            Ok(outcome) => {
+                files_removed += outcome.files_removed;
+                for warning in outcome.warnings {
+                    push_cleanup_warning(&mut warnings, warning);
+                }
+            }
+            Err(_) => {
+                push_cleanup_warning(
+                    &mut warnings,
+                    "En färdigspelad fil kunde inte raderas och lämnades kvar.".into(),
+                );
+            }
+        }
+    }
+
+    Ok(FinishedCleanupOutcome {
+        enabled: true,
+        days: settings.days,
+        files_removed,
+        warnings,
+    })
+}
+
+fn push_cleanup_warning(warnings: &mut Vec<String>, warning: String) {
+    const MAX_WARNINGS: usize = 24;
+    if warnings.len() < MAX_WARNINGS {
+        warnings.push(warning);
+    } else if warnings.len() == MAX_WARNINGS {
+        warnings.push("Ytterligare varningar utelämnades.".into());
+    }
 }
 
 pub fn update_podcast_settings(
@@ -2683,6 +2808,401 @@ mod tests {
         remember_file(&conn, linked_ep, &linked_file);
         set_episode_status(&conn, linked_ep, "downloaded").unwrap();
         let linked = delete_episode_local_file(&conn, &media, linked_ep).unwrap();
+        assert_eq!(linked.files_removed, 0);
+        assert!(linked.warnings.iter().any(|w| w.contains("symlänk")));
+        assert_eq!(std::fs::read(&linked_file).unwrap(), b"linked");
+        assert!(linked_show
+            .symlink_metadata()
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(get_episode(&conn, linked_ep).unwrap().status, "downloaded");
+        assert!(get_download(&conn, linked_ep).unwrap().is_some());
+        assert_eq!(get_podcast(&conn, linked_id).unwrap().title, "Symlänkad");
+    }
+
+    fn mark_played(conn: &Connection, episode_id: i64, completed: bool, at: Option<&str>) {
+        save_playback(
+            conn,
+            &PlaybackState {
+                episode_id,
+                position_ms: if completed { 1_000 } else { 10 },
+                speed: 1.0,
+                completed,
+                last_played_at: at.map(str::to_string),
+            },
+        )
+        .unwrap();
+    }
+
+    fn place_downloaded(
+        conn: &Connection,
+        show: &std::path::Path,
+        episode_id: i64,
+    ) -> std::path::PathBuf {
+        std::fs::create_dir_all(show).unwrap();
+        let path = show.join(format!("{episode_id}.mp3"));
+        std::fs::write(&path, b"audio").unwrap();
+        remember_file(conn, episode_id, &path);
+        set_episode_status(conn, episode_id, "downloaded").unwrap();
+        path
+    }
+
+    #[test]
+    fn finished_cleanup_defaults_off() {
+        let conn = open_db();
+        let settings = finished_cleanup_settings(&conn).unwrap();
+        assert!(!settings.enabled);
+        assert_eq!(settings.days, 7);
+
+        set_setting(&conn, "delete_finished_enabled", "true").unwrap();
+        set_setting(&conn, "delete_finished_days", "0").unwrap();
+        let settings = finished_cleanup_settings(&conn).unwrap();
+        assert!(!settings.enabled);
+        assert_eq!(settings.days, 7);
+
+        set_setting(&conn, "delete_finished_enabled", "1").unwrap();
+        set_setting(&conn, "delete_finished_days", "9999").unwrap();
+        let settings = finished_cleanup_settings(&conn).unwrap();
+        assert!(settings.enabled);
+        assert_eq!(settings.days, 7);
+
+        let rejected = save_finished_cleanup_settings(
+            &conn,
+            &FinishedCleanupSettings {
+                enabled: true,
+                days: 0,
+            },
+        )
+        .unwrap_err();
+        assert!(rejected.to_string().contains("1 och 365"));
+        assert!(save_finished_cleanup_settings(
+            &conn,
+            &FinishedCleanupSettings {
+                enabled: true,
+                days: 366,
+            },
+        )
+        .is_err());
+        let settings = finished_cleanup_settings(&conn).unwrap();
+        assert!(settings.enabled);
+        assert_eq!(settings.days, 7);
+
+        save_finished_cleanup_settings(
+            &conn,
+            &FinishedCleanupSettings {
+                enabled: true,
+                days: 1,
+            },
+        )
+        .unwrap();
+        assert!(finished_cleanup_settings(&conn).unwrap().enabled);
+        assert_eq!(finished_cleanup_settings(&conn).unwrap().days, 1);
+
+        save_finished_cleanup_settings(
+            &conn,
+            &FinishedCleanupSettings {
+                enabled: false,
+                days: 14,
+            },
+        )
+        .unwrap();
+        let settings = finished_cleanup_settings(&conn).unwrap();
+        assert!(!settings.enabled);
+        assert_eq!(settings.days, 14);
+
+        let dir = tempfile::tempdir().unwrap();
+        let media = dir.path().join("media");
+        crate::download::ensure_media_layout(&media).unwrap();
+        let (pid, eid) = add_show(&conn, "https://off.example/feed.xml", "Av");
+        let show = media.join("podcasts").join(pid.to_string());
+        let file = place_downloaded(&conn, &show, eid);
+        let now = chrono::Utc::now();
+        let old = (now - chrono::Duration::days(30)).to_rfc3339();
+        mark_played(&conn, eid, true, Some(&old));
+
+        let outcome = purge_finished_episode_files(&conn, &media, now).unwrap();
+        assert!(!outcome.enabled);
+        assert_eq!(outcome.days, 14);
+        assert_eq!(outcome.files_removed, 0);
+        assert!(outcome.warnings.is_empty());
+        assert_eq!(std::fs::read(&file).unwrap(), b"audio");
+        assert_eq!(get_episode(&conn, eid).unwrap().status, "downloaded");
+        assert!(get_download(&conn, eid)
+            .unwrap()
+            .unwrap()
+            .file_path
+            .is_some());
+        assert!(get_playback(&conn, eid).unwrap().unwrap().completed);
+    }
+
+    #[test]
+    fn purge_finished_deletes_only_files_older_than_n_days() {
+        let dir = tempfile::tempdir().unwrap();
+        let media = dir.path().join("media");
+        crate::download::ensure_media_layout(&media).unwrap();
+        let conn = open_db();
+        save_finished_cleanup_settings(
+            &conn,
+            &FinishedCleanupSettings {
+                enabled: true,
+                days: 7,
+            },
+        )
+        .unwrap();
+
+        let (pid, old_id) = add_show(&conn, "https://age.example/feed.xml", "Ålder");
+        let show = media.join("podcasts").join(pid.to_string());
+        let now = chrono::Utc::now();
+        let ago = |days: i64, extra_secs: i64| {
+            (now - chrono::Duration::days(days) - chrono::Duration::seconds(extra_secs))
+                .to_rfc3339()
+        };
+        let add = |guid: &str, title: &str| {
+            upsert_episode(
+                &conn,
+                pid,
+                guid,
+                title,
+                None,
+                Some("https://cdn.example/ep.mp3"),
+                None,
+                Some(1_000),
+            )
+            .unwrap()
+        };
+
+        let exact_id = add("exact", "Exakt");
+        let recent_id = add("recent", "Nyligen");
+        let just_id = add("just", "Precis");
+        let open_id = add("open", "Pågår");
+        let notime_id = add("notime", "Utan tid");
+        let bad_id = add("bad", "Dålig tid");
+
+        let old_file = place_downloaded(&conn, &show, old_id);
+        let exact_file = place_downloaded(&conn, &show, exact_id);
+        let recent_file = place_downloaded(&conn, &show, recent_id);
+        let just_file = place_downloaded(&conn, &show, just_id);
+        let open_file = place_downloaded(&conn, &show, open_id);
+        let notime_file = place_downloaded(&conn, &show, notime_id);
+        let bad_file = place_downloaded(&conn, &show, bad_id);
+        let cover = show.join("cover.jpg");
+        std::fs::write(&cover, b"jpeg").unwrap();
+        let music = media.join("music").join("done.flac");
+        std::fs::write(&music, b"flac").unwrap();
+
+        mark_played(&conn, old_id, true, Some(&ago(8, 0)));
+        mark_played(&conn, exact_id, true, Some(&ago(7, 0)));
+        mark_played(&conn, recent_id, true, Some(&ago(6, 0)));
+        mark_played(&conn, just_id, true, Some(&ago(7, 1)));
+        mark_played(&conn, open_id, false, Some(&ago(40, 0)));
+        mark_played(&conn, notime_id, true, None);
+        mark_played(&conn, bad_id, true, Some("inte-ett-datum"));
+
+        let (other_pid, other_id) = add_show(&conn, "https://other-age.example/feed.xml", "Annan");
+        let other_file = place_downloaded(
+            &conn,
+            &media.join("podcasts").join(other_pid.to_string()),
+            other_id,
+        );
+        mark_played(&conn, other_id, false, Some(&ago(90, 0)));
+
+        let outcome = purge_finished_episode_files(&conn, &media, now).unwrap();
+        assert!(outcome.enabled);
+        assert_eq!(outcome.days, 7);
+        assert_eq!(outcome.files_removed, 2);
+        assert!(outcome.warnings.is_empty());
+        assert!(!old_file.exists());
+        assert!(!just_file.exists());
+        assert_eq!(std::fs::read(&exact_file).unwrap(), b"audio");
+        assert_eq!(std::fs::read(&recent_file).unwrap(), b"audio");
+        assert_eq!(std::fs::read(&open_file).unwrap(), b"audio");
+        assert_eq!(std::fs::read(&notime_file).unwrap(), b"audio");
+        assert_eq!(std::fs::read(&bad_file).unwrap(), b"audio");
+        assert_eq!(std::fs::read(&cover).unwrap(), b"jpeg");
+        assert_eq!(std::fs::read(&music).unwrap(), b"flac");
+        assert_eq!(std::fs::read(&other_file).unwrap(), b"audio");
+        assert!(show.is_dir());
+        let removed = get_episode(&conn, old_id).unwrap();
+        assert_eq!(removed.title, "Avsnitt");
+        assert_eq!(removed.status, "new");
+        assert!(get_download(&conn, old_id).unwrap().is_none());
+        assert!(get_playback(&conn, old_id).unwrap().unwrap().completed);
+        assert_eq!(get_episode(&conn, exact_id).unwrap().status, "downloaded");
+        assert_eq!(get_episode(&conn, open_id).unwrap().status, "downloaded");
+        assert_eq!(get_podcast(&conn, pid).unwrap().title, "Ålder");
+        assert_eq!(list_episodes(&conn, pid).unwrap().len(), 7);
+
+        save_finished_cleanup_settings(
+            &conn,
+            &FinishedCleanupSettings {
+                enabled: true,
+                days: 3,
+            },
+        )
+        .unwrap();
+        let tighter = purge_finished_episode_files(&conn, &media, now).unwrap();
+        assert_eq!(tighter.days, 3);
+        assert_eq!(tighter.files_removed, 2);
+        assert!(!exact_file.exists());
+        assert!(!recent_file.exists());
+        assert_eq!(std::fs::read(&open_file).unwrap(), b"audio");
+        assert_eq!(std::fs::read(&notime_file).unwrap(), b"audio");
+        assert_eq!(std::fs::read(&bad_file).unwrap(), b"audio");
+        assert_eq!(std::fs::read(&other_file).unwrap(), b"audio");
+        assert_eq!(std::fs::read(&music).unwrap(), b"flac");
+        assert_eq!(get_episode(&conn, open_id).unwrap().status, "downloaded");
+    }
+
+    #[test]
+    fn purge_finished_keeps_paths_outside_the_episode_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let media = dir.path().join("media");
+        crate::download::ensure_media_layout(&media).unwrap();
+        let conn = open_db();
+        save_finished_cleanup_settings(
+            &conn,
+            &FinishedCleanupSettings {
+                enabled: true,
+                days: 7,
+            },
+        )
+        .unwrap();
+        let now = chrono::Utc::now();
+        let old = (now - chrono::Duration::days(10)).to_rfc3339();
+
+        let (pid, eid) = add_show(&conn, "https://path.example/feed.xml", "Sökväg");
+        let show = media.join("podcasts").join(pid.to_string());
+        let own = place_downloaded(&conn, &show, eid);
+        let part = show.join(format!("{eid}.part"));
+        std::fs::write(&part, b"part").unwrap();
+        let exe = show.join(format!("{eid}.exe"));
+        std::fs::write(&exe, b"exe").unwrap();
+        let nested = show.join("extra").join(format!("{eid}.mp3"));
+        std::fs::create_dir_all(nested.parent().unwrap()).unwrap();
+        std::fs::write(&nested, b"nested").unwrap();
+        let cover = show.join("cover.jpg");
+        std::fs::write(&cover, b"jpeg").unwrap();
+        let secret = dir.path().join("secret.mp3");
+        std::fs::write(&secret, b"secret").unwrap();
+        let escaped = show.join("..").join("..").join("secret.mp3");
+        remember_file(&conn, eid, &escaped);
+        mark_played(&conn, eid, true, Some(&old));
+
+        let sibling = upsert_episode(
+            &conn,
+            pid,
+            "sibling",
+            "Syskon",
+            None,
+            Some("https://cdn.example/other.mp3"),
+            None,
+            Some(1_000),
+        )
+        .unwrap();
+        let sibling_file = place_downloaded(&conn, &show, sibling);
+        mark_played(&conn, sibling, false, Some(&old));
+
+        let (other_pid, other_id) = add_show(&conn, "https://decoy.example/feed.xml", "Lockbete");
+        let other_show = media.join("podcasts").join(other_pid.to_string());
+        std::fs::create_dir_all(&other_show).unwrap();
+        let decoy = other_show.join(format!("{eid}.mp3"));
+        std::fs::write(&decoy, b"decoy").unwrap();
+        let other_file = place_downloaded(&conn, &other_show, other_id);
+        mark_played(&conn, other_id, false, Some(&old));
+
+        let (dir_pid, dir_eid) = add_show(&conn, "https://dir.example/feed.xml", "Katalog");
+        let fake_dir = media
+            .join("podcasts")
+            .join(dir_pid.to_string())
+            .join(format!("{dir_eid}.mp3"));
+        std::fs::create_dir_all(&fake_dir).unwrap();
+        let inside = fake_dir.join("inside.txt");
+        std::fs::write(&inside, b"inside").unwrap();
+        remember_file(&conn, dir_eid, &fake_dir);
+        set_episode_status(&conn, dir_eid, "downloaded").unwrap();
+        mark_played(&conn, dir_eid, true, Some(&old));
+
+        let music = media.join("music").join("album.flac");
+        std::fs::write(&music, b"music").unwrap();
+
+        let outcome = purge_finished_episode_files(&conn, &media, now).unwrap();
+        assert_eq!(outcome.files_removed, 2);
+        assert!(outcome.warnings.iter().any(|w| w.contains("utanför")));
+        assert!(outcome.warnings.iter().any(|w| w.contains("katalog")));
+        assert!(!own.exists());
+        assert!(!part.exists());
+        assert_eq!(std::fs::read(&exe).unwrap(), b"exe");
+        assert_eq!(std::fs::read(&nested).unwrap(), b"nested");
+        assert_eq!(std::fs::read(&cover).unwrap(), b"jpeg");
+        assert_eq!(std::fs::read(&secret).unwrap(), b"secret");
+        assert_eq!(std::fs::read(&sibling_file).unwrap(), b"audio");
+        assert_eq!(std::fs::read(&decoy).unwrap(), b"decoy");
+        assert_eq!(std::fs::read(&other_file).unwrap(), b"audio");
+        assert_eq!(std::fs::read(&inside).unwrap(), b"inside");
+        assert_eq!(std::fs::read(&music).unwrap(), b"music");
+        assert!(show.is_dir());
+        assert!(fake_dir.is_dir());
+        assert_eq!(get_episode(&conn, eid).unwrap().status, "new");
+        assert!(get_download(&conn, eid).unwrap().is_none());
+        assert_eq!(get_episode(&conn, dir_eid).unwrap().status, "downloaded");
+        assert!(get_download(&conn, dir_eid).unwrap().is_some());
+        assert_eq!(get_podcast(&conn, pid).unwrap().title, "Sökväg");
+        assert_eq!(get_podcast(&conn, other_pid).unwrap().title, "Lockbete");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn purge_finished_does_not_follow_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let media = dir.path().join("media");
+        crate::download::ensure_media_layout(&media).unwrap();
+        let conn = open_db();
+        save_finished_cleanup_settings(
+            &conn,
+            &FinishedCleanupSettings {
+                enabled: true,
+                days: 7,
+            },
+        )
+        .unwrap();
+        let now = chrono::Utc::now();
+        let old = (now - chrono::Duration::days(10)).to_rfc3339();
+
+        let (pid, eid) = add_show(&conn, "https://link-purge.example/feed.xml", "Länk");
+        let show = media.join("podcasts").join(pid.to_string());
+        std::fs::create_dir_all(&show).unwrap();
+        let outside = dir.path().join("outside.mp3");
+        std::fs::write(&outside, b"outside").unwrap();
+        let link = show.join(format!("{eid}.mp3"));
+        symlink(&outside, &link).unwrap();
+        remember_file(&conn, eid, &link);
+        set_episode_status(&conn, eid, "downloaded").unwrap();
+        mark_played(&conn, eid, true, Some(&old));
+
+        let outcome = purge_finished_episode_files(&conn, &media, now).unwrap();
+        assert_eq!(outcome.files_removed, 1);
+        assert!(outcome.warnings.is_empty());
+        assert!(!link.exists());
+        assert_eq!(std::fs::read(&outside).unwrap(), b"outside");
+        assert!(get_download(&conn, eid).unwrap().is_none());
+        assert_eq!(get_episode(&conn, eid).unwrap().title, "Avsnitt");
+
+        let (linked_id, linked_ep) =
+            add_show(&conn, "https://linked-purge.example/feed.xml", "Symlänkad");
+        let linked_target = dir.path().join("linked-target");
+        let linked_file = linked_target.join(format!("{linked_ep}.mp3"));
+        std::fs::create_dir_all(&linked_target).unwrap();
+        std::fs::write(&linked_file, b"linked").unwrap();
+        let linked_show = media.join("podcasts").join(linked_id.to_string());
+        symlink(&linked_target, &linked_show).unwrap();
+        remember_file(&conn, linked_ep, &linked_file);
+        set_episode_status(&conn, linked_ep, "downloaded").unwrap();
+        mark_played(&conn, linked_ep, true, Some(&old));
+
+        let linked = purge_finished_episode_files(&conn, &media, now).unwrap();
         assert_eq!(linked.files_removed, 0);
         assert!(linked.warnings.iter().any(|w| w.contains("symlänk")));
         assert_eq!(std::fs::read(&linked_file).unwrap(), b"linked");

@@ -50,6 +50,7 @@ pub fn run() {
             let _ = db::rewrite_legacy_download_paths(&conn, &media_root);
             let _ = db::backfill_download_mime(&conn);
             let _ = db::requeue_running_jobs(&conn);
+            let _ = db::purge_finished_episode_files(&conn, &media_root, chrono::Utc::now());
             let smtc = smtc::init(app);
             let engine = engine::Handle::new();
             app.manage(AppState {
@@ -103,6 +104,8 @@ pub fn run() {
             commands::refresh_feed,
             commands::unsubscribe_podcast,
             commands::delete_episode_file,
+            commands::get_finished_cleanup_settings,
+            commands::save_finished_cleanup_settings,
             commands::import_opml,
             commands::import_opml_file,
             commands::export_opml,
