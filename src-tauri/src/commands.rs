@@ -1,4 +1,5 @@
 use crate::asr;
+use crate::auto_download;
 use crate::db;
 use crate::download;
 use crate::error::AppResult;
@@ -71,7 +72,14 @@ async fn subscribe_url(state: &AppState, url: &str) -> AppResult<SubscribeOutcom
             parsed.guid.as_deref(),
             parsed.language.as_deref(),
         )?;
-        let mut download_ids = Vec::new();
+        let known_before_fetch = db::episodes_seen_before_fetch(&conn, podcast_id)?
+            .into_iter()
+            .map(|row| auto_download::KnownEpisode {
+                guid: row.guid,
+                file_present: row.file_present,
+            })
+            .collect::<Vec<_>>();
+        let mut fetched = Vec::new();
         for episode in parsed.episodes {
             let eid = db::upsert_subscribed_episode(
                 &conn,
@@ -83,19 +91,30 @@ async fn subscribe_url(state: &AppState, url: &str) -> AppResult<SubscribeOutcom
                 episode.publish_at.as_deref(),
                 episode.duration_ms,
             )?;
-            if episode.audio_url.is_some() && !db::download_is_done(&conn, eid) {
-                download_ids.push((eid, episode.title));
-            }
+            let has_audio_url = episode
+                .audio_url
+                .as_deref()
+                .is_some_and(|url| !url.trim().is_empty());
+            fetched.push(auto_download::FetchedEpisode {
+                episode_id: eid,
+                guid: episode.guid,
+                title: episode.title,
+                has_audio_url,
+            });
         }
-        (db::get_podcast(&conn, podcast_id)?, download_ids)
+        let podcast = db::get_podcast(&conn, podcast_id)?;
+        let download_ids = auto_download::select_auto_downloads(
+            podcast.auto_download,
+            &known_before_fetch,
+            &fetched,
+        );
+        (podcast, download_ids)
     };
     let mut warnings = Vec::new();
-    if podcast.auto_download {
-        for (eid, title) in download_ids {
-            match download_episode_inner(state, eid).await {
-                Ok(_) => {}
-                Err(err) => warnings.push(format!("{title}: {err}")),
-            }
+    for item in download_ids {
+        match download_episode_inner(state, item.episode_id).await {
+            Ok(_) => {}
+            Err(err) => warnings.push(format!("{}: {err}", item.title)),
         }
     }
     Ok(SubscribeOutcome { podcast, warnings })

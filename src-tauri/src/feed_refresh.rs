@@ -1,7 +1,8 @@
 //! Automatic feed refresh at startup and every 60 minutes.
 //!
-//! Only feed URLs already stored as subscriptions are eligible. The download
-//! selection inside `subscribe_url` is left unchanged.
+//! Only feed URLs already stored as subscriptions are eligible. When
+//! auto-download is on, `subscribe_url` queues episodes that are new since
+//! the previous fetch and downloads them on the existing validated path.
 
 use crate::commands;
 use crate::db;

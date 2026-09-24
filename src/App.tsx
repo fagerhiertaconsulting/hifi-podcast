@@ -1728,6 +1728,10 @@ function Library(props: {
                   />
                   Auto-nedladdning
                 </label>
+                <p className="auto-download-note">
+                  Bara avsnitt som är nya sedan förra hämtningen. Äldre avsnitt
+                  utan fil laddas inte ner automatiskt.
+                </p>
                 <label className="check">
                   <input
                     type="checkbox"

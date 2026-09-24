@@ -1,4 +1,5 @@
 mod asr;
+mod auto_download;
 mod commands;
 mod db;
 mod download;
