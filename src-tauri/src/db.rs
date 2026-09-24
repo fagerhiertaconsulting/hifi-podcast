@@ -1648,6 +1648,34 @@ pub fn download_is_done(conn: &Connection, episode_id: i64) -> bool {
     matches!(get_download(conn, episode_id), Ok(Some(d)) if d.state == "done")
 }
 
+/// Episodes already stored for a show, before the current fetch upserts.
+/// `file_present` is true only when the download row is completed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EpisodeSeenBeforeFetch {
+    pub guid: String,
+    pub file_present: bool,
+}
+
+pub fn episodes_seen_before_fetch(
+    conn: &Connection,
+    podcast_id: i64,
+) -> AppResult<Vec<EpisodeSeenBeforeFetch>> {
+    let mut stmt = conn.prepare(
+        "SELECT e.guid, CASE WHEN d.state = 'done' THEN 1 ELSE 0 END
+         FROM episode e
+         LEFT JOIN download d ON d.episode_id = e.id
+         WHERE e.podcast_id = ?1
+         ORDER BY e.id",
+    )?;
+    let rows = stmt.query_map(params![podcast_id], |row| {
+        Ok(EpisodeSeenBeforeFetch {
+            guid: row.get(0)?,
+            file_present: row.get::<_, i64>(1)? != 0,
+        })
+    })?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+}
+
 fn music_album_key(title: &str, artist: &str) -> String {
     format!(
         "{}|||{}",

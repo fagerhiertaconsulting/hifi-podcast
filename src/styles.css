@@ -144,10 +144,17 @@ textarea {
   flex: 1;
 }
 
-.auto-refresh-note {
+.auto-refresh-note,
+.auto-download-note {
   margin: 0.35rem 0 0;
   font-size: 0.82rem;
   color: var(--muted);
+}
+
+.auto-download-note {
+  flex-basis: 100%;
+  margin: 0;
+  line-height: 1.4;
 }
 
 .library textarea {
