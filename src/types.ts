@@ -184,6 +184,18 @@ export type UpnpSettings = {
   port: number;
 };
 
+export type FinishedCleanupSettings = {
+  enabled: boolean;
+  days: number;
+};
+
+export type FinishedCleanupOutcome = {
+  enabled: boolean;
+  days: number;
+  files_removed: number;
+  warnings: string[];
+};
+
 export type UpnpStatus = {
   running: boolean;
   bind: string;

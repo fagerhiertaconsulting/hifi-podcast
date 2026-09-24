@@ -1960,6 +1960,100 @@ function QueueView(props: {
   );
 }
 
+function FinishedCleanupPanel(props: { onStatus: (s: string) => void }) {
+  const [enabled, setEnabled] = useState(false);
+  const [days, setDays] = useState(7);
+  const [busy, setBusy] = useState(false);
+
+  const refresh = useCallback(async () => {
+    const settings = await api.getFinishedCleanupSettings();
+    setEnabled(settings.enabled);
+    setDays(settings.days);
+  }, []);
+
+  useEffect(() => {
+    void refresh().catch((err) => props.onStatus(String(err)));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [refresh]);
+
+  const save = async () => {
+    const nextDays = Math.round(days);
+    if (!Number.isInteger(nextDays) || nextDays < 1 || nextDays > 365) {
+      props.onStatus("Antal dagar måste vara mellan 1 och 365.");
+      return;
+    }
+    setBusy(true);
+    try {
+      const outcome = await api.saveFinishedCleanupSettings({
+        enabled,
+        days: nextDays,
+      });
+      setEnabled(outcome.enabled);
+      setDays(outcome.days);
+      const removed =
+        outcome.files_removed === 0
+          ? "Inga filer raderades."
+          : outcome.files_removed === 1
+            ? "1 lokal fil raderades."
+            : `${outcome.files_removed} lokala filer raderades.`;
+      const extra = outcome.warnings[0] ? ` ${outcome.warnings[0]}` : "";
+      props.onStatus(
+        outcome.enabled
+          ? `Färdigspelade avsnitt raderas efter ${outcome.days} dagar. ${removed}${extra}`
+          : `Automatisk radering av färdigspelade är av. ${removed}${extra}`,
+      );
+    } catch (err) {
+      props.onStatus(String(err));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="upnp-panel">
+      <h2>Färdigspelade avsnitt</h2>
+      <p>
+        Valfritt. Av som standard. När det är på tas bara den lokala filen bort
+        för avsnitt där uppspelningen redan har nått slutet, och bara om det
+        var för mer än det valda antalet dagar sedan. Standard är 7 dagar.
+        Avsnittet finns kvar och kan laddas ner igen. Pågående avsnitt och
+        musik rörs inte.
+      </p>
+      <label className="check">
+        <input
+          type="checkbox"
+          checked={enabled}
+          onChange={(e) => setEnabled(e.target.checked)}
+        />
+        Radera färdigspelade avsnitt efter ett antal dagar
+      </label>
+      <div className="settings-grid">
+        <label>
+          Antal dagar
+          <input
+            type="number"
+            min={1}
+            max={365}
+            step={1}
+            value={days}
+            disabled={!enabled}
+            onChange={(e) => setDays(Number(e.target.value))}
+          />
+        </label>
+      </div>
+      <p className="sidebar-note">
+        Filen måste ligga direkt i poddens mediamapp. En sparad sökväg utanför
+        den mappen används inte, och symlänkar följs inte.
+      </p>
+      <div className="row-actions">
+        <button onClick={() => void save()} disabled={busy}>
+          Spara
+        </button>
+      </div>
+    </div>
+  );
+}
+
 function SettingsView(props: {
   paths: AppPaths | null;
   asr: AsrStatus | null;
@@ -1991,6 +2085,7 @@ function SettingsView(props: {
         />
         Hoppa tystnad globalt (av som standard — påverkar inte dynamik)
       </label>
+      <FinishedCleanupPanel onStatus={props.onStatus} />
       <AudioEnginePanel
         settings={props.engineSettings}
         onSettings={(s) => {

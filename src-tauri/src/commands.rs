@@ -5,10 +5,10 @@ use crate::error::AppResult;
 use crate::feeds;
 use crate::models::{
     AdSegment, AppPaths, AsrStatus, Bookmark, Chapter, DeleteEpisodeFileOutcome, Download, Episode,
-    ImportOutcome, InboxItem, JobRow, LibraryStats, MusicAlbum, MusicImportOutcome,
-    MusicPlaybackState, MusicPlayerPayload, MusicTrack, PlaybackState, Podcast, PodcastSettings,
-    QueueItem, SubscribeOutcome, Transcript, TranscriptSegment, UnsubscribeOutcome, UpnpSettings,
-    UpnpStatus,
+    FinishedCleanupOutcome, FinishedCleanupSettings, ImportOutcome, InboxItem, JobRow,
+    LibraryStats, MusicAlbum, MusicImportOutcome, MusicPlaybackState, MusicPlayerPayload,
+    MusicTrack, PlaybackState, Podcast, PodcastSettings, QueueItem, SubscribeOutcome, Transcript,
+    TranscriptSegment, UnsubscribeOutcome, UpnpSettings, UpnpStatus,
 };
 use crate::AppState;
 use tauri::State;
@@ -130,6 +130,21 @@ pub fn delete_episode_file(
     episode_id: i64,
 ) -> AppResult<DeleteEpisodeFileOutcome> {
     db::delete_episode_local_file(&conn(&state), &state.media_root, episode_id)
+}
+
+#[tauri::command]
+pub fn get_finished_cleanup_settings(state: State<AppState>) -> AppResult<FinishedCleanupSettings> {
+    db::finished_cleanup_settings(&conn(&state))
+}
+
+#[tauri::command]
+pub fn save_finished_cleanup_settings(
+    state: State<AppState>,
+    settings: FinishedCleanupSettings,
+) -> AppResult<FinishedCleanupOutcome> {
+    let conn = conn(&state);
+    db::save_finished_cleanup_settings(&conn, &settings)?;
+    db::purge_finished_episode_files(&conn, &state.media_root, chrono::Utc::now())
 }
 
 #[tauri::command]

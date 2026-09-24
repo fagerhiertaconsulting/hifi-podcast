@@ -267,6 +267,31 @@ pub struct DeleteEpisodeFileOutcome {
     pub warnings: Vec<String>,
 }
 
+/// Optional cleanup of local files for episodes whose playback reached the end.
+/// Off unless the user turns it on. `days` is only used when `enabled` is true.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FinishedCleanupSettings {
+    pub enabled: bool,
+    pub days: i64,
+}
+
+impl Default for FinishedCleanupSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            days: 7,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FinishedCleanupOutcome {
+    pub enabled: bool,
+    pub days: i64,
+    pub files_removed: i64,
+    pub warnings: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ImportOutcome {
     pub podcasts: Vec<Podcast>,

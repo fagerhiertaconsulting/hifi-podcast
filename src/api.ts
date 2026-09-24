@@ -18,6 +18,8 @@ import type {
   QueueItem,
   SubscribeOutcome,
   DeleteEpisodeFileOutcome,
+  FinishedCleanupOutcome,
+  FinishedCleanupSettings,
   UnsubscribeOutcome,
   Transcript,
   TranscriptSegment,
@@ -51,6 +53,10 @@ export const api = {
     invoke<UnsubscribeOutcome>("unsubscribe_podcast", { podcastId, deleteFiles }),
   deleteEpisodeFile: (episodeId: number) =>
     invoke<DeleteEpisodeFileOutcome>("delete_episode_file", { episodeId }),
+  getFinishedCleanupSettings: () =>
+    invoke<FinishedCleanupSettings>("get_finished_cleanup_settings"),
+  saveFinishedCleanupSettings: (settings: FinishedCleanupSettings) =>
+    invoke<FinishedCleanupOutcome>("save_finished_cleanup_settings", { settings }),
   importOpml: (xml: string) => invoke<ImportOutcome>("import_opml", { xml }),
   importOpmlFile: (path: string) =>
     invoke<ImportOutcome>("import_opml_file", { path }),
