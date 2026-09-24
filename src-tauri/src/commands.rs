@@ -73,7 +73,7 @@ async fn subscribe_url(state: &AppState, url: &str) -> AppResult<SubscribeOutcom
         )?;
         let mut download_ids = Vec::new();
         for episode in parsed.episodes {
-            let eid = db::upsert_episode(
+            let eid = db::upsert_subscribed_episode(
                 &conn,
                 podcast_id,
                 &episode.guid,

@@ -6,6 +6,8 @@ use crate::models::{
 };
 use rusqlite::{params, Connection, OptionalExtension};
 
+const SIDELOAD_FEED_URL: &str = "local://sideload";
+
 pub fn initialize(conn: &Connection) -> AppResult<()> {
     conn.execute_batch(
         r#"
@@ -30,7 +32,8 @@ pub fn initialize(conn: &Connection) -> AppResult<()> {
           skip_ads INTEGER NOT NULL DEFAULT 0,
           auto_transcribe INTEGER NOT NULL DEFAULT 0,
           created_at TEXT NOT NULL,
-          updated_at TEXT NOT NULL
+          updated_at TEXT NOT NULL,
+          subscribed_at TEXT
         );
 
         CREATE TABLE IF NOT EXISTS episode (
@@ -84,6 +87,7 @@ pub fn initialize(conn: &Connection) -> AppResult<()> {
     migrate_episode_guid_scope(conn)?;
     migrate_upnp(conn)?;
     migrate_music(conn)?;
+    migrate_subscription_inbox(conn)?;
     Ok(())
 }
 
@@ -501,6 +505,65 @@ fn migrate_episode_guid_scope(conn: &Connection) -> AppResult<()> {
     Ok(())
 }
 
+/// Existing feeds keep their original subscription time. Episodes that were
+/// not published after that time leave the inbox. Sideloaded files are left
+/// alone, and episodes the user already removed from the inbox stay removed.
+fn migrate_subscription_inbox(conn: &Connection) -> AppResult<()> {
+    let _ = conn.execute("ALTER TABLE podcast ADD COLUMN subscribed_at TEXT", []);
+    conn.execute(
+        "UPDATE podcast SET subscribed_at = created_at
+         WHERE subscribed_at IS NULL OR TRIM(subscribed_at) = ''",
+        [],
+    )?;
+    let mut stmt = conn.prepare(
+        r#"
+        SELECT e.id, e.publish_at, p.subscribed_at
+        FROM episode e
+        JOIN podcast p ON p.id = e.podcast_id
+        WHERE e.inbox = 1 AND p.feed_url != ?1
+        "#,
+    )?;
+    let rows: Vec<(i64, Option<String>, Option<String>)> = stmt
+        .query_map(params![SIDELOAD_FEED_URL], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    drop(stmt);
+    for (id, publish_at, subscribed_at) in rows {
+        let cutoff = subscribed_at.unwrap_or_default();
+        if !published_after_subscription(publish_at.as_deref(), &cutoff) {
+            conn.execute(
+                "UPDATE episode SET inbox = 0 WHERE id = ?1 AND inbox = 1",
+                params![id],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn published_after_subscription(publish_at: Option<&str>, subscribed_at: &str) -> bool {
+    match (
+        publish_at.and_then(parse_utc_timestamp),
+        parse_utc_timestamp(subscribed_at),
+    ) {
+        (Some(published), Some(cutoff)) => published > cutoff,
+        _ => false,
+    }
+}
+
+fn parse_utc_timestamp(raw: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(raw) {
+        return Some(dt.with_timezone(&chrono::Utc));
+    }
+    chrono::DateTime::parse_from_rfc2822(raw)
+        .ok()
+        .map(|dt| dt.with_timezone(&chrono::Utc))
+}
+
 fn episode_guid_is_globally_unique(conn: &Connection) -> bool {
     let sql: Option<String> = conn
         .query_row(
@@ -536,8 +599,11 @@ pub fn upsert_podcast(
     let ts = now_rfc3339();
     conn.execute(
         r#"
-        INSERT INTO podcast (guid, title, author, feed_url, description, language, auto_transcribe, created_at, updated_at)
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, ?7, ?7)
+        INSERT INTO podcast (
+          guid, title, author, feed_url, description, language, auto_transcribe,
+          created_at, updated_at, subscribed_at
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, ?7, ?7, ?7)
         ON CONFLICT(feed_url) DO UPDATE SET
           title = excluded.title,
           author = COALESCE(excluded.author, podcast.author),
@@ -560,7 +626,8 @@ pub fn list_podcasts(conn: &Connection) -> AppResult<Vec<Podcast>> {
     let mut stmt = conn.prepare(
         "SELECT id, guid, title, author, feed_url, artwork_path, description,
                 auto_download, speed, intro_skip_sec, outro_skip_sec, skip_silence,
-                language, asr_language, skip_ads, auto_transcribe, created_at, updated_at
+                language, asr_language, skip_ads, auto_transcribe, created_at, updated_at,
+                subscribed_at
          FROM podcast ORDER BY title COLLATE NOCASE",
     )?;
     let rows = stmt.query_map([], map_podcast)?;
@@ -587,6 +654,7 @@ fn map_podcast(row: &rusqlite::Row<'_>) -> rusqlite::Result<Podcast> {
         auto_transcribe: row.get::<_, i64>(15)? != 0,
         created_at: row.get(16)?,
         updated_at: row.get(17)?,
+        subscribed_at: row.get::<_, Option<String>>(18)?.unwrap_or_default(),
     })
 }
 
@@ -594,7 +662,8 @@ pub fn get_podcast(conn: &Connection, id: i64) -> AppResult<Podcast> {
     conn.query_row(
         "SELECT id, guid, title, author, feed_url, artwork_path, description,
                 auto_download, speed, intro_skip_sec, outro_skip_sec, skip_silence,
-                language, asr_language, skip_ads, auto_transcribe, created_at, updated_at
+                language, asr_language, skip_ads, auto_transcribe, created_at, updated_at,
+                subscribed_at
          FROM podcast WHERE id = ?1",
         params![id],
         map_podcast,
@@ -734,6 +803,64 @@ pub fn upsert_episode(
             audio_url,
             publish_at,
             duration_ms,
+            ts
+        ],
+    )?;
+    let id: i64 = conn.query_row(
+        "SELECT id FROM episode WHERE podcast_id = ?1 AND guid = ?2",
+        params![podcast_id, guid],
+        |row| row.get(0),
+    )?;
+    Ok(id)
+}
+
+/// Insert or refresh one feed episode. Inbox is decided only on insert:
+/// the episode must be published strictly after the feed's subscription time.
+/// A later refresh does not move that cutoff or put a back-catalog episode
+/// into the inbox.
+pub fn upsert_subscribed_episode(
+    conn: &Connection,
+    podcast_id: i64,
+    guid: &str,
+    title: &str,
+    description: Option<&str>,
+    audio_url: Option<&str>,
+    publish_at: Option<&str>,
+    duration_ms: Option<i64>,
+) -> AppResult<i64> {
+    let subscribed_at: String = conn
+        .query_row(
+            "SELECT COALESCE(subscribed_at, '') FROM podcast WHERE id = ?1",
+            params![podcast_id],
+            |row| row.get(0),
+        )
+        .map_err(|_| crate::error::AppError::msg("Podcasten hittades inte."))?;
+    let inbox = published_after_subscription(publish_at, &subscribed_at);
+    let ts = now_rfc3339();
+    conn.execute(
+        r#"
+        INSERT INTO episode (
+          podcast_id, guid, title, description, audio_url, publish_at, duration_ms,
+          status, inbox, created_at, updated_at
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'new', ?8, ?9, ?9)
+        ON CONFLICT(podcast_id, guid) DO UPDATE SET
+          title = excluded.title,
+          description = COALESCE(excluded.description, episode.description),
+          audio_url = COALESCE(excluded.audio_url, episode.audio_url),
+          publish_at = COALESCE(excluded.publish_at, episode.publish_at),
+          duration_ms = COALESCE(excluded.duration_ms, episode.duration_ms),
+          updated_at = excluded.updated_at
+        "#,
+        params![
+            podcast_id,
+            guid,
+            title,
+            description,
+            audio_url,
+            publish_at,
+            duration_ms,
+            inbox as i64,
             ts
         ],
     )?;
@@ -1365,7 +1492,7 @@ pub fn library_stats(conn: &Connection) -> AppResult<LibraryStats> {
 pub fn ensure_sideload_podcast(conn: &Connection) -> AppResult<i64> {
     upsert_podcast(
         conn,
-        "local://sideload",
+        SIDELOAD_FEED_URL,
         "Importerade filer",
         Some("Lokal"),
         Some("Ljudfiler importerade utan RSS."),
@@ -2567,5 +2694,305 @@ mod tests {
         assert_eq!(get_episode(&conn, linked_ep).unwrap().status, "downloaded");
         assert!(get_download(&conn, linked_ep).unwrap().is_some());
         assert_eq!(get_podcast(&conn, linked_id).unwrap().title, "Symlänkad");
+    }
+
+    fn inbox_titles(conn: &Connection) -> Vec<String> {
+        let mut titles: Vec<String> = list_inbox(conn)
+            .unwrap()
+            .into_iter()
+            .map(|item| item.episode.title)
+            .collect();
+        titles.sort();
+        titles
+    }
+
+    #[test]
+    fn new_subscription_inbox_only_includes_episodes_published_after() {
+        let conn = open_db();
+        let pid = upsert_podcast(
+            &conn,
+            "https://example.com/feed.xml",
+            "Testpodd",
+            None,
+            None,
+            None,
+            Some("sv"),
+        )
+        .unwrap();
+        let show = get_podcast(&conn, pid).unwrap();
+        let cutoff = chrono::DateTime::parse_from_rfc3339(&show.subscribed_at).unwrap();
+        assert_eq!(show.subscribed_at, show.created_at);
+        let same = cutoff.to_rfc3339();
+        let before = (cutoff - chrono::Duration::seconds(1)).to_rfc3339();
+        let after = (cutoff + chrono::Duration::seconds(1)).to_rfc3339();
+        let later = (cutoff + chrono::Duration::days(2)).to_rfc3339();
+        let rfc_before = (cutoff - chrono::Duration::days(1)).to_rfc2822();
+        let rfc_after = (cutoff + chrono::Duration::days(1)).to_rfc2822();
+        let same_instant_other_offset =
+            cutoff.with_timezone(&chrono::FixedOffset::east_opt(2 * 3600).unwrap());
+
+        let add = |guid: &str, title: &str, publish: Option<&str>| {
+            upsert_subscribed_episode(
+                &conn,
+                pid,
+                guid,
+                title,
+                None,
+                Some("https://cdn.example/a.mp3"),
+                publish,
+                Some(1_000),
+            )
+            .unwrap();
+        };
+        add("old", "Före", Some(&before));
+        add("same", "Samma", Some(&same));
+        add(
+            "offset",
+            "Samma ögonblick",
+            Some(&same_instant_other_offset.to_rfc3339()),
+        );
+        add("new", "Efter", Some(&after));
+        add("undated", "Utan datum", None);
+        add("bad", "Ogiltigt datum", Some("inte-ett-datum"));
+        add("rfc-old", "Rfc före", Some(&rfc_before));
+        add("rfc-new", "Rfc efter", Some(&rfc_after));
+
+        assert_eq!(
+            inbox_titles(&conn),
+            vec!["Efter".to_string(), "Rfc efter".to_string()]
+        );
+        assert_eq!(list_episodes(&conn, pid).unwrap().len(), 8);
+
+        set_inbox(&conn, get_episode_by_guid(&conn, pid, "new"), false, false).unwrap();
+        add("new", "Efter", Some(&after));
+        add("old", "Före uppdaterad", Some(&before));
+        add("later", "Nyare", Some(&later));
+
+        assert_eq!(
+            inbox_titles(&conn),
+            vec!["Nyare".to_string(), "Rfc efter".to_string()]
+        );
+        assert_eq!(
+            get_episode(&conn, get_episode_by_guid(&conn, pid, "old"))
+                .unwrap()
+                .title,
+            "Före uppdaterad"
+        );
+        assert!(
+            !get_episode(&conn, get_episode_by_guid(&conn, pid, "old"))
+                .unwrap()
+                .inbox
+        );
+
+        let cutoff_before_refresh = get_podcast(&conn, pid).unwrap().subscribed_at;
+        upsert_podcast(
+            &conn,
+            "https://example.com/feed.xml",
+            "Nytt namn från feeden",
+            None,
+            None,
+            None,
+            Some("sv"),
+        )
+        .unwrap();
+        let refreshed = get_podcast(&conn, pid).unwrap();
+        assert_eq!(refreshed.title, "Nytt namn från feeden");
+        assert_eq!(refreshed.subscribed_at, cutoff_before_refresh);
+        assert_eq!(
+            inbox_titles(&conn),
+            vec!["Nyare".to_string(), "Rfc efter".to_string()]
+        );
+    }
+
+    fn get_episode_by_guid(conn: &Connection, podcast_id: i64, guid: &str) -> i64 {
+        conn.query_row(
+            "SELECT id FROM episode WHERE podcast_id = ?1 AND guid = ?2",
+            params![podcast_id, guid],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn migration_drops_back_catalog_from_inbox_for_existing_feeds() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            r#"
+            CREATE TABLE podcast (
+              id INTEGER PRIMARY KEY,
+              guid TEXT,
+              title TEXT NOT NULL,
+              author TEXT,
+              feed_url TEXT NOT NULL UNIQUE,
+              artwork_path TEXT,
+              description TEXT,
+              auto_download INTEGER NOT NULL DEFAULT 0,
+              speed REAL NOT NULL DEFAULT 1.0,
+              intro_skip_sec INTEGER NOT NULL DEFAULT 0,
+              outro_skip_sec INTEGER NOT NULL DEFAULT 0,
+              skip_silence INTEGER NOT NULL DEFAULT 0,
+              language TEXT,
+              asr_language TEXT,
+              skip_ads INTEGER NOT NULL DEFAULT 0,
+              auto_transcribe INTEGER NOT NULL DEFAULT 0,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL
+            );
+            CREATE TABLE episode (
+              id INTEGER PRIMARY KEY,
+              podcast_id INTEGER NOT NULL REFERENCES podcast(id) ON DELETE CASCADE,
+              guid TEXT NOT NULL,
+              title TEXT NOT NULL,
+              description TEXT,
+              audio_url TEXT,
+              publish_at TEXT,
+              duration_ms INTEGER,
+              episode_image_path TEXT,
+              status TEXT NOT NULL DEFAULT 'new',
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL,
+              inbox INTEGER NOT NULL DEFAULT 1,
+              archived INTEGER NOT NULL DEFAULT 0,
+              UNIQUE(podcast_id, guid)
+            );
+            "#,
+        )
+        .unwrap();
+        let subscribed = "2024-06-01T12:00:00+00:00";
+        conn.execute(
+            "INSERT INTO podcast (title, feed_url, created_at, updated_at) VALUES (?1, ?2, ?3, ?3)",
+            params!["Befintlig", "https://old.example/feed.xml", subscribed],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO podcast (title, feed_url, created_at, updated_at) VALUES (?1, ?2, ?3, ?3)",
+            params!["Importerade filer", SIDELOAD_FEED_URL, subscribed],
+        )
+        .unwrap();
+        let insert_ep = |podcast_id: i64,
+                         guid: &str,
+                         title: &str,
+                         publish: Option<&str>,
+                         inbox: i64,
+                         archived: i64| {
+            conn.execute(
+                "INSERT INTO episode (podcast_id, guid, title, publish_at, inbox, archived, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)",
+                params![podcast_id, guid, title, publish, inbox, archived, subscribed],
+            )
+            .unwrap();
+        };
+        insert_ep(1, "efter", "Efter", Some("2024-07-01T00:00:00+00:00"), 1, 0);
+        insert_ep(1, "fore", "Före", Some("2024-05-01T00:00:00+00:00"), 1, 1);
+        insert_ep(1, "samma", "Samma", Some(subscribed), 1, 0);
+        insert_ep(1, "zulu", "Zulu före", Some("2024-06-01T11:30:00Z"), 1, 0);
+        insert_ep(
+            1,
+            "offset",
+            "Offset före",
+            Some("2024-06-01T13:30:00+02:00"),
+            1,
+            0,
+        );
+        insert_ep(1, "utan", "Utan datum", None, 1, 0);
+        insert_ep(
+            1,
+            "ogiltigt",
+            "Ogiltigt datum",
+            Some("inte-ett-datum"),
+            1,
+            0,
+        );
+        insert_ep(
+            1,
+            "rfc-efter",
+            "Rfc efter",
+            Some("Tue, 02 Jul 2024 15:00:00 +0000"),
+            1,
+            0,
+        );
+        insert_ep(
+            1,
+            "redan",
+            "Redan borttagen",
+            Some("2024-08-01T00:00:00+00:00"),
+            0,
+            0,
+        );
+        insert_ep(2, "lokal", "Lokal fil", None, 1, 0);
+
+        initialize(&conn).unwrap();
+
+        let show = get_podcast(&conn, 1).unwrap();
+        assert_eq!(show.subscribed_at, subscribed);
+        assert_eq!(
+            inbox_titles(&conn),
+            vec![
+                "Efter".to_string(),
+                "Lokal fil".to_string(),
+                "Rfc efter".to_string()
+            ]
+        );
+        let old = get_episode(&conn, get_episode_by_guid(&conn, 1, "fore")).unwrap();
+        assert!(!old.inbox);
+        assert!(old.archived);
+        assert!(
+            !get_episode(&conn, get_episode_by_guid(&conn, 1, "redan"))
+                .unwrap()
+                .inbox
+        );
+        assert!(
+            get_episode(&conn, get_episode_by_guid(&conn, 2, "lokal"))
+                .unwrap()
+                .inbox
+        );
+
+        initialize(&conn).unwrap();
+        assert_eq!(get_podcast(&conn, 1).unwrap().subscribed_at, subscribed);
+        assert_eq!(
+            inbox_titles(&conn),
+            vec![
+                "Efter".to_string(),
+                "Lokal fil".to_string(),
+                "Rfc efter".to_string()
+            ]
+        );
+
+        upsert_subscribed_episode(
+            &conn,
+            1,
+            "ny-efter",
+            "Ny efter",
+            None,
+            Some("https://cdn.example/new.mp3"),
+            Some("2024-09-01T00:00:00+00:00"),
+            Some(1_000),
+        )
+        .unwrap();
+        upsert_subscribed_episode(
+            &conn,
+            1,
+            "ny-fore",
+            "Ny före",
+            None,
+            Some("https://cdn.example/old.mp3"),
+            Some("2024-01-01T00:00:00+00:00"),
+            Some(1_000),
+        )
+        .unwrap();
+        assert_eq!(
+            inbox_titles(&conn),
+            vec![
+                "Efter".to_string(),
+                "Lokal fil".to_string(),
+                "Ny efter".to_string(),
+                "Rfc efter".to_string()
+            ]
+        );
+        assert!(
+            !get_episode(&conn, get_episode_by_guid(&conn, 1, "ny-fore"))
+                .unwrap()
+                .inbox
+        );
     }
 }

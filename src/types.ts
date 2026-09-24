@@ -17,6 +17,7 @@ export type Podcast = {
   auto_transcribe: boolean;
   created_at: string;
   updated_at: string;
+  subscribed_at: string;
 };
 
 export type PodcastSettings = {

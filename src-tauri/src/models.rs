@@ -20,6 +20,8 @@ pub struct Podcast {
     pub auto_transcribe: bool,
     pub created_at: String,
     pub updated_at: String,
+    /// Set once, when the feed is first added. Inbox episodes must be published after this.
+    pub subscribed_at: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
