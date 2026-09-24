@@ -169,21 +169,44 @@ async fn chapters(app: &AppHandle, episode_id: i64) -> AppResult<()> {
 }
 
 async fn ads(app: &AppHandle, episode_id: i64) -> AppResult<()> {
-    let segments = {
+    let (segments, media_root, podcast_id) = {
         let state = app.state::<AppState>();
         let conn = state.db.lock().expect("db");
-        db::list_segments(&conn, episode_id)?
+        let episode = db::get_episode(&conn, episode_id)?;
+        let segments = db::list_segments(&conn, episode_id)?
             .into_iter()
             .map(|s| intel::Segment {
                 start_ms: s.start_ms,
                 end_ms: s.end_ms,
                 text: s.text,
             })
-            .collect::<Vec<_>>()
+            .collect::<Vec<_>>();
+        (segments, state.media_root.clone(), episode.podcast_id)
     };
-    let ads = intel::detect_ads(&segments);
+    let silence = tokio::task::spawn_blocking(move || {
+        silence_for_episode(&media_root, podcast_id, episode_id)
+    })
+    .await
+    .unwrap_or_default();
+    let found = crate::ad_cut::combine_ads(&segments, &silence);
     let state = app.state::<AppState>();
     let conn = state.db.lock().expect("db");
-    db::replace_ads(&conn, episode_id, &ads)?;
+    db::replace_ads(&conn, episode_id, &found)?;
     Ok(())
+}
+
+fn silence_for_episode(
+    media_root: &std::path::Path,
+    podcast_id: i64,
+    episode_id: i64,
+) -> Vec<intel::AdDraft> {
+    let show = match crate::download::ready_show_dir(media_root, podcast_id) {
+        Ok(show) => show,
+        Err(_) => return Vec::new(),
+    };
+    let path = match crate::download::episode_original_in_show(&show, episode_id) {
+        Ok(path) => path,
+        Err(_) => return Vec::new(),
+    };
+    crate::ad_cut::silence_ads_in_file(&path).unwrap_or_default()
 }

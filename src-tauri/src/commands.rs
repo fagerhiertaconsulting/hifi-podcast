@@ -5,12 +5,12 @@ use crate::download;
 use crate::error::AppResult;
 use crate::feeds;
 use crate::models::{
-    AdSegment, AppPaths, AsrStatus, Bookmark, Chapter, DeleteEpisodeFileOutcome, Download, Episode,
-    FinishedCleanupOutcome, FinishedCleanupSettings, ImportOutcome, InboxItem, JobRow,
-    LibraryStats, MusicAlbum, MusicImportOutcome, MusicPlaybackState, MusicPlayerPayload,
-    MusicTrack, OnlineMetadataOutcome, PlaybackState, Podcast, PodcastSettings, QueueItem,
-    SubscribeOutcome, Transcript, TranscriptSearchHit, TranscriptSegment, UnsubscribeOutcome,
-    UpnpSettings, UpnpStatus,
+    AdSegment, AppPaths, AsrStatus, Bookmark, Chapter, CutAdsOutcome, DeleteEpisodeFileOutcome,
+    Download, Episode, FfmpegStatus, FinishedCleanupOutcome, FinishedCleanupSettings,
+    ImportOutcome, InboxItem, JobRow, LibraryStats, MusicAlbum, MusicImportOutcome,
+    MusicPlaybackState, MusicPlayerPayload, MusicTrack, OnlineMetadataOutcome, PlaybackState,
+    Podcast, PodcastSettings, QueueItem, SubscribeOutcome, Transcript, TranscriptSearchHit,
+    TranscriptSegment, UnsubscribeOutcome, UpnpSettings, UpnpStatus,
 };
 use crate::AppState;
 use tauri::State;
@@ -526,6 +526,117 @@ pub fn list_chapters(state: State<AppState>, episode_id: i64) -> AppResult<Vec<C
 #[tauri::command]
 pub fn list_ads(state: State<AppState>, episode_id: i64) -> AppResult<Vec<AdSegment>> {
     db::list_ads(&conn(&state), episode_id)
+}
+
+#[tauri::command]
+pub fn update_chapter_title(
+    state: State<AppState>,
+    chapter_id: i64,
+    title: String,
+) -> AppResult<Chapter> {
+    db::update_chapter_title(&conn(&state), chapter_id, &title)
+}
+
+#[tauri::command]
+pub fn set_ad_feedback(
+    state: State<AppState>,
+    episode_id: i64,
+    ad_id: Option<i64>,
+    position_ms: i64,
+    label: String,
+) -> AppResult<Vec<AdSegment>> {
+    let conn = conn(&state);
+    let duration_ms = db::get_episode(&conn, episode_id)?.duration_ms;
+    db::set_ad_feedback(&conn, episode_id, ad_id, position_ms, &label, duration_ms)?;
+    db::list_ads(&conn, episode_id)
+}
+
+#[tauri::command]
+pub async fn scan_silence_ads(
+    state: State<'_, AppState>,
+    episode_id: i64,
+) -> AppResult<Vec<AdSegment>> {
+    let (segments, podcast_id, media_root) = {
+        let conn = conn(&state);
+        let episode = db::get_episode(&conn, episode_id)?;
+        let segments = db::list_segments(&conn, episode_id)?
+            .into_iter()
+            .map(|s| crate::intel::Segment {
+                start_ms: s.start_ms,
+                end_ms: s.end_ms,
+                text: s.text,
+            })
+            .collect::<Vec<_>>();
+        (segments, episode.podcast_id, state.media_root.clone())
+    };
+    let silence =
+        tokio::task::spawn_blocking(move || silence_ads_for(&media_root, podcast_id, episode_id))
+            .await
+            .map_err(|err| {
+                crate::error::AppError::msg(format!("Tystnadsanalysen avbröts: {err}"))
+            })??;
+    let found = crate::ad_cut::combine_ads(&segments, &silence);
+    let conn = conn(&state);
+    db::replace_ads(&conn, episode_id, &found)?;
+    db::list_ads(&conn, episode_id)
+}
+
+fn silence_ads_for(
+    media_root: &std::path::Path,
+    podcast_id: i64,
+    episode_id: i64,
+) -> AppResult<Vec<crate::intel::AdDraft>> {
+    let show = download::ready_show_dir(media_root, podcast_id)?;
+    let path = download::episode_original_in_show(&show, episode_id)?;
+    crate::ad_cut::silence_ads_in_file(&path)
+}
+
+#[tauri::command]
+pub async fn cut_episode_ads(
+    state: State<'_, AppState>,
+    episode_id: i64,
+) -> AppResult<CutAdsOutcome> {
+    let (podcast_id, duration_ms, cuts, media_root, data_dir) = {
+        let conn = conn(&state);
+        let episode = db::get_episode(&conn, episode_id)?;
+        let cuts = db::list_ads(&conn, episode_id)?
+            .into_iter()
+            .filter(|ad| ad.enabled && ad.user_label != "not_ad")
+            .map(|ad| (ad.start_ms, ad.end_ms))
+            .collect::<Vec<_>>();
+        (
+            episode.podcast_id,
+            episode.duration_ms.unwrap_or(0),
+            cuts,
+            state.media_root.clone(),
+            state.data_dir.clone(),
+        )
+    };
+    tokio::task::spawn_blocking(move || {
+        crate::ad_cut::cut_marked_ads(
+            &media_root,
+            &data_dir,
+            podcast_id,
+            episode_id,
+            duration_ms,
+            &cuts,
+            None,
+        )
+    })
+    .await
+    .map_err(|err| crate::error::AppError::msg(format!("Klippet avbröts: {err}")))?
+}
+
+#[tauri::command]
+pub fn ffmpeg_status(state: State<AppState>) -> FfmpegStatus {
+    crate::ffmpeg_bin::status(&state.data_dir)
+}
+
+#[tauri::command]
+pub async fn download_ffmpeg(state: State<'_, AppState>) -> AppResult<FfmpegStatus> {
+    let data_dir = state.data_dir.clone();
+    crate::ffmpeg_bin::download_windows_build(&data_dir).await?;
+    Ok(crate::ffmpeg_bin::status(&data_dir))
 }
 
 #[tauri::command]

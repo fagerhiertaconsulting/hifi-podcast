@@ -47,11 +47,18 @@ impl EngineError {
     }
 }
 
+pub fn file_duration_ms(path: &Path) -> Result<i64, EngineError> {
+    decode::file_duration_ms(path)
+}
+
+pub fn collect_rms_windows(path: &Path) -> Result<(Vec<(i64, i64, f32)>, i64), EngineError> {
+    decode::collect_rms_windows(path)
+}
+
 pub fn ensure_under_root(media_root: &Path, path: &Path) -> Result<PathBuf, EngineError> {
     let root = std::fs::canonicalize(media_root)?;
-    let file = std::fs::canonicalize(path).map_err(|_| {
-        EngineError::msg("Ljudfilen hittades inte under media-root.")
-    })?;
+    let file = std::fs::canonicalize(path)
+        .map_err(|_| EngineError::msg("Ljudfilen hittades inte under media-root."))?;
     if !file.starts_with(&root) {
         return Err(EngineError::msg("Otillåten sökväg."));
     }
@@ -106,7 +113,9 @@ mod tests {
         let caps = Handle::capabilities();
         assert!(caps.pcm_mimes.iter().any(|m| m == "audio/flac"));
         assert!(caps.asio_note_sv.contains("ASIO"));
-        assert!(caps.dsd_status_sv.contains("native DSD") || caps.dsd_status_sv.contains("Native DSD"));
+        assert!(
+            caps.dsd_status_sv.contains("native DSD") || caps.dsd_status_sv.contains("Native DSD")
+        );
         assert!(!crate::engine::is_preferred_hi_fi_name("Realtek"));
         assert!(crate::engine::is_preferred_hi_fi_name("FiiO ASIO Driver"));
     }

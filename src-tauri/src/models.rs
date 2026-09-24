@@ -206,6 +206,23 @@ pub struct AdSegment {
     pub confidence: f64,
     pub method: String,
     pub enabled: bool,
+    /// `ad`, `not_ad`, or `unset`.
+    pub user_label: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CutAdsOutcome {
+    pub original_path: String,
+    pub cut_path: String,
+    pub removed_ms: i64,
+    pub bytes: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FfmpegStatus {
+    pub present: bool,
+    pub path: Option<String>,
+    pub hint: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

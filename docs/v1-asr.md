@@ -101,4 +101,8 @@ Först inbäddade ID3-kapitel. Annars genererade från transkriptluckor / ~6 min
 
 ## 5. Reklam
 
-Frasheuristik (specifika sponsorfraser, t.ex. «sponsrad av», «i samarbete med», «this podcast is sponsored») plus tystnadsluckor. Den ensamma frasen «reklam» matchas **inte**, för att undvika falska träffar i vanligt tal. **Skip** under playback. Cut-läge är v2.
+Frasheuristik (specifika sponsorfraser, t.ex. «sponsrad av», «i samarbete med», «this podcast is sponsored») plus tystnadsblock (ungefär 15/30/60 s nära start, mitten eller slut). Den ensamma frasen «reklam» matchas **inte**, för att undvika falska träffar i vanligt tal. **Skip** under playback när blocket är aktiverat.
+
+«detta var reklam» och «inte reklam» sparas på blocket. En redigerad kapiteltitel får källan `user` och skrivs inte över av nästa generering.
+
+**Klipp** skriver en ny fil i avsnittets mediamapp med ffmpeg `-c copy` (argv, ingen shell). Originalfilen lämnas kvar. Klippet är för privat bruk.

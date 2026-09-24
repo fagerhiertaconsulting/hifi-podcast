@@ -1165,6 +1165,12 @@ export default function App() {
           else if (audioRef.current) audioRef.current.currentTime = ms / 1000;
         }}
         onOpenHit={openSearchHit}
+        onNotice={setStatus}
+        onAdsChanged={(next) => {
+          if (payloadRef.current?.podcast.skip_ads) {
+            adsRef.current = next.filter((ad) => ad.enabled);
+          }
+        }}
       />
 
       <footer className="player">

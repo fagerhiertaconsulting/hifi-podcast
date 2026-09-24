@@ -96,6 +96,20 @@ export type AdSegment = {
   confidence: number;
   method: string;
   enabled: boolean;
+  user_label: "ad" | "not_ad" | "unset" | string;
+};
+
+export type CutAdsOutcome = {
+  original_path: string;
+  cut_path: string;
+  removed_ms: number;
+  bytes: number;
+};
+
+export type FfmpegStatus = {
+  present: boolean;
+  path: string | null;
+  hint: string;
 };
 
 export type TranscriptSegment = {
