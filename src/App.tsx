@@ -957,6 +957,8 @@ export default function App() {
             busy={busy}
             onSelectAlbum={setSelectedAlbumId}
             onPlay={(id) => void playMusicTrack(id)}
+            onStatus={setStatus}
+            onRefresh={refreshMusic}
             onImport={async () => {
               const lastRoot = await api.lastMusicImportRoot().catch(() => null);
               const path = await open({
@@ -1862,6 +1864,11 @@ function trackQualityHint(track: MusicTrack): string {
   return "";
 }
 
+function localCoverSrc(path: string | null): string | null {
+  if (!path || path.includes("://")) return null;
+  return assetUrlForLocalFile(path);
+}
+
 function MusicView(props: {
   albums: MusicAlbum[];
   tracks: MusicTrack[];
@@ -1872,8 +1879,72 @@ function MusicView(props: {
   onSelectAlbum: (id: number) => void;
   onPlay: (id: number) => void;
   onImport: () => void;
+  onStatus: (message: string) => void;
+  onRefresh: () => Promise<void>;
 }) {
+  const [savedConsent, setSavedConsent] = useState(false);
+  const [draftConsent, setDraftConsent] = useState(false);
+  const [consentBusy, setConsentBusy] = useState(false);
+  const [fetchBusy, setFetchBusy] = useState(false);
   const selected = props.albums.find((a) => a.id === props.selectedAlbumId) ?? null;
+  const coverSrc = localCoverSrc(selected?.cover_path ?? null);
+
+  useEffect(() => {
+    let cancelled = false;
+    void api
+      .getOnlineMetadataConsent()
+      .then((enabled) => {
+        if (cancelled) return;
+        setSavedConsent(enabled);
+        setDraftConsent(enabled);
+      })
+      .catch((err) => props.onStatus(String(err)));
+    return () => {
+      cancelled = true;
+    };
+    // Local setting only. This does not contact MusicBrainz or Cover Art Archive.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const saveConsent = async () => {
+    setConsentBusy(true);
+    try {
+      const enabled = await api.saveOnlineMetadataConsent(draftConsent);
+      setSavedConsent(enabled);
+      setDraftConsent(enabled);
+      props.onStatus(
+        enabled
+          ? "Internet-samtycke är på. MusicBrainz och Cover Art Archive kontaktas bara när du hämtar metadata."
+          : "Internet-samtycke är av. Ingen metadataförfrågan skickas.",
+      );
+    } catch (err) {
+      props.onStatus(String(err));
+    } finally {
+      setConsentBusy(false);
+    }
+  };
+
+  const fetchMetadata = async () => {
+    if (!savedConsent || selected == null) {
+      props.onStatus("Internet-samtycke saknas. Ingen förfrågan skickades.");
+      return;
+    }
+    setFetchBusy(true);
+    try {
+      const outcome = await api.fetchAlbumOnlineMetadata(selected.id);
+      await props.onRefresh();
+      const date = outcome.release_date ? ` Utgivning ${outcome.release_date}.` : "";
+      const cover = outcome.cover_saved ? " Omslag sparat." : "";
+      const warning = outcome.warnings.length ? ` ${outcome.warnings.join(" ")}` : "";
+      props.onStatus(
+        `Metadata hämtad från MusicBrainz (${outcome.mbid}).${date}${cover}${warning}`,
+      );
+    } catch (err) {
+      props.onStatus(String(err));
+    } finally {
+      setFetchBusy(false);
+    }
+  };
   const q = props.filter.trim().toLowerCase();
   const visible = props.tracks.filter((t) => {
     if (!q) return true;
@@ -1898,6 +1969,30 @@ function MusicView(props: {
         utan kopia till appdata och utan omkodning, och spelar dem i samma hi-fi-motor
         (ASIO/FiiO, WASAPI, native DSD). SACD-ISO rippning ingår inte.
       </p>
+      <div className="consent-panel">
+        <h2>Internet-metadata</h2>
+        <p>
+          Av som standard. Appen kontaktar bara musicbrainz.org och
+          coverartarchive.org, och bara efter att du har sparat samtycke.
+          Ingen förfrågan skickas innan dess. Lokala taggar skrivs inte över.
+          Omslag sparas bara om Cover Art Archive svarar med själva bilden.
+          En omdirigering till en annan värd, till exempel archive.org, avvisas.
+        </p>
+        <label className="check">
+          <input
+            type="checkbox"
+            checked={draftConsent}
+            onChange={(e) => setDraftConsent(e.target.checked)}
+          />
+          Jag samtycker till att hämta albummetadata och omslag från MusicBrainz
+          och Cover Art Archive
+        </label>
+        <div className="row-actions">
+          <button onClick={() => void saveConsent()} disabled={consentBusy}>
+            Spara samtycke
+          </button>
+        </div>
+      </div>
       <div className="toolbar">
         <input
           placeholder="Filtrera spår"
@@ -1928,11 +2023,28 @@ function MusicView(props: {
           {selected ? (
             <>
               <div className="podcast-head">
+                {coverSrc ? (
+                  <img className="album-cover" src={coverSrc} alt={`Omslag för ${selected.title}`} />
+                ) : null}
                 <div>
                   <h1>{selected.title}</h1>
                   <p>{selected.artist}</p>
+                  {selected.release_date ? <p>Utgivning {selected.release_date}</p> : null}
+                  {selected.mbid ? <p>MusicBrainz {selected.mbid}</p> : null}
                 </div>
+                <button
+                  onClick={() => void fetchMetadata()}
+                  disabled={!savedConsent || fetchBusy || props.busy}
+                  title={savedConsent ? undefined : "Kräver sparat internet-samtycke"}
+                >
+                  Hämta metadata och omslag
+                </button>
               </div>
+              {!savedConsent ? (
+                <p className="meta-note">
+                  Spara internet-samtycke först. Ingen förfrågan skickas innan dess.
+                </p>
+              ) : null}
               <ul className="episodes">
                 {visible.map((track) => (
                   <li key={track.id}>

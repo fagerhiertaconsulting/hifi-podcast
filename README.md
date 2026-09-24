@@ -45,7 +45,8 @@ Tauri lägger appdata under `%LOCALAPPDATA%\consulting.fagerhierta.hifi-podcast\
 |--------|----------|
 | `db.sqlite` | Prenumerationer, avsnitt, kö, transkript, jobb, UPnP-inställningar, **musikbibliotek** |
 | `media/podcasts/<podcast_id>/<episode_id>.<ext>` | **Original** enclosure-filer |
-| musik | Originalfilerna ligger kvar i den valda mappen. Biblioteket sparar sökvägen i `db.sqlite`. Ingen kopia under appdata. |
+| musik | Originalfilerna ligger kvar i den valda mappen. Biblioteket sparar sökvägen i `db.sqlite`. Ingen kopia av ljudet under appdata. |
+| `media/music/covers/<album_id>.<ext>` | Omslag från Cover Art Archive, bara efter sparat internet-samtycke. Max 2 MiB. |
 | `models/ggml-small.bin` | Whisper-modell (nedladdas av användaren) |
 | `bin/whisper-cli.exe` | whisper.cpp sidecar (Windows: Inställningar → Ladda ner whisper-cli) |
 
@@ -60,6 +61,7 @@ Tauri lägger appdata under `%LOCALAPPDATA%\consulting.fagerhierta.hifi-podcast\
 - Spelare: native Symphonia PCM + DSD (.dsf/.dff) → **ASIO (FiiO native DSD / DoP) / WASAPI exclusive DoP**, med WebView2 som omkopplare för podd (inte DSD)
 - Per-podcast: hastighet, auto-nedladdning, intro/outro-skip, opt-in hoppa tystnad
 - **Musik:** separat flik, import av mapp (FLAC/DSD), uppspelning i samma native-motor
+- **Online metadata:** av tills användaren sparar samtycke. Då bara `musicbrainz.org` och `coverartarchive.org` (https, port 443). Omslag max 2 MiB under `media/music/covers/`
 
 **Inte i koden ännu:** SACD-ISO-rippning, reklam-cut, moln-ASR, in-app UPnP-renderer, UPnP-träd för musik.
 

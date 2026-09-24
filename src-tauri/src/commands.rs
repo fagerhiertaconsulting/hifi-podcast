@@ -8,7 +8,8 @@ use crate::models::{
     AdSegment, AppPaths, AsrStatus, Bookmark, Chapter, DeleteEpisodeFileOutcome, Download, Episode,
     FinishedCleanupOutcome, FinishedCleanupSettings, ImportOutcome, InboxItem, JobRow,
     LibraryStats, MusicAlbum, MusicImportOutcome, MusicPlaybackState, MusicPlayerPayload,
-    MusicTrack, PlaybackState, Podcast, PodcastSettings, QueueItem, SubscribeOutcome, Transcript,
+    MusicTrack, OnlineMetadataOutcome, PlaybackState, Podcast, PodcastSettings, QueueItem,
+    SubscribeOutcome, Transcript,
     TranscriptSegment, UnsubscribeOutcome, UpnpSettings, UpnpStatus,
 };
 use crate::AppState;
@@ -778,7 +779,11 @@ pub fn engine_status(state: State<AppState>) -> crate::engine::EngineStatus {
 
 #[tauri::command]
 pub fn list_music_albums(state: State<AppState>) -> AppResult<Vec<MusicAlbum>> {
-    crate::music::list_albums(&conn(&state))
+    let mut albums = crate::music::list_albums(&conn(&state))?;
+    for album in &mut albums {
+        crate::online_meta::attach_cover_path(&state.media_root, album);
+    }
+    Ok(albums)
 }
 
 #[tauri::command]
@@ -809,7 +814,8 @@ pub fn music_track_for_player(
     let mut track = db::get_music_track(&conn, track_id)?;
     let playable = crate::music::require_playable_track(&conn, &state.media_root, &track)?;
     track.file_path = playable.display().to_string().replace('\\', "/");
-    let album = db::get_music_album(&conn, track.album_id)?;
+    let mut album = db::get_music_album(&conn, track.album_id)?;
+    crate::online_meta::attach_cover_path(&state.media_root, &mut album);
     let playback = db::get_music_playback(&conn, track_id)?;
     Ok(MusicPlayerPayload {
         track,
@@ -826,6 +832,46 @@ pub fn save_music_playback(state: State<AppState>, playback: MusicPlaybackState)
 #[tauri::command]
 pub fn next_music_track(state: State<AppState>, track_id: i64) -> AppResult<Option<MusicTrack>> {
     db::next_music_track(&conn(&state), track_id)
+}
+
+#[tauri::command]
+pub fn get_online_metadata_consent(state: State<AppState>) -> AppResult<bool> {
+    db::online_metadata_consent(&conn(&state))
+}
+
+#[tauri::command]
+pub fn save_online_metadata_consent(state: State<AppState>, enabled: bool) -> AppResult<bool> {
+    let conn = conn(&state);
+    db::set_online_metadata_consent(&conn, enabled)?;
+    db::online_metadata_consent(&conn)
+}
+
+#[tauri::command]
+pub async fn fetch_album_online_metadata(
+    state: State<'_, AppState>,
+    album_id: i64,
+) -> AppResult<OnlineMetadataOutcome> {
+    let media_root = state.media_root.clone();
+    let (consent, artist, title) = {
+        let conn = conn(&state);
+        let consent = db::online_metadata_consent(&conn)?;
+        if !consent {
+            (false, String::new(), String::new())
+        } else {
+            let album = db::get_music_album(&conn, album_id)?;
+            (true, album.artist, album.title)
+        }
+    };
+    // `LiveHttp::connect` is only the factory. lookup returns before calling it when consent is off.
+    let fetched = crate::online_meta::lookup_with_client(
+        consent,
+        &artist,
+        &title,
+        crate::online_meta::LiveHttp::connect,
+    )
+    .await?;
+    let conn = conn(&state);
+    crate::online_meta::persist(&conn, &media_root, album_id, fetched)
 }
 
 #[cfg(test)]

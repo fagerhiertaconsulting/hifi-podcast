@@ -57,3 +57,5 @@ Lägre RAM när v1 kör whisper.cpp på samma maskin. Native Windows-fönster. B
 ## Säkerhet / sekretess
 
 Inget konto, ingen telemetri i MVP. Feeds och media lämnar maskinen bara som användaren begär (RSS-hämtning, nedladdning). BYOK-moln-ASR är v1 och opt-in.
+
+Albummetadata och omslag från internet är också opt-in. Default är av. Först när användaren sparar ett uttryckligt samtycke får appen kontakta exakt `musicbrainz.org` och `coverartarchive.org` över https port 443. Andra värdar, omdirigeringar dit, och privata eller länklokala adresser avvisas. Omslag begränsas till 2 MiB.
