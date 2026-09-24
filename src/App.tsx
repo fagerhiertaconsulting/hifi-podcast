@@ -192,6 +192,39 @@ export default function App() {
   }, [refreshLibrary]);
 
   useEffect(() => {
+    const un = listen<{ refreshed: number; skipped: number; warnings: string[] }>(
+      "feeds-refreshed",
+      (event) => {
+        void refreshLibrary().catch((err) => setStatus(String(err)));
+        if (selectedId != null) {
+          void loadEpisodes(selectedId).catch((err) => setStatus(String(err)));
+        }
+        const { refreshed, warnings } = event.payload;
+        if (refreshed === 0 && warnings.length === 0) return;
+        setStatus((current) => {
+          if (
+            current.startsWith("Spelar") ||
+            current.startsWith("Musik") ||
+            current.startsWith("Native") ||
+            current.startsWith("Laddar")
+          ) {
+            return current;
+          }
+          if (warnings.length > 0) {
+            return `Automatisk uppdatering: ${refreshed} flöden. Varningar: ${warnings.join(" ")}`;
+          }
+          return refreshed === 1
+            ? "Flödet uppdaterades automatiskt."
+            : `Flödena uppdaterades automatiskt (${refreshed}).`;
+        });
+      },
+    );
+    return () => {
+      void un.then((fn) => fn());
+    };
+  }, [refreshLibrary, loadEpisodes, selectedId]);
+
+  useEffect(() => {
     const active = jobs.some((j) => j.state === "queued" || j.state === "running");
     if (!active) return;
     const id = window.setInterval(() => {
@@ -1544,6 +1577,9 @@ function Library(props: {
           Uppdatera flöde
         </button>
       </header>
+      <p className="auto-refresh-note">
+        Flöden hämtas vid start och var 60:e minut. Knappen uppdaterar det valda flödet direkt.
+      </p>
       <div className="toolbar">
         <input
           placeholder="Filtrera avsnitt"
