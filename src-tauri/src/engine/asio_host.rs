@@ -7,7 +7,7 @@
 use super::byte_ring::ByteRing;
 #[allow(unused_imports)]
 use super::dsd::{self, DSD_MUTE};
-use super::ring::FrameRing;
+use super::ring::{FrameRing, IntRing};
 use super::EngineError;
 use serde::Serialize;
 use std::cell::UnsafeCell;
@@ -108,6 +108,113 @@ impl SampleType {
     }
 }
 
+/// How FLAC PCM is handed to ASIO. Integer is a bit-copy of the decoder's
+/// MSB-aligned samples. f32 is the only fallback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AsioPcmDelivery {
+    /// Device integer container holds the FLAC bits. No float, no dither.
+    IntegerBitCopy,
+    /// Device format cannot take those bits, or playback would alter them.
+    Float32,
+}
+
+/// FLAC facts the ASIO open needs before the driver reports its sample type.
+#[derive(Debug, Clone, Copy)]
+#[cfg_attr(not(windows), allow(dead_code))]
+pub struct FlacAsioParams {
+    pub bits: u32,
+    pub unity_speed: bool,
+    pub skip_silence: bool,
+}
+
+/// Significant integer bits an ASIO PCM container can carry unchanged.
+fn integer_container_bits(device: SampleType) -> Option<u32> {
+    match device {
+        SampleType::I16Le => Some(16),
+        SampleType::I24Le | SampleType::I32Le24 => Some(24),
+        SampleType::I32Le => Some(32),
+        SampleType::F32Le
+        | SampleType::DsdLsb
+        | SampleType::DsdMsb
+        | SampleType::DsdNer8
+        | SampleType::Other(_) => None,
+    }
+}
+
+/// True when `file_bits` fit in the device integer container (no truncation, no float).
+pub fn flac_integer_fits(file_bits: u32, device: SampleType) -> bool {
+    match integer_container_bits(device) {
+        Some(cap) => (1..=32).contains(&file_bits) && file_bits <= cap,
+        None => false,
+    }
+}
+
+/// Integer bit-copy only when the device can hold the FLAC bits and playback
+/// will not alter samples (1×, no skip-silence, same rate). Otherwise f32.
+pub fn choose_flac_asio_delivery(
+    file_bits: u32,
+    device: SampleType,
+    source_rate: u32,
+    device_rate: u32,
+    unity_speed: bool,
+    skip_silence: bool,
+) -> AsioPcmDelivery {
+    let rate_ok = source_rate > 0 && source_rate == device_rate;
+    if unity_speed && !skip_silence && rate_ok && flac_integer_fits(file_bits, device) {
+        AsioPcmDelivery::IntegerBitCopy
+    } else {
+        AsioPcmDelivery::Float32
+    }
+}
+
+/// ASIO io path. DSD sample types (32/33/40) are native DSD, never DoP.
+/// DoP is only the PCM-marker fallback.
+pub fn classify_asio_io_path(native_dsd: bool, dop: bool, sample_type: SampleType) -> &'static str {
+    if sample_type.is_dsd() || native_dsd {
+        "native_dsd"
+    } else if dop {
+        "dop"
+    } else {
+        "pcm"
+    }
+}
+
+/// One Symphonia FLAC sample (MSB-aligned in i32) packed into an ASIO integer slot.
+/// `None` for float, DSD, and unknown types — those are not a bit-copy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PackedInteger {
+    pub bytes: [u8; 4],
+    pub len: usize,
+}
+
+pub fn pack_flac_integer_sample(msb_aligned: i32, device: SampleType) -> Option<PackedInteger> {
+    match device {
+        SampleType::I16Le => {
+            let b = ((msb_aligned >> 16) as i16).to_le_bytes();
+            Some(PackedInteger {
+                bytes: [b[0], b[1], 0, 0],
+                len: 2,
+            })
+        }
+        SampleType::I24Le => {
+            let b = (msb_aligned >> 8).to_le_bytes();
+            Some(PackedInteger {
+                bytes: [b[0], b[1], b[2], 0],
+                len: 3,
+            })
+        }
+        SampleType::I32Le | SampleType::I32Le24 => Some(PackedInteger {
+            bytes: msb_aligned.to_le_bytes(),
+            len: 4,
+        }),
+        SampleType::F32Le
+        | SampleType::DsdLsb
+        | SampleType::DsdMsb
+        | SampleType::DsdNer8
+        | SampleType::Other(_) => None,
+    }
+}
+
 pub fn asio_available() -> bool {
     cfg!(windows)
 }
@@ -157,8 +264,13 @@ pub fn list_asio_drivers() -> Vec<AsioDriverInfo> {
 #[derive(Clone, Copy, Debug)]
 #[allow(dead_code)]
 enum RtFillMode {
+    /// f32 ring, scaled into the device format.
     Pcm,
-    NativeDsd { reverse: bool },
+    /// i32 ring, packed as an integer bit-copy. No float.
+    Integer,
+    NativeDsd {
+        reverse: bool,
+    },
     Dop,
 }
 
@@ -174,6 +286,9 @@ pub struct AsioStream {
     pub dsd_diag: String,
     pub output_bits: u32,
     pub output_sample: String,
+    /// FLAC integer bit-copy vs f32. DSD streams leave this as [`AsioPcmDelivery::Float32`];
+    /// their real path is [`Self::io_path`].
+    pub pcm_delivery: AsioPcmDelivery,
 }
 
 impl Drop for AsioStream {
@@ -191,15 +306,33 @@ pub fn start_asio(
     source_rate: u32,
     hwnd: Option<usize>,
     ring: Arc<FrameRing>,
+    int_ring: Option<Arc<IntRing>>,
+    flac: Option<FlacAsioParams>,
     playing: Arc<AtomicBool>,
 ) -> Result<AsioStream, EngineError> {
     #[cfg(windows)]
     {
-        windows_impl::start(driver_name, source_rate, hwnd, ring, playing)
+        windows_impl::start(
+            driver_name,
+            source_rate,
+            hwnd,
+            ring,
+            int_ring,
+            flac,
+            playing,
+        )
     }
     #[cfg(not(windows))]
     {
-        let _ = (driver_name, source_rate, hwnd, ring, playing);
+        let _ = (
+            driver_name,
+            source_rate,
+            hwnd,
+            ring,
+            int_ring,
+            flac,
+            playing,
+        );
         Err(EngineError::msg(
             "ASIO finns bara på Windows. Installera FiiO ASIO Driver på PC:n och välj den i Inställningar.",
         ))
@@ -267,6 +400,7 @@ pub fn start_asio_dop(
 #[allow(dead_code)]
 struct RtHost {
     pcm_ring: Arc<FrameRing>,
+    int_ring: Option<Arc<IntRing>>,
     dsd_ring: Option<Arc<ByteRing>>,
     fill: RtFillMode,
     playing: Arc<AtomicBool>,
@@ -276,6 +410,7 @@ struct RtHost {
     channels: usize,
     stop: Arc<AtomicBool>,
     scratch: UnsafeCell<Vec<f32>>,
+    scratch_i32: UnsafeCell<Vec<i32>>,
     scratch_u8: UnsafeCell<Vec<u8>>,
     scratch_busy: AtomicBool,
     dop_marker_a: AtomicBool,
@@ -600,15 +735,18 @@ pub fn asio_callback_reentries() -> u64 {
 
 fn new_rt_host(
     ring: Arc<FrameRing>,
+    int_ring: Option<Arc<IntRing>>,
     playing: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
     buffers: Vec<[*mut u8; 2]>,
     frames: usize,
     sample_type: SampleType,
     channels: usize,
+    fill: RtFillMode,
 ) -> Box<RtHost> {
     new_rt_host_ex(
         ring,
+        int_ring,
         None,
         playing,
         stop,
@@ -616,12 +754,13 @@ fn new_rt_host(
         frames,
         sample_type,
         channels,
-        RtFillMode::Pcm,
+        fill,
     )
 }
 
 fn new_rt_host_ex(
     pcm_ring: Arc<FrameRing>,
+    int_ring: Option<Arc<IntRing>>,
     dsd_ring: Option<Arc<ByteRing>>,
     playing: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
@@ -634,7 +773,8 @@ fn new_rt_host_ex(
     let n = frames.saturating_mul(channels.max(1));
     let u8_n = match fill {
         RtFillMode::Dop => n.saturating_mul(2),
-        _ => n,
+        RtFillMode::NativeDsd { .. } => n,
+        RtFillMode::Pcm | RtFillMode::Integer => 1,
     };
     let bps = match fill {
         RtFillMode::NativeDsd { .. } => 1,
@@ -642,11 +782,20 @@ fn new_rt_host_ex(
             SampleType::I24Le => 3,
             _ => 4,
         },
-        RtFillMode::Pcm => sample_type.bytes_per_sample().unwrap_or(4),
+        RtFillMode::Pcm | RtFillMode::Integer => sample_type.bytes_per_sample().unwrap_or(4),
     };
     let buffer_bytes = frames.saturating_mul(bps).max(1);
+    let f32_n = match fill {
+        RtFillMode::Pcm => n,
+        _ => 0,
+    };
+    let i32_n = match fill {
+        RtFillMode::Integer => n,
+        _ => 0,
+    };
     Box::new(RtHost {
         pcm_ring,
+        int_ring,
         dsd_ring,
         fill,
         playing,
@@ -655,7 +804,8 @@ fn new_rt_host_ex(
         sample_type,
         channels,
         stop,
-        scratch: UnsafeCell::new(vec![0.0f32; n]),
+        scratch: UnsafeCell::new(vec![0.0f32; f32_n]),
+        scratch_i32: UnsafeCell::new(vec![0i32; i32_n]),
         scratch_u8: UnsafeCell::new(vec![DSD_MUTE; u8_n.max(1)]),
         scratch_busy: AtomicBool::new(false),
         dop_marker_a: AtomicBool::new(true),
@@ -682,6 +832,7 @@ fn new_rt_host_dsd(
 ) -> Box<RtHost> {
     let mut host = new_rt_host_ex(
         Arc::new(FrameRing::new(channels.max(1))),
+        None,
         Some(dsd_ring),
         playing,
         stop,
@@ -698,6 +849,7 @@ fn new_rt_host_dsd(
 #[allow(dead_code)]
 fn install_session_host(
     pcm_ring: Option<Arc<FrameRing>>,
+    int_ring: Option<Arc<IntRing>>,
     dsd_ring: Option<Arc<ByteRing>>,
     playing: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
@@ -709,16 +861,18 @@ fn install_session_host(
     reverse: bool,
 ) {
     match fill {
-        RtFillMode::Pcm => {
+        RtFillMode::Pcm | RtFillMode::Integer => {
             let ring = pcm_ring.unwrap_or_else(|| Arc::new(FrameRing::new(channels.max(1))));
             install_rt_host(new_rt_host(
                 ring,
+                int_ring,
                 playing,
                 stop,
                 buffers,
                 frames,
                 sample_type,
                 channels,
+                fill,
             ));
         }
         _ => {
@@ -981,6 +1135,7 @@ mod windows_impl {
 
         match st.fill {
             RtFillMode::Pcm => fill_pcm(st, idx, frames, ch),
+            RtFillMode::Integer => fill_integer(st, idx, frames, ch),
             RtFillMode::NativeDsd { reverse } => fill_native_dsd(st, idx, frames, ch, reverse),
             RtFillMode::Dop => fill_dop(st, idx, frames, ch),
         }
@@ -1019,6 +1174,68 @@ mod windows_impl {
                     dest[i * ch + c]
                 });
             }
+        }
+    }
+
+    fn fill_integer(st: &RtHost, idx: usize, frames: usize, ch: usize) {
+        let Some(ring) = st.int_ring.as_ref() else {
+            unsafe { write_integer_mute(st, idx, frames, ch) };
+            return;
+        };
+        let scratch = unsafe { &mut *st.scratch_i32.get() };
+        if scratch.len() < frames * ch {
+            ring.note_underrun();
+            unsafe { write_integer_mute(st, idx, frames, ch) };
+            return;
+        }
+        let dest = &mut scratch[..frames * ch];
+        if st.playing.load(Ordering::Relaxed) {
+            let _ = ring.pop_interleaved(dest);
+        } else {
+            dest.fill(0);
+        }
+        for c in 0..ch {
+            let p = st.buffers.get(c).map(|b| b[idx]).unwrap_or(ptr::null_mut());
+            if p.is_null() {
+                continue;
+            }
+            unsafe {
+                write_integer_channel(p, st.sample_type, frames, st.buffer_bytes, |i| {
+                    dest[i * ch + c]
+                });
+            }
+        }
+    }
+
+    unsafe fn write_integer_mute(st: &RtHost, idx: usize, frames: usize, ch: usize) {
+        for c in 0..ch {
+            let p = st.buffers.get(c).map(|b| b[idx]).unwrap_or(ptr::null_mut());
+            if p.is_null() {
+                continue;
+            }
+            write_integer_channel(p, st.sample_type, frames, st.buffer_bytes, |_| 0);
+        }
+    }
+
+    unsafe fn write_integer_channel(
+        ptr: *mut u8,
+        ty: SampleType,
+        frames: usize,
+        max_bytes: usize,
+        sample: impl Fn(usize) -> i32,
+    ) {
+        let Some(bps) = ty.bytes_per_sample() else {
+            return;
+        };
+        if pack_flac_integer_sample(0, ty).is_none() {
+            return;
+        }
+        let frames = frames.min(max_bytes / bps.max(1));
+        for i in 0..frames {
+            let Some(packed) = pack_flac_integer_sample(sample(i), ty) else {
+                return;
+            };
+            ptr::copy_nonoverlapping(packed.bytes.as_ptr(), ptr.add(i * packed.len), packed.len);
         }
     }
 
@@ -1107,6 +1324,7 @@ mod windows_impl {
 
     unsafe fn write_mute(st: &RtHost, idx: usize, frames: usize, ch: usize) {
         match st.fill {
+            RtFillMode::Integer => write_integer_mute(st, idx, frames, ch),
             RtFillMode::Pcm => {
                 for c in 0..ch {
                     let p = st.buffers.get(c).map(|b| b[idx]).unwrap_or(ptr::null_mut());
@@ -1296,7 +1514,9 @@ mod windows_impl {
     enum StreamKind {
         Pcm {
             ring: Arc<FrameRing>,
+            int_ring: Option<Arc<IntRing>>,
             rate: u32,
+            flac: Option<FlacAsioParams>,
         },
         NativeDsd {
             ring: Arc<ByteRing>,
@@ -1318,6 +1538,7 @@ mod windows_impl {
         dsd_diag: String,
         output_bits: u32,
         output_sample: String,
+        pcm_delivery: AsioPcmDelivery,
     }
 
     pub fn start(
@@ -1325,6 +1546,8 @@ mod windows_impl {
         source_rate: u32,
         hwnd: Option<usize>,
         ring: Arc<FrameRing>,
+        int_ring: Option<Arc<IntRing>>,
+        flac: Option<FlacAsioParams>,
         playing: Arc<AtomicBool>,
     ) -> Result<AsioStream, EngineError> {
         start_kind(
@@ -1333,7 +1556,9 @@ mod windows_impl {
             playing,
             StreamKind::Pcm {
                 ring,
+                int_ring,
                 rate: source_rate,
+                flac,
             },
         )
     }
@@ -1405,6 +1630,7 @@ mod windows_impl {
                 dsd_diag: opened.dsd_diag,
                 output_bits: opened.output_bits,
                 output_sample: opened.output_sample,
+                pcm_delivery: opened.pcm_delivery,
             }),
             Ok(Err(err)) => {
                 stop.store(true, Ordering::Relaxed);
@@ -1584,44 +1810,68 @@ mod windows_impl {
         }
         let channels = outs.min(2) as usize;
 
-        let (want_dsd_io, rate_candidates, native_dsd, dop, file_lsb, pcm_ring, dsd_ring) =
-            match &kind {
-                StreamKind::Pcm { ring, rate } => (
-                    false,
-                    vec![*rate],
-                    false,
-                    false,
-                    false,
-                    Some(ring.clone()),
-                    None,
-                ),
-                StreamKind::NativeDsd {
-                    ring,
-                    dsd_hz,
-                    file_lsb,
-                } => (
-                    true,
-                    vec![*dsd_hz, dsd::native_dsd_byte_rate(*dsd_hz)],
-                    true,
-                    false,
-                    *file_lsb,
-                    None,
-                    Some(ring.clone()),
-                ),
-                StreamKind::Dop {
-                    ring,
-                    dsd_hz,
-                    file_lsb,
-                } => (
-                    false,
-                    vec![dsd::dop_pcm_rate(*dsd_hz)],
-                    false,
-                    true,
-                    *file_lsb,
-                    None,
-                    Some(ring.clone()),
-                ),
-            };
+        let (
+            want_dsd_io,
+            rate_candidates,
+            native_dsd,
+            dop,
+            file_lsb,
+            pcm_ring,
+            int_ring,
+            dsd_ring,
+            flac,
+            source_rate,
+        ) = match &kind {
+            StreamKind::Pcm {
+                ring,
+                int_ring,
+                rate,
+                flac,
+            } => (
+                false,
+                vec![*rate],
+                false,
+                false,
+                false,
+                Some(ring.clone()),
+                int_ring.clone(),
+                None,
+                *flac,
+                *rate,
+            ),
+            StreamKind::NativeDsd {
+                ring,
+                dsd_hz,
+                file_lsb,
+            } => (
+                true,
+                vec![*dsd_hz, dsd::native_dsd_byte_rate(*dsd_hz)],
+                true,
+                false,
+                *file_lsb,
+                None,
+                None,
+                Some(ring.clone()),
+                None,
+                0,
+            ),
+            StreamKind::Dop {
+                ring,
+                dsd_hz,
+                file_lsb,
+            } => (
+                false,
+                vec![dsd::dop_pcm_rate(*dsd_hz)],
+                false,
+                true,
+                *file_lsb,
+                None,
+                None,
+                Some(ring.clone()),
+                None,
+                0,
+            ),
+        };
 
         let io_probe = probe_io_format(driver, vtbl, want_dsd_io);
         let io_sw = classify_io_format_probe(&io_probe);
@@ -1792,6 +2042,12 @@ mod windows_impl {
                 "{display_name} växlar inte till DSD-sampletyp efter createBuffers (fick {sample_type_post}). {dsd_diag} Native DSD avbryts — prova DoP om DAC:n stöder det. Filen rörs inte."
             )));
         }
+        if !native_dsd && !dop && (sample_type.is_dsd() || !sample_type.is_pcm()) {
+            teardown_asio(driver, vtbl, true, false);
+            return Err(EngineError::msg(format!(
+                "{display_name} sampletyp {sample_type_post} efter createBuffers är inte PCM. FLAC/PCM skrivs inte till en DSD-kanal. Filen rörs inte."
+            )));
+        }
 
         let buffers: Vec<[*mut u8; 2]> = buf_infos
             .iter()
@@ -1806,22 +2062,33 @@ mod windows_impl {
         } else {
             false
         };
+        let pcm_delivery = if native_dsd || dop {
+            AsioPcmDelivery::Float32
+        } else if let (Some(flac), Some(_)) = (flac, int_ring.as_ref()) {
+            choose_flac_asio_delivery(
+                flac.bits,
+                sample_type,
+                source_rate,
+                rate,
+                flac.unity_speed,
+                flac.skip_silence,
+            )
+        } else {
+            AsioPcmDelivery::Float32
+        };
         let fill = if native_dsd {
             RtFillMode::NativeDsd { reverse }
         } else if dop {
             RtFillMode::Dop
+        } else if pcm_delivery == AsioPcmDelivery::IntegerBitCopy {
+            RtFillMode::Integer
         } else {
             RtFillMode::Pcm
         };
-        let io_path = if native_dsd {
-            "native_dsd"
-        } else if dop {
-            "dop"
-        } else {
-            "pcm"
-        };
+        let io_path = classify_asio_io_path(native_dsd, dop, sample_type);
         install_session_host(
             pcm_ring.clone(),
+            int_ring.clone(),
             dsd_ring.clone(),
             playing.clone(),
             stop.clone(),
@@ -1850,6 +2117,7 @@ mod windows_impl {
             dsd_diag: dsd_diag.clone(),
             output_bits: sample_type.bits(),
             output_sample: sample_type.label(),
+            pcm_delivery,
         }));
 
         while !stop.load(Ordering::Relaxed) {
@@ -1883,6 +2151,7 @@ mod windows_impl {
                     .collect();
                 install_session_host(
                     pcm_ring.clone(),
+                    int_ring.clone(),
                     dsd_ring.clone(),
                     playing.clone(),
                     stop.clone(),
@@ -2159,12 +2428,14 @@ mod tests {
         let ring = Arc::new(FrameRing::new(2));
         install_rt_host(new_rt_host(
             ring,
+            None,
             Arc::new(AtomicBool::new(false)),
             Arc::new(AtomicBool::new(false)),
             vec![[ptr::null_mut(), ptr::null_mut()]],
             64,
             SampleType::F32Le,
             2,
+            RtFillMode::Pcm,
         ));
         assert!(!RT_HOST.load(Ordering::Acquire).is_null());
         uninstall_rt_host();
@@ -2179,15 +2450,136 @@ mod tests {
         for _ in 0..3 {
             install_rt_host(new_rt_host(
                 ring.clone(),
+                None,
                 Arc::new(AtomicBool::new(true)),
                 Arc::new(AtomicBool::new(false)),
                 vec![[ptr::null_mut(), ptr::null_mut()]],
                 32,
                 SampleType::I32Le,
                 2,
+                RtFillMode::Integer,
             ));
         }
         uninstall_rt_host();
         assert!(RT_HOST.load(Ordering::Acquire).is_null());
+    }
+
+    fn flac_ok(bits: u32, device: SampleType) -> AsioPcmDelivery {
+        choose_flac_asio_delivery(bits, device, 96_000, 96_000, true, false)
+    }
+
+    #[test]
+    fn flac_integer_when_device_format_allows_it() {
+        assert_eq!(
+            flac_ok(16, SampleType::I16Le),
+            AsioPcmDelivery::IntegerBitCopy
+        );
+        assert_eq!(
+            flac_ok(16, SampleType::I24Le),
+            AsioPcmDelivery::IntegerBitCopy
+        );
+        assert_eq!(
+            flac_ok(16, SampleType::I32Le),
+            AsioPcmDelivery::IntegerBitCopy
+        );
+        assert_eq!(
+            flac_ok(16, SampleType::I32Le24),
+            AsioPcmDelivery::IntegerBitCopy
+        );
+        assert_eq!(
+            flac_ok(24, SampleType::I24Le),
+            AsioPcmDelivery::IntegerBitCopy
+        );
+        assert_eq!(
+            flac_ok(24, SampleType::I32Le24),
+            AsioPcmDelivery::IntegerBitCopy
+        );
+        assert_eq!(
+            flac_ok(24, SampleType::I32Le),
+            AsioPcmDelivery::IntegerBitCopy
+        );
+        assert_eq!(
+            flac_ok(32, SampleType::I32Le),
+            AsioPcmDelivery::IntegerBitCopy
+        );
+        assert_eq!(
+            choose_flac_asio_delivery(24, SampleType::from_asio(18), 44_100, 44_100, true, false),
+            AsioPcmDelivery::IntegerBitCopy
+        );
+        // MSB-aligned 24-bit sample is stored unchanged in i32 / i32-24.
+        let sample = 0x0102_0300i32;
+        let i32 = pack_flac_integer_sample(sample, SampleType::I32Le).unwrap();
+        assert_eq!(i32.len, 4);
+        assert_eq!(i32.bytes, sample.to_le_bytes());
+        let i32_24 = pack_flac_integer_sample(sample, SampleType::I32Le24).unwrap();
+        assert_eq!(i32_24.bytes, sample.to_le_bytes());
+        let i24 = pack_flac_integer_sample(sample, SampleType::I24Le).unwrap();
+        assert_eq!(i24.len, 3);
+        assert_eq!(&i24.bytes[..3], &[0x03, 0x02, 0x01]);
+        let i16 = pack_flac_integer_sample(0x0102_0000i32, SampleType::I16Le).unwrap();
+        assert_eq!(&i16.bytes[..2], &[0x02, 0x01]);
+        // Sign stays in the container. Not a float scale.
+        let neg = pack_flac_integer_sample(-256, SampleType::I24Le).unwrap();
+        assert_eq!(&neg.bytes[..3], &[0xff, 0xff, 0xff]);
+        // f32 chain: i32 → f32 (÷ 2^31) then the device writer × (2^31−1). Not a bit-copy.
+        let wide = 0x1234_5678i32;
+        let as_f32 = (wide as f64 / 2_147_483_648.0) as f32;
+        let via_f32 = (as_f32.clamp(-1.0, 1.0) * 2_147_483_647.0) as i32;
+        assert_ne!(via_f32, wide);
+        let packed = pack_flac_integer_sample(wide, SampleType::I32Le).unwrap();
+        assert_eq!(packed.bytes, wide.to_le_bytes());
+    }
+
+    #[test]
+    fn flac_f32_when_device_format_does_not_allow_integer() {
+        assert_eq!(flac_ok(24, SampleType::F32Le), AsioPcmDelivery::Float32);
+        assert_eq!(flac_ok(16, SampleType::F32Le), AsioPcmDelivery::Float32);
+        assert_eq!(flac_ok(32, SampleType::F32Le), AsioPcmDelivery::Float32);
+        assert_eq!(flac_ok(24, SampleType::I16Le), AsioPcmDelivery::Float32);
+        assert_eq!(flac_ok(32, SampleType::I24Le), AsioPcmDelivery::Float32);
+        assert_eq!(flac_ok(32, SampleType::I32Le24), AsioPcmDelivery::Float32);
+        assert_eq!(flac_ok(0, SampleType::I32Le), AsioPcmDelivery::Float32);
+        assert_eq!(flac_ok(24, SampleType::DsdLsb), AsioPcmDelivery::Float32);
+        assert_eq!(flac_ok(24, SampleType::Other(99)), AsioPcmDelivery::Float32);
+        assert!(pack_flac_integer_sample(1, SampleType::F32Le).is_none());
+        assert!(pack_flac_integer_sample(1, SampleType::DsdLsb).is_none());
+        // Same device can take the bits, but not as a bit-copy once samples would change.
+        assert_eq!(
+            choose_flac_asio_delivery(24, SampleType::I32Le, 96_000, 96_000, false, false),
+            AsioPcmDelivery::Float32
+        );
+        assert_eq!(
+            choose_flac_asio_delivery(24, SampleType::I32Le, 96_000, 96_000, true, true),
+            AsioPcmDelivery::Float32
+        );
+        assert_eq!(
+            choose_flac_asio_delivery(24, SampleType::I32Le, 96_000, 48_000, true, false),
+            AsioPcmDelivery::Float32
+        );
+    }
+
+    #[test]
+    fn native_dsd_stays_native_not_dop() {
+        for ty in [SampleType::DsdLsb, SampleType::DsdMsb, SampleType::DsdNer8] {
+            assert_eq!(classify_asio_io_path(true, false, ty), "native_dsd");
+            assert_ne!(classify_asio_io_path(true, false, ty), "dop");
+            // A DSD sample type is never the DoP marker path, even if a DoP flag is set.
+            assert_eq!(classify_asio_io_path(false, true, ty), "native_dsd");
+            assert_eq!(ty.bits(), 1);
+        }
+        assert_eq!(classify_asio_io_path(false, true, SampleType::I32Le), "dop");
+        assert_eq!(classify_asio_io_path(false, true, SampleType::I24Le), "dop");
+        assert_eq!(
+            classify_asio_io_path(false, false, SampleType::I32Le),
+            "pcm"
+        );
+        assert_eq!(
+            classify_asio_io_path(false, false, SampleType::F32Le),
+            "pcm"
+        );
+        assert_ne!(
+            classify_asio_io_path(true, false, SampleType::from_asio(32)),
+            "dop"
+        );
     }
 }

@@ -71,6 +71,72 @@ impl FrameRing {
     }
 }
 
+/// Interleaved i32 ring for FLAC integer bit-copy. Samples stay the decoder's
+/// MSB-aligned integers — this buffer never scales through f32.
+/// Same underrun policy as [`FrameRing`].
+pub struct IntRing {
+    inner: Mutex<VecDeque<i32>>,
+    channels: usize,
+    underruns: AtomicU64,
+}
+
+impl IntRing {
+    pub fn new(channels: usize) -> Self {
+        Self {
+            inner: Mutex::new(VecDeque::with_capacity(48_000 * channels.max(1))),
+            channels: channels.max(1),
+            underruns: AtomicU64::new(0),
+        }
+    }
+
+    pub fn underrun_count(&self) -> u64 {
+        self.underruns.load(Ordering::Relaxed)
+    }
+
+    pub fn note_underrun(&self) {
+        self.underruns.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn clear(&self) {
+        if let Ok(mut g) = self.inner.lock() {
+            g.clear();
+        }
+    }
+
+    pub fn len_frames(&self) -> usize {
+        self.inner
+            .lock()
+            .map(|g| g.len() / self.channels)
+            .unwrap_or(0)
+    }
+
+    pub fn push_interleaved(&self, samples: &[i32]) {
+        if let Ok(mut g) = self.inner.lock() {
+            g.extend(samples.iter().copied());
+        }
+    }
+
+    /// Fill `out`. Remainder is integer silence (0). Contention or a short ring counts as underrun.
+    pub fn pop_interleaved(&self, out: &mut [i32]) -> usize {
+        let Some(mut g) = self.inner.try_lock().ok() else {
+            out.fill(0);
+            self.note_underrun();
+            return 0;
+        };
+        let n = out.len().min(g.len());
+        for slot in out.iter_mut().take(n) {
+            *slot = g.pop_front().unwrap_or(0);
+        }
+        for slot in out.iter_mut().skip(n) {
+            *slot = 0;
+        }
+        if n < out.len() {
+            self.note_underrun();
+        }
+        n / self.channels
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -115,5 +181,16 @@ mod tests {
         assert_eq!(ring.pop_interleaved(&mut out), 1);
         assert_eq!(out, [0.5, -0.5, 0.0, 0.0]);
         assert_eq!(ring.underrun_count(), 1);
+    }
+
+    #[test]
+    fn int_ring_keeps_integer_bits() {
+        let ring = IntRing::new(2);
+        let samples = [0x0102_0300i32, -256, 1, i32::MIN];
+        ring.push_interleaved(&samples);
+        let mut out = [7i32; 4];
+        assert_eq!(ring.pop_interleaved(&mut out), 2);
+        assert_eq!(out, samples);
+        assert_eq!(ring.underrun_count(), 0);
     }
 }
