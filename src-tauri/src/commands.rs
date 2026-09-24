@@ -4,10 +4,11 @@ use crate::download;
 use crate::error::AppResult;
 use crate::feeds;
 use crate::models::{
-    AdSegment, AppPaths, AsrStatus, Bookmark, Chapter, Download, Episode, ImportOutcome, InboxItem,
-    JobRow, LibraryStats, MusicAlbum, MusicImportOutcome, MusicPlaybackState, MusicPlayerPayload,
-    MusicTrack, PlaybackState, Podcast, PodcastSettings, QueueItem, SubscribeOutcome, Transcript,
-    TranscriptSegment, UnsubscribeOutcome, UpnpSettings, UpnpStatus,
+    AdSegment, AppPaths, AsrStatus, Bookmark, Chapter, DeleteEpisodeFileOutcome, Download, Episode,
+    ImportOutcome, InboxItem, JobRow, LibraryStats, MusicAlbum, MusicImportOutcome,
+    MusicPlaybackState, MusicPlayerPayload, MusicTrack, PlaybackState, Podcast, PodcastSettings,
+    QueueItem, SubscribeOutcome, Transcript, TranscriptSegment, UnsubscribeOutcome, UpnpSettings,
+    UpnpStatus,
 };
 use crate::AppState;
 use tauri::State;
@@ -121,6 +122,14 @@ pub fn unsubscribe_podcast(
     delete_files: bool,
 ) -> AppResult<UnsubscribeOutcome> {
     db::unsubscribe_podcast(&conn(&state), &state.media_root, podcast_id, delete_files)
+}
+
+#[tauri::command]
+pub fn delete_episode_file(
+    state: State<AppState>,
+    episode_id: i64,
+) -> AppResult<DeleteEpisodeFileOutcome> {
+    db::delete_episode_local_file(&conn(&state), &state.media_root, episode_id)
 }
 
 #[tauri::command]

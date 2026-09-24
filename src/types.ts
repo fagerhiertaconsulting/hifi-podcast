@@ -339,6 +339,14 @@ export type UnsubscribeOutcome = {
   warnings: string[];
 };
 
+export type DeleteEpisodeFileOutcome = {
+  episode_id: number;
+  podcast_id: number;
+  title: string;
+  files_removed: number;
+  warnings: string[];
+};
+
 export type ImportOutcome = {
   podcasts: Podcast[];
   warnings: string[];

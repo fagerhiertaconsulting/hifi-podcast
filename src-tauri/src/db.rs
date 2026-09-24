@@ -1,8 +1,8 @@
 use crate::error::AppResult;
 use crate::models::{
-    AdSegment, Bookmark, Chapter, Download, Episode, InboxItem, JobRow, LibraryStats, MusicAlbum,
-    MusicPlaybackState, MusicTrack, PlaybackState, Podcast, PodcastSettings, QueueItem, Transcript,
-    TranscriptSegment, UnsubscribeOutcome,
+    AdSegment, Bookmark, Chapter, DeleteEpisodeFileOutcome, Download, Episode, InboxItem, JobRow,
+    LibraryStats, MusicAlbum, MusicPlaybackState, MusicTrack, PlaybackState, Podcast,
+    PodcastSettings, QueueItem, Transcript, TranscriptSegment, UnsubscribeOutcome,
 };
 use rusqlite::{params, Connection, OptionalExtension};
 
@@ -627,6 +627,40 @@ pub fn unsubscribe_podcast(
         title: podcast.title,
         files_removed,
         warnings,
+    })
+}
+
+/// Delete one episode's local file. The podcast and the episode row stay
+/// so the episode can be downloaded again.
+pub fn delete_episode_local_file(
+    conn: &Connection,
+    media_root: &std::path::Path,
+    episode_id: i64,
+) -> AppResult<DeleteEpisodeFileOutcome> {
+    let episode = get_episode(conn, episode_id)?;
+    let _podcast = get_podcast(conn, episode.podcast_id)?;
+    let stored = get_download(conn, episode_id)?.and_then(|download| download.file_path);
+    let deleted = crate::download::delete_episode_media(
+        media_root,
+        episode.podcast_id,
+        episode.id,
+        stored.as_deref(),
+    )?;
+    if deleted.forget_download {
+        conn.execute(
+            "DELETE FROM download WHERE episode_id = ?1",
+            params![episode_id],
+        )?;
+        if episode.status == "downloaded" {
+            set_episode_status(conn, episode_id, "new")?;
+        }
+    }
+    Ok(DeleteEpisodeFileOutcome {
+        episode_id: episode.id,
+        podcast_id: episode.podcast_id,
+        title: episode.title,
+        files_removed: deleted.removed_files,
+        warnings: deleted.warnings,
     })
 }
 
@@ -2330,5 +2364,208 @@ mod tests {
         assert!(err.to_string().contains("vanlig katalog"));
         assert_eq!(get_podcast(&conn, root_id).unwrap().title, "Rot");
         assert!(parked.is_dir());
+    }
+
+    #[test]
+    fn delete_episode_file_removes_only_that_local_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let media = dir.path().join("media");
+        crate::download::ensure_media_layout(&media).unwrap();
+        let conn = open_db();
+        let (pid, eid) = add_show(&conn, "https://drop.example/feed.xml", "Kvar");
+        let sibling = upsert_episode(
+            &conn,
+            pid,
+            "other",
+            "Syskon",
+            None,
+            Some("https://cdn.example/other.mp3"),
+            None,
+            Some(1_000),
+        )
+        .unwrap();
+        let show = media.join("podcasts").join(pid.to_string());
+        let own = show.join(format!("{eid}.mp3"));
+        let part = show.join(format!("{eid}.part"));
+        let other = show.join(format!("{sibling}.mp3"));
+        let cover = show.join("cover.jpg");
+        let prefixed = show.join(format!("{eid}0.mp3"));
+        std::fs::create_dir_all(&show).unwrap();
+        std::fs::write(&own, b"own").unwrap();
+        std::fs::write(&part, b"part").unwrap();
+        std::fs::write(&other, b"other").unwrap();
+        std::fs::write(&cover, b"jpeg").unwrap();
+        std::fs::write(&prefixed, b"prefix").unwrap();
+        remember_file(&conn, eid, &own);
+        set_episode_status(&conn, eid, "downloaded").unwrap();
+        remember_file(&conn, sibling, &other);
+        set_episode_status(&conn, sibling, "downloaded").unwrap();
+        let music = media.join("music").join("1.flac");
+        std::fs::write(&music, b"flac").unwrap();
+
+        let outcome = delete_episode_local_file(&conn, &media, eid).unwrap();
+        assert_eq!(outcome.episode_id, eid);
+        assert_eq!(outcome.podcast_id, pid);
+        assert_eq!(outcome.files_removed, 2);
+        assert!(outcome.warnings.is_empty());
+        assert!(!own.exists());
+        assert!(!part.exists());
+        assert_eq!(std::fs::read(&other).unwrap(), b"other");
+        assert_eq!(std::fs::read(&cover).unwrap(), b"jpeg");
+        assert_eq!(std::fs::read(&prefixed).unwrap(), b"prefix");
+        assert_eq!(std::fs::read(&music).unwrap(), b"flac");
+        assert!(show.is_dir());
+        assert!(get_download(&conn, sibling)
+            .unwrap()
+            .unwrap()
+            .file_path
+            .is_some());
+    }
+
+    #[test]
+    fn delete_episode_file_keeps_episode_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let media = dir.path().join("media");
+        crate::download::ensure_media_layout(&media).unwrap();
+        let conn = open_db();
+        let (pid, eid) = add_show(&conn, "https://keep.example/feed.xml", "Prenumererad");
+        let show = media.join("podcasts").join(pid.to_string());
+        let own = show.join(format!("{eid}.mp3"));
+        std::fs::create_dir_all(&show).unwrap();
+        std::fs::write(&own, b"own").unwrap();
+        remember_file(&conn, eid, &own);
+        set_episode_status(&conn, eid, "downloaded").unwrap();
+        add_to_queue(&conn, eid).unwrap();
+        save_playback(
+            &conn,
+            &PlaybackState {
+                episode_id: eid,
+                position_ms: 1500,
+                speed: 1.0,
+                completed: false,
+                last_played_at: None,
+            },
+        )
+        .unwrap();
+
+        let outcome = delete_episode_local_file(&conn, &media, eid).unwrap();
+        assert_eq!(outcome.title, "Avsnitt");
+        assert_eq!(outcome.files_removed, 1);
+        assert!(!own.exists());
+        let episode = get_episode(&conn, eid).unwrap();
+        assert_eq!(episode.podcast_id, pid);
+        assert_eq!(episode.title, "Avsnitt");
+        assert_eq!(episode.status, "new");
+        assert_eq!(
+            episode.audio_url.as_deref(),
+            Some("https://cdn.example/ep.mp3")
+        );
+        assert!(get_download(&conn, eid).unwrap().is_none());
+        assert!(!download_is_done(&conn, eid));
+        assert_eq!(get_podcast(&conn, pid).unwrap().title, "Prenumererad");
+        assert_eq!(list_episodes(&conn, pid).unwrap().len(), 1);
+        assert_eq!(list_podcasts(&conn).unwrap().len(), 1);
+        let queue = list_queue(&conn).unwrap();
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue[0].episode_id, eid);
+        assert_eq!(get_playback(&conn, eid).unwrap().unwrap().position_ms, 1500);
+    }
+
+    #[test]
+    fn delete_episode_file_ignores_stored_path_outside_show() {
+        let dir = tempfile::tempdir().unwrap();
+        let media = dir.path().join("media");
+        crate::download::ensure_media_layout(&media).unwrap();
+        let conn = open_db();
+        let (pid, eid) = add_show(&conn, "https://one.example/feed.xml", "Ett");
+        let (other_id, other_ep) = add_show(&conn, "https://two.example/feed.xml", "Två");
+        let show = media.join("podcasts").join(pid.to_string());
+        let own = show.join(format!("{eid}.mp3"));
+        std::fs::create_dir_all(&show).unwrap();
+        std::fs::write(&own, b"own").unwrap();
+        set_episode_status(&conn, eid, "downloaded").unwrap();
+
+        let secret = dir.path().join("secret.mp3");
+        std::fs::write(&secret, b"secret").unwrap();
+        let escaped = show.join("..").join("..").join("secret.mp3");
+        remember_file(&conn, eid, &escaped);
+
+        let sibling = media
+            .join("podcasts")
+            .join(other_id.to_string())
+            .join(format!("{other_ep}.mp3"));
+        std::fs::create_dir_all(sibling.parent().unwrap()).unwrap();
+        std::fs::write(&sibling, b"sibling").unwrap();
+        remember_file(&conn, other_ep, &sibling);
+        let same_name = media.join("podcasts").join("oops.mp3");
+        std::fs::write(&same_name, b"oops").unwrap();
+        let music = media.join("music").join("album.flac");
+        std::fs::write(&music, b"music").unwrap();
+
+        let outcome = delete_episode_local_file(&conn, &media, eid).unwrap();
+        assert_eq!(outcome.files_removed, 1);
+        assert!(outcome.warnings.iter().any(|w| w.contains("utanför")));
+        assert!(!own.exists());
+        assert_eq!(std::fs::read(&secret).unwrap(), b"secret");
+        assert_eq!(std::fs::read(&sibling).unwrap(), b"sibling");
+        assert_eq!(std::fs::read(&same_name).unwrap(), b"oops");
+        assert_eq!(std::fs::read(&music).unwrap(), b"music");
+        assert!(show.is_dir());
+        assert_eq!(get_episode(&conn, eid).unwrap().status, "new");
+        assert!(get_download(&conn, eid).unwrap().is_none());
+        assert_eq!(get_podcast(&conn, pid).unwrap().title, "Ett");
+        assert_eq!(get_podcast(&conn, other_id).unwrap().title, "Två");
+        assert!(get_download(&conn, other_ep).unwrap().is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn delete_episode_file_does_not_follow_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let media = dir.path().join("media");
+        crate::download::ensure_media_layout(&media).unwrap();
+        let conn = open_db();
+        let (pid, eid) = add_show(&conn, "https://link.example/feed.xml", "Länk");
+        let show = media.join("podcasts").join(pid.to_string());
+        std::fs::create_dir_all(&show).unwrap();
+        let outside = dir.path().join("outside.mp3");
+        std::fs::write(&outside, b"outside").unwrap();
+        let link = show.join(format!("{eid}.mp3"));
+        symlink(&outside, &link).unwrap();
+        remember_file(&conn, eid, &link);
+        set_episode_status(&conn, eid, "downloaded").unwrap();
+
+        let outcome = delete_episode_local_file(&conn, &media, eid).unwrap();
+        assert_eq!(outcome.files_removed, 1);
+        assert!(outcome.warnings.is_empty());
+        assert!(!link.exists());
+        assert_eq!(std::fs::read(&outside).unwrap(), b"outside");
+        assert!(get_download(&conn, eid).unwrap().is_none());
+        assert_eq!(get_episode(&conn, eid).unwrap().title, "Avsnitt");
+
+        let (linked_id, linked_ep) =
+            add_show(&conn, "https://linked.example/feed.xml", "Symlänkad");
+        let linked_target = dir.path().join("linked-target");
+        let linked_file = linked_target.join(format!("{linked_ep}.mp3"));
+        std::fs::create_dir_all(&linked_target).unwrap();
+        std::fs::write(&linked_file, b"linked").unwrap();
+        let linked_show = media.join("podcasts").join(linked_id.to_string());
+        symlink(&linked_target, &linked_show).unwrap();
+        remember_file(&conn, linked_ep, &linked_file);
+        set_episode_status(&conn, linked_ep, "downloaded").unwrap();
+        let linked = delete_episode_local_file(&conn, &media, linked_ep).unwrap();
+        assert_eq!(linked.files_removed, 0);
+        assert!(linked.warnings.iter().any(|w| w.contains("symlänk")));
+        assert_eq!(std::fs::read(&linked_file).unwrap(), b"linked");
+        assert!(linked_show
+            .symlink_metadata()
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(get_episode(&conn, linked_ep).unwrap().status, "downloaded");
+        assert!(get_download(&conn, linked_ep).unwrap().is_some());
+        assert_eq!(get_podcast(&conn, linked_id).unwrap().title, "Symlänkad");
     }
 }
