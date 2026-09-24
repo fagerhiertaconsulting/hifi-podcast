@@ -838,6 +838,39 @@ export default function App() {
                 current.map((p) => (p.id === selected?.id ? { ...p, ...patch } : p)),
               );
             }}
+            onDeleteFile={async (id) => {
+              setBusy(true);
+              try {
+                if (payload?.episode.id === id) {
+                  const audio = audioRef.current;
+                  if (audio) {
+                    audio.pause();
+                    audio.removeAttribute("src");
+                    audio.load();
+                  }
+                  await api.engineStop().catch(() => undefined);
+                  setPlaying(false);
+                  setPayload(null);
+                  filePathRef.current = null;
+                  void api.smtcNowPlaying("", "", false);
+                }
+                const result = await api.deleteEpisodeFile(id);
+                if (selected) await loadEpisodes(selected.id);
+                await refreshLibrary();
+                const warn = result.warnings.length
+                  ? ` ${result.warnings.join(" ")}`
+                  : "";
+                const note =
+                  result.files_removed > 0
+                    ? "Lokal fil raderad. Avsnittet finns kvar och kan laddas ner igen."
+                    : "Ingen lokal fil raderades. Avsnittet finns kvar.";
+                setStatus(`${note}${warn}`);
+              } catch (err) {
+                setStatus(String(err));
+              } finally {
+                setBusy(false);
+              }
+            }}
             onUnsubscribe={async (deleteFiles) => {
               if (!selected) return;
               const id = selected.id;
@@ -1476,12 +1509,15 @@ function Library(props: {
   onSaveSettings: () => void;
   onPatchSelected: (patch: Partial<Podcast>) => void;
   onUnsubscribe: (deleteFiles: boolean) => void;
+  onDeleteFile: (episodeId: number) => void;
 }) {
   const [confirmUnsubscribe, setConfirmUnsubscribe] = useState(false);
   const [deleteLocalFiles, setDeleteLocalFiles] = useState(false);
+  const [confirmDeleteId, setConfirmDeleteId] = useState<number | null>(null);
   useEffect(() => {
     setConfirmUnsubscribe(false);
     setDeleteLocalFiles(false);
+    setConfirmDeleteId(null);
   }, [props.selected?.id]);
   const selected = props.selected;
   const visible = props.episodes.filter((ep) => {
@@ -1710,6 +1746,34 @@ function Library(props: {
                     </div>
                     <div className="ep-actions">
                       <button onClick={() => props.onDownload(episode.id)}>Ladda ner</button>
+                      {episode.status === "downloaded" &&
+                        (confirmDeleteId === episode.id ? (
+                          <>
+                            <button
+                              disabled={props.busy}
+                              onClick={() => setConfirmDeleteId(null)}
+                            >
+                              Avbryt
+                            </button>
+                            <button
+                              className="danger"
+                              disabled={props.busy}
+                              onClick={() => {
+                                setConfirmDeleteId(null);
+                                props.onDeleteFile(episode.id);
+                              }}
+                            >
+                              Radera fil
+                            </button>
+                          </>
+                        ) : (
+                          <button
+                            disabled={props.busy}
+                            onClick={() => setConfirmDeleteId(episode.id)}
+                          >
+                            Radera fil
+                          </button>
+                        ))}
                       <button onClick={() => props.onTranscribe(episode.id)}>Transkribera</button>
                       <button onClick={() => props.onEnqueue(episode.id)}>Köa</button>
                       <button className="primary" onClick={() => props.onPlay(episode.id)}>

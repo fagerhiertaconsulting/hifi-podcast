@@ -219,6 +219,11 @@ button.danger {
   color: var(--danger);
 }
 
+.ep-actions {
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
 .toolbar-title {
   font-size: 1.35rem;
   margin: 0;

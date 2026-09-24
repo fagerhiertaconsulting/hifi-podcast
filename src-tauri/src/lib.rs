@@ -102,6 +102,7 @@ pub fn run() {
             commands::add_feed,
             commands::refresh_feed,
             commands::unsubscribe_podcast,
+            commands::delete_episode_file,
             commands::import_opml,
             commands::import_opml_file,
             commands::export_opml,
