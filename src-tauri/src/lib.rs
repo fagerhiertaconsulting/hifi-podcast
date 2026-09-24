@@ -125,6 +125,7 @@ pub fn run() {
             commands::get_download,
             commands::save_playback_state,
             commands::get_playback_state,
+            commands::resume_episode_id,
             commands::list_queue,
             commands::enqueue_episode,
             commands::dequeue_item,

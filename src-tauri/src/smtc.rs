@@ -52,6 +52,9 @@ mod windows_smtc {
                         MediaControlEvent::Previous => "previous",
                         _ => return,
                     };
+                    // Låsskärmens mediatangenter når den redan öppnade motorn
+                    // även om webview inte hinner köra. Nästa/föregående seekar inte.
+                    apply_lock_screen_transport(&emit_handle, name);
                     let _ = emit_handle.emit("smtc", name);
                 });
                 if let Ok(mut guard) = handle.0.lock() {
@@ -86,6 +89,47 @@ mod windows_smtc {
             MediaPlayback::Paused { progress: None }
         });
     }
+
+    pub fn set_playback_flag(handle: &Handle, playing: bool) {
+        let Ok(mut guard) = handle.0.lock() else {
+            return;
+        };
+        let Some(ctrl) = guard.as_mut() else {
+            return;
+        };
+        let _ = ctrl.set_playback(if playing {
+            MediaPlayback::Playing { progress: None }
+        } else {
+            MediaPlayback::Paused { progress: None }
+        });
+    }
+
+    fn apply_lock_screen_transport(app: &AppHandle, name: &str) {
+        let Some(action) = super::lock_screen_engine_command(name) else {
+            return;
+        };
+        let Some(state) = app.try_state::<crate::AppState>() else {
+            return;
+        };
+        let was_playing = state.engine.status().playing;
+        let next_playing = match action {
+            super::EngineTransport::Play => true,
+            super::EngineTransport::Pause => false,
+            super::EngineTransport::Toggle => !was_playing,
+        };
+        let ok = if next_playing {
+            state.engine.play().is_ok()
+        } else {
+            state.engine.pause().is_ok()
+        };
+        if !ok {
+            return;
+        }
+        let handle = state.smtc.clone();
+        std::thread::spawn(move || {
+            set_playback_flag(&handle, next_playing);
+        });
+    }
 }
 
 #[cfg(windows)]
@@ -107,3 +151,45 @@ pub fn try_bind(_app: &tauri::AppHandle, _handle: &Handle) -> bool {
 
 #[cfg(not(windows))]
 pub fn set_playing(_handle: &Handle, _title: &str, _artist: &str, _playing: bool) {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EngineTransport {
+    Play,
+    Pause,
+    Toggle,
+}
+
+/// Play, paus och växla gäller den redan öppnade motorn.
+/// Nästa, föregående och seek gör det inte — de ska inte flytta uppspelningen härifrån.
+pub fn lock_screen_engine_command(name: &str) -> Option<EngineTransport> {
+    match name {
+        "play" => Some(EngineTransport::Play),
+        "pause" => Some(EngineTransport::Pause),
+        "toggle" => Some(EngineTransport::Toggle),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lock_screen_transport_does_not_seek() {
+        assert_eq!(
+            lock_screen_engine_command("play"),
+            Some(EngineTransport::Play)
+        );
+        assert_eq!(
+            lock_screen_engine_command("pause"),
+            Some(EngineTransport::Pause)
+        );
+        assert_eq!(
+            lock_screen_engine_command("toggle"),
+            Some(EngineTransport::Toggle)
+        );
+        assert_eq!(lock_screen_engine_command("next"), None);
+        assert_eq!(lock_screen_engine_command("previous"), None);
+        assert_eq!(lock_screen_engine_command("seek"), None);
+    }
+}
