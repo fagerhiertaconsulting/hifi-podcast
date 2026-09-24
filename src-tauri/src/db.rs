@@ -13,6 +13,7 @@ const FINISHED_CLEANUP_DAYS_KEY: &str = "delete_finished_days";
 const FINISHED_CLEANUP_DEFAULT_DAYS: i64 = 7;
 const FINISHED_CLEANUP_MIN_DAYS: i64 = 1;
 const FINISHED_CLEANUP_MAX_DAYS: i64 = 365;
+const ONLINE_METADATA_CONSENT_KEY: &str = "online_metadata_consent";
 
 pub fn initialize(conn: &Connection) -> AppResult<()> {
     conn.execute_batch(
@@ -112,7 +113,10 @@ fn migrate_music(conn: &Connection) -> AppResult<()> {
           artist TEXT NOT NULL,
           key TEXT NOT NULL UNIQUE,
           created_at TEXT NOT NULL,
-          updated_at TEXT NOT NULL
+          updated_at TEXT NOT NULL,
+          mbid TEXT,
+          release_date TEXT,
+          cover_ext TEXT
         );
 
         CREATE TABLE IF NOT EXISTS music_track (
@@ -145,6 +149,10 @@ fn migrate_music(conn: &Connection) -> AppResult<()> {
         );
         "#,
     )?;
+    // Existing libraries created the album table before these columns existed.
+    let _ = conn.execute("ALTER TABLE music_album ADD COLUMN mbid TEXT", []);
+    let _ = conn.execute("ALTER TABLE music_album ADD COLUMN release_date TEXT", []);
+    let _ = conn.execute("ALTER TABLE music_album ADD COLUMN cover_ext TEXT", []);
     Ok(())
 }
 
@@ -181,6 +189,19 @@ pub fn set_setting(conn: &Connection, key: &str, value: &str) -> AppResult<()> {
         params![key, value],
     )?;
     Ok(())
+}
+
+/// Absent, empty, and every value other than the exact string `1` mean off.
+pub fn online_metadata_consent(conn: &Connection) -> AppResult<bool> {
+    Ok(get_setting(conn, ONLINE_METADATA_CONSENT_KEY)?.as_deref() == Some("1"))
+}
+
+pub fn set_online_metadata_consent(conn: &Connection, enabled: bool) -> AppResult<()> {
+    set_setting(
+        conn,
+        ONLINE_METADATA_CONSENT_KEY,
+        if enabled { "1" } else { "0" },
+    )
 }
 
 pub fn upnp_settings(conn: &Connection) -> AppResult<crate::models::UpnpSettings> {
@@ -1844,14 +1865,86 @@ pub fn get_music_track(conn: &Connection, id: i64) -> AppResult<MusicTrack> {
     .map_err(|_| crate::error::AppError::msg("Spåret finns inte."))
 }
 
+const MUSIC_ALBUM_COLUMNS: &str = "\
+a.id, a.title, a.artist, \
+(SELECT COUNT(*) FROM music_track t WHERE t.album_id = a.id), \
+a.created_at, a.updated_at, a.mbid, a.release_date, a.cover_ext";
+
+pub fn set_music_album_online(
+    conn: &Connection,
+    album_id: i64,
+    mbid: &str,
+    release_date: Option<&str>,
+    cover_ext: Option<&str>,
+) -> AppResult<()> {
+    if album_id <= 0 || !music_mbid_ok(mbid) {
+        return Err(crate::error::AppError::msg("Ogiltig albummetadata."));
+    }
+    if let Some(date) = release_date {
+        if !music_release_date_ok(date) {
+            return Err(crate::error::AppError::msg("Ogiltigt utgivningsdatum."));
+        }
+    }
+    if let Some(ext) = cover_ext {
+        if !music_cover_ext_ok(ext) {
+            return Err(crate::error::AppError::msg("Ogiltig omslagstyp."));
+        }
+    }
+    let updated = conn.execute(
+        r#"
+        UPDATE music_album
+        SET mbid = ?1,
+            release_date = ?2,
+            cover_ext = CASE WHEN ?3 IS NULL THEN cover_ext ELSE ?3 END,
+            updated_at = ?4
+        WHERE id = ?5
+        "#,
+        params![mbid, release_date, cover_ext, now_rfc3339(), album_id],
+    )?;
+    if updated != 1 {
+        return Err(crate::error::AppError::msg("Albumet finns inte."));
+    }
+    Ok(())
+}
+
+fn music_mbid_ok(id: &str) -> bool {
+    let bytes = id.as_bytes();
+    if bytes.len() != 36 {
+        return false;
+    }
+    bytes.iter().enumerate().all(|(index, byte)| match index {
+        8 | 13 | 18 | 23 => *byte == b'-',
+        _ => byte.is_ascii_hexdigit() && (byte.is_ascii_digit() || byte.is_ascii_lowercase()),
+    })
+}
+
+fn music_release_date_ok(raw: &str) -> bool {
+    let bytes = raw.as_bytes();
+    match bytes.len() {
+        4 => bytes.iter().all(|byte| byte.is_ascii_digit()),
+        7 => bytes[4] == b'-' && digits(&bytes[0..4]) && digits(&bytes[5..7]),
+        10 => {
+            bytes[4] == b'-'
+                && bytes[7] == b'-'
+                && digits(&bytes[0..4])
+                && digits(&bytes[5..7])
+                && digits(&bytes[8..10])
+        }
+        _ => false,
+    }
+}
+
+fn digits(bytes: &[u8]) -> bool {
+    bytes.iter().all(|byte| byte.is_ascii_digit())
+}
+
+fn music_cover_ext_ok(ext: &str) -> bool {
+    matches!(ext, "jpg" | "png" | "gif" | "webp")
+}
+
 pub fn get_music_album(conn: &Connection, id: i64) -> AppResult<MusicAlbum> {
     conn.query_row(
-        r#"
-        SELECT a.id, a.title, a.artist,
-               (SELECT COUNT(*) FROM music_track t WHERE t.album_id = a.id),
-               a.created_at, a.updated_at
-        FROM music_album a WHERE a.id = ?1
-        "#,
+        &format!("SELECT {MUSIC_ALBUM_COLUMNS} FROM music_album a WHERE a.id = ?1"),
         params![id],
         map_music_album,
     )
@@ -1859,15 +1952,9 @@ pub fn get_music_album(conn: &Connection, id: i64) -> AppResult<MusicAlbum> {
 }
 
 pub fn list_music_albums(conn: &Connection) -> AppResult<Vec<MusicAlbum>> {
-    let mut stmt = conn.prepare(
-        r#"
-        SELECT a.id, a.title, a.artist,
-               (SELECT COUNT(*) FROM music_track t WHERE t.album_id = a.id),
-               a.created_at, a.updated_at
-        FROM music_album a
-        ORDER BY a.artist COLLATE NOCASE, a.title COLLATE NOCASE
-        "#,
-    )?;
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {MUSIC_ALBUM_COLUMNS} FROM music_album a ORDER BY a.artist COLLATE NOCASE, a.title COLLATE NOCASE"
+    ))?;
     let rows = stmt.query_map([], map_music_album)?;
     let mut out = Vec::new();
     for row in rows {
@@ -2003,6 +2090,10 @@ fn map_music_album(row: &rusqlite::Row<'_>) -> rusqlite::Result<MusicAlbum> {
         track_count: row.get(3)?,
         created_at: row.get(4)?,
         updated_at: row.get(5)?,
+        mbid: row.get(6)?,
+        release_date: row.get(7)?,
+        cover_ext: row.get(8)?,
+        cover_path: None,
     })
 }
 

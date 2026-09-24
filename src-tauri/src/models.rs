@@ -306,6 +306,11 @@ pub struct MusicAlbum {
     pub track_count: i64,
     pub created_at: String,
     pub updated_at: String,
+    pub mbid: Option<String>,
+    pub release_date: Option<String>,
+    pub cover_ext: Option<String>,
+    /// Local file only, filled in after a path check. Never a remote URL.
+    pub cover_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -351,4 +356,13 @@ pub struct MusicImportOutcome {
     pub album_count: i64,
     pub track_count: i64,
     pub errors: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OnlineMetadataOutcome {
+    pub album_id: i64,
+    pub mbid: String,
+    pub release_date: Option<String>,
+    pub cover_saved: bool,
+    pub warnings: Vec<String>,
 }

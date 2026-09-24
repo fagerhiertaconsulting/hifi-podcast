@@ -31,3 +31,14 @@ Blanda aldrig podcast-kö med musikbibliotek. Gemensamt är motor + globala outp
 4. Hoppa tystnad och reklam används **inte** för musik.
 
 UPnP-trädets `Music/` är fortfarande en tom stub (Onkyo-podcastträdet oförändrat).
+
+## Online metadata och omslag
+
+Av som standard. Ingen DNS-uppslagning och ingen HTTP-förfrågan sker förrän användaren sparar samtycke i Musik-fliken.
+
+Tillåtna värdar, exakt och utan underdomäner:
+
+- `musicbrainz.org` (sök release, JSON)
+- `coverartarchive.org` (omslag `front-250`)
+
+Bara https på port 443. Omdirigering till någon annan värd, till exempel `archive.org`, avvisas. Privata, loopback- och länklokala adresser avvisas. Omslag får vara högst 2 MiB och bara JPEG, PNG, GIF eller WebP. Filen sparas som `media/music/covers/<album-id>.<ext>` i appdata. Ljudfilerna ligger kvar där de importerades. Lokala taggar skrivs inte över.

@@ -13,6 +13,7 @@ mod media_mime;
 mod models;
 mod music;
 mod net;
+mod online_meta;
 mod smtc;
 mod upnp;
 
@@ -170,6 +171,9 @@ pub fn run() {
             commands::music_track_for_player,
             commands::save_music_playback,
             commands::next_music_track,
+            commands::get_online_metadata_consent,
+            commands::save_online_metadata_consent,
+            commands::fetch_album_online_metadata,
         ])
         .run(tauri::generate_context!())
         .expect("kunde inte starta HIFI podcast");

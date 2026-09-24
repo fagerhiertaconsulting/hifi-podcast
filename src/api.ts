@@ -35,6 +35,7 @@ import type {
   MusicPlayerPayload,
   MusicPlaybackState,
   MusicImportOutcome,
+  OnlineMetadataOutcome,
 } from "./types";
 
 export const api = {
@@ -152,4 +153,9 @@ export const api = {
     invoke<void>("save_music_playback", { playback }),
   nextMusicTrack: (trackId: number) =>
     invoke<MusicTrack | null>("next_music_track", { trackId }),
+  getOnlineMetadataConsent: () => invoke<boolean>("get_online_metadata_consent"),
+  saveOnlineMetadataConsent: (enabled: boolean) =>
+    invoke<boolean>("save_online_metadata_consent", { enabled }),
+  fetchAlbumOnlineMetadata: (albumId: number) =>
+    invoke<OnlineMetadataOutcome>("fetch_album_online_metadata", { albumId }),
 };

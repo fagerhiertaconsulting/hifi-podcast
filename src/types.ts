@@ -297,6 +297,18 @@ export type MusicAlbum = {
   track_count: number;
   created_at: string;
   updated_at: string;
+  mbid: string | null;
+  release_date: string | null;
+  cover_ext: string | null;
+  cover_path: string | null;
+};
+
+export type OnlineMetadataOutcome = {
+  album_id: number;
+  mbid: string;
+  release_date: string | null;
+  cover_saved: boolean;
+  warnings: string[];
 };
 
 export type MusicTrack = {
