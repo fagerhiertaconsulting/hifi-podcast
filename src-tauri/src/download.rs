@@ -62,6 +62,7 @@ pub fn podcasts_dir(media_root: &Path) -> PathBuf {
     media_root.join("podcasts")
 }
 
+/// Kept so older copies under appdata can still be found. New imports do not write here.
 pub fn music_dir(media_root: &Path) -> PathBuf {
     media_root.join("music")
 }

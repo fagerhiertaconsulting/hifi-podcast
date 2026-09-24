@@ -27,14 +27,15 @@ UI ska inte avkoda feeds eller skriva SQLite direkt.
 ## Lagring
 
 - DB: app local data `db.sqlite`
-- Media-root: `media/podcasts/<id>/…` och `media/music/` (migrering från `media/<id>/`)
+- Media-root: `media/podcasts/<id>/…` (migrering från `media/<id>/`). Musik kopieras inte dit.
 
-**Podcast-library** ligger under `media/podcasts/<podcast_id>/<episode_id>.<ext>`. Musikbiblioteket:
+**Podcast-library** ligger under `media/podcasts/<podcast_id>/<episode_id>.<ext>`. Musikbiblioteket indexerar filerna där de redan ligger:
 
 ```
 media/
   podcasts/<podcast_id>/<episode_id>.<ext>
-  music/<album_id>/<track_id>.<ext>
+<vald mapp>/
+  Artist/Album/01 Titel.flac
 ```
 
 Migrera podcast-sökvägar i en explicit version. UPnP-servern ska peka på **media-root**, inte på en hårdkodad “podcasts only”-mapp i Windows-firewall/URL-yta.

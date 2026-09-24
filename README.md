@@ -45,7 +45,7 @@ Tauri lägger appdata under `%LOCALAPPDATA%\consulting.fagerhierta.hifi-podcast\
 |--------|----------|
 | `db.sqlite` | Prenumerationer, avsnitt, kö, transkript, jobb, UPnP-inställningar, **musikbibliotek** |
 | `media/podcasts/<podcast_id>/<episode_id>.<ext>` | **Original** enclosure-filer |
-| `media/music/<album_id>/<track_id>.<ext>` | **Original** importerade musikfiler |
+| musik | Originalfilerna ligger kvar i den valda mappen. Biblioteket sparar sökvägen i `db.sqlite`. Ingen kopia under appdata. |
 | `models/ggml-small.bin` | Whisper-modell (nedladdas av användaren) |
 | `bin/whisper-cli.exe` | whisper.cpp sidecar (Windows: Inställningar → Ladda ner whisper-cli) |
 

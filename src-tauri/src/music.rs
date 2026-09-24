@@ -1,15 +1,15 @@
-//! Local music library: separate tables from podcasts, files under `media/music/`.
+//! Local music library: separate tables from podcasts.
+//! Tracks stay in the folder the user chose. Import indexes that path; it does not copy into appdata.
 
 use crate::db;
-use crate::download;
 use crate::error::{AppError, AppResult};
 use crate::models::{MusicAlbum, MusicImportOutcome, MusicTrack};
 use crate::net::MAX_MEDIA_BYTES;
 use id3::TagLike;
 use rusqlite::Connection;
 use std::fs;
-use std::io::{Read, Write};
-use std::path::{Path, PathBuf};
+use std::io::Read;
+use std::path::{Component, Path, PathBuf};
 
 const AUDIO_EXTS: &[&str] = &[
     "flac", "wav", "wave", "aiff", "aif", "dsf", "dff", "dsd", "mp3", "m4a", "m4b", "aac", "ogg",
@@ -24,24 +24,24 @@ struct Tags {
     track_no: Option<i64>,
 }
 
-pub fn import_folder(
-    conn: &Connection,
-    media_root: &Path,
-    folder: &Path,
-) -> AppResult<MusicImportOutcome> {
-    if !folder.is_dir() {
-        return Err(AppError::msg("Mappen finns inte."));
-    }
-    let root = fs::canonicalize(folder)?;
+pub fn import_folder(conn: &Connection, folder: &Path) -> AppResult<MusicImportOutcome> {
+    let root = prepare_import_root(folder)?;
     let files = collect_audio_files(&root)?;
-    let mut copied_new: Vec<PathBuf> = Vec::new();
+    import_indexed_files(conn, &root, &files)
+}
+
+fn import_indexed_files(
+    conn: &Connection,
+    root: &Path,
+    files: &[PathBuf],
+) -> AppResult<MusicImportOutcome> {
     conn.execute("BEGIN IMMEDIATE", [])?;
     let outcome = (|| {
         let mut imported = 0i64;
         let mut skipped = 0i64;
         let mut errors = Vec::new();
-        for src in &files {
-            match import_one(conn, media_root, &root, src, &mut copied_new) {
+        for src in files {
+            match import_one(conn, root, src) {
                 Ok(true) => imported += 1,
                 Ok(false) => skipped += 1,
                 Err(err) => {
@@ -66,7 +66,7 @@ pub fn import_folder(
                 outcome.errors.join(" ")
             )));
         }
-        db::upsert_music_folder(conn, &normalize_path(&root))?;
+        db::upsert_music_folder(conn, &normalize_path(root))?;
         db::set_setting(conn, "music_last_import_root", &root.display().to_string())?;
         Ok(outcome)
     })();
@@ -77,29 +77,14 @@ pub fn import_folder(
         }
         Err(err) => {
             let _ = conn.execute("ROLLBACK", []);
-            cleanup_copied_files(&copied_new);
             Err(err)
         }
     }
 }
 
-fn cleanup_copied_files(paths: &[PathBuf]) {
-    for dest in paths {
-        let _ = fs::remove_file(dest);
-        if let Some(dir) = dest.parent() {
-            let _ = fs::remove_dir(dir);
-        }
-    }
-}
-
-fn import_one(
-    conn: &Connection,
-    media_root: &Path,
-    import_root: &Path,
-    src: &Path,
-    copied_new: &mut Vec<PathBuf>,
-) -> AppResult<bool> {
-    ensure_importable_file(src)?;
+fn import_one(conn: &Connection, import_root: &Path, src: &Path) -> AppResult<bool> {
+    let (linked, byte_len) = link_source(import_root, src, MAX_MEDIA_BYTES)?;
+    let source = normalize_path(&linked);
     let ext = src
         .extension()
         .and_then(|s| s.to_str())
@@ -108,21 +93,24 @@ fn import_one(
     if ext == "iso" {
         return Err(AppError::msg("SACD-ISO rippning ingår inte."));
     }
-    let source = normalize_path(&fs::canonicalize(src)?);
+    let bytes = byte_len as i64;
     if let Some(existing) = db::music_track_by_source(conn, &source)? {
-        if track_needs_repair(&existing) {
-            finish_copy(conn, media_root, src, existing.album_id, existing.id, &ext)?;
+        if track_needs_relink(&existing, &source) {
+            db::set_music_track_file(conn, existing.id, &source, Some(bytes))?;
             return Ok(true);
         }
         return Ok(false);
     }
-    let mut tags = read_tags(src);
-    apply_path_fallback(&mut tags, import_root, src);
-    let probe = crate::engine::Handle::probe(src).ok();
+    let mut tags = read_tags(&linked);
+    apply_path_fallback(&mut tags, import_root, &linked);
+    let probe = crate::engine::Handle::probe(&linked).ok();
     let duration_ms = probe.as_ref().and_then(|p| p.duration_ms).map(|v| v as i64);
     let sample_rate = probe.as_ref().and_then(|p| p.sample_rate).map(|v| v as i64);
     let channels = probe.as_ref().and_then(|p| p.channels).map(|v| v as i64);
-    let bits = probe.as_ref().and_then(|p| p.bits_per_sample).map(|v| v as i64);
+    let bits = probe
+        .as_ref()
+        .and_then(|p| p.bits_per_sample)
+        .map(|v| v as i64);
     let codec = probe.as_ref().and_then(|p| p.codec.clone());
     let format = if ext.is_empty() {
         "unknown".into()
@@ -153,91 +141,251 @@ fn import_one(
         bits,
         channels,
     )?;
-    match finish_copy(conn, media_root, src, album_id, track_id, &ext) {
-        Ok(dest) => {
-            copied_new.push(dest);
-            Ok(true)
-        }
-        Err(err) => {
-            let _ = db::delete_music_track(conn, track_id);
-            Err(err)
-        }
+    if let Err(err) = db::set_music_track_file(conn, track_id, &source, Some(bytes)) {
+        let _ = db::delete_music_track(conn, track_id);
+        return Err(err);
     }
+    Ok(true)
 }
 
-fn track_needs_repair(track: &MusicTrack) -> bool {
-    let path = track.file_path.trim();
-    path.is_empty() || !Path::new(path).is_file()
+fn track_needs_relink(track: &MusicTrack, source: &str) -> bool {
+    let path = track.file_path.trim().replace('\\', "/");
+    path.is_empty() || path != source
 }
 
-fn finish_copy(
-    conn: &Connection,
-    media_root: &Path,
-    src: &Path,
-    album_id: i64,
-    track_id: i64,
-    ext: &str,
-) -> AppResult<PathBuf> {
-    let dest = download::music_track_file(media_root, album_id, track_id, ext);
-    let bytes = copy_regular_limited(src, &dest, MAX_MEDIA_BYTES)?;
-    db::set_music_track_file(conn, track_id, &dest.display().to_string(), Some(bytes as i64))?;
-    Ok(dest)
+/// Index `src` by its real path inside `import_root`. Does not copy bytes.
+fn link_source(import_root: &Path, src: &Path, max_bytes: u64) -> AppResult<(PathBuf, u64)> {
+    let path = contained_file(import_root, src)?;
+    let meta = assert_regular_file(&path, max_bytes, false)?;
+    Ok((path, meta.len()))
 }
 
-fn ensure_importable_file(path: &Path) -> AppResult<fs::Metadata> {
-    let meta = fs::symlink_metadata(path)?;
-    if meta.file_type().is_symlink() {
+fn prepare_import_root(folder: &Path) -> AppResult<PathBuf> {
+    let path = lexical_absolute(folder)?;
+    let meta = fs::symlink_metadata(&path).map_err(|_| AppError::msg("Mappen finns inte."))?;
+    if metadata_is_link(&meta) {
         return Err(AppError::msg("Symlänkar importeras inte."));
+    }
+    if !meta.is_dir() {
+        return Err(AppError::msg("Mappen finns inte."));
+    }
+    Ok(path)
+}
+
+fn contained_file(import_root: &Path, src: &Path) -> AppResult<PathBuf> {
+    let root = lexical_absolute(import_root)?;
+    let file = lexical_absolute(src)?;
+    if !file.starts_with(&root) {
+        return Err(AppError::msg("Sökvägen lämnar den valda mappen."));
+    }
+    reject_links_between(&root, &file, false)?;
+    Ok(file)
+}
+
+fn assert_regular_file(path: &Path, max_bytes: u64, playing: bool) -> AppResult<fs::Metadata> {
+    let meta = fs::symlink_metadata(path).map_err(|_| {
+        if playing {
+            AppError::msg("Spåret saknar lokal fil.")
+        } else {
+            AppError::msg("Bara vanliga filer kan importeras.")
+        }
+    })?;
+    if metadata_is_link(&meta) {
+        return Err(symlink_err(playing));
     }
     if !meta.is_file() {
         return Err(AppError::msg("Bara vanliga filer kan importeras."));
     }
-    if meta.len() > MAX_MEDIA_BYTES {
-        return Err(AppError::msg("Ljudfilen är större än tillåtet (2 GB)."));
-    }
-    Ok(meta)
-}
-
-fn copy_regular_limited(src: &Path, dest: &Path, max_bytes: u64) -> AppResult<u64> {
-    let meta = ensure_importable_file(src)?;
     if meta.len() > max_bytes {
         return Err(AppError::msg("Ljudfilen är större än tillåtet (2 GB)."));
     }
-    if let Some(parent) = dest.parent() {
-        fs::create_dir_all(parent)?;
+    confirm_open_nofollow(path, playing)?;
+    Ok(meta)
+}
+
+fn symlink_err(playing: bool) -> AppError {
+    if playing {
+        AppError::msg("Symlänkar spelas inte.")
+    } else {
+        AppError::msg("Symlänkar importeras inte.")
     }
-    let tmp = {
-        let mut name = dest.as_os_str().to_os_string();
-        name.push(".part");
-        PathBuf::from(name)
-    };
-    let mut input = fs::File::open(src)?;
-    let mut output = fs::File::create(&tmp)?;
-    let mut buf = [0u8; 64 * 1024];
-    let mut written: u64 = 0;
-    let copy_err = loop {
-        let n = match input.read(&mut buf) {
-            Ok(0) => break None,
-            Ok(n) => n,
-            Err(err) => break Some(err.into()),
-        };
-        written = written.saturating_add(n as u64);
-        if written > max_bytes {
-            break Some(AppError::msg("Ljudfilen är större än tillåtet (2 GB)."));
-        }
-        if let Err(err) = output.write_all(&buf[..n]) {
-            break Some(err.into());
-        }
-    };
-    if let Some(err) = copy_err {
-        drop(output);
-        let _ = fs::remove_file(&tmp);
-        return Err(err);
+}
+
+pub(crate) fn metadata_is_link(meta: &fs::Metadata) -> bool {
+    if meta.file_type().is_symlink() {
+        return true;
     }
-    output.flush()?;
-    drop(output);
-    fs::rename(&tmp, dest)?;
-    Ok(written)
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        if meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return true;
+        }
+    }
+    false
+}
+
+/// Refuse to follow a symlink (or, on Windows, any reparse point) between `root` and `file`.
+fn reject_links_between(root: &Path, file: &Path, playing: bool) -> AppResult<()> {
+    let root_meta = fs::symlink_metadata(root)?;
+    if metadata_is_link(&root_meta) {
+        return Err(symlink_err(playing));
+    }
+    let rel = file.strip_prefix(root).map_err(|_| {
+        if playing {
+            AppError::msg("Sökvägen lämnar den indexerade filen.")
+        } else {
+            AppError::msg("Sökvägen lämnar den valda mappen.")
+        }
+    })?;
+    let mut acc = root.to_path_buf();
+    for comp in rel.components() {
+        match comp {
+            Component::CurDir => continue,
+            Component::ParentDir => {
+                return Err(if playing {
+                    AppError::msg("Sökvägen lämnar den indexerade filen.")
+                } else {
+                    AppError::msg("Sökvägen lämnar den valda mappen.")
+                });
+            }
+            Component::Normal(name) => acc.push(name),
+            Component::Prefix(_) | Component::RootDir => continue,
+        }
+        let meta = fs::symlink_metadata(&acc)?;
+        if metadata_is_link(&meta) {
+            return Err(if playing {
+                symlink_err(true)
+            } else {
+                AppError::msg(format!("Symlänkar importeras inte ({}).", acc.display()))
+            });
+        }
+    }
+    Ok(())
+}
+
+fn confirm_open_nofollow(path: &Path, playing: bool) -> AppResult<()> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        const O_NOFOLLOW: i32 = 0x20000;
+        match fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(O_NOFOLLOW)
+            .open(path)
+        {
+            Ok(file) => {
+                drop(file);
+                Ok(())
+            }
+            Err(err) if err.raw_os_error() == Some(40) => {
+                // Linux ELOOP: O_NOFOLLOW refused a symlink.
+                Err(symlink_err(playing))
+            }
+            Err(err) => Err(err.into()),
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (path, playing);
+        Ok(())
+    }
+}
+
+fn lexical_absolute(path: &Path) -> AppResult<PathBuf> {
+    let abs = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    let mut out = PathBuf::new();
+    for comp in abs.components() {
+        match comp {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    if out.as_os_str().is_empty() {
+        return Err(AppError::msg("Sökvägen lämnar den valda mappen."));
+    }
+    Ok(out)
+}
+
+/// Play `requested` only when it is the indexed music file, or a podcast file under media-root.
+/// A symlink that resolves outside the indexed file is refused.
+pub(crate) fn authorize_playback_path(
+    conn: &Connection,
+    media_root: &Path,
+    requested: &Path,
+) -> AppResult<PathBuf> {
+    let lexical = lexical_absolute(requested)?;
+    let key = normalize_path(&lexical);
+    if let Some(track) = db::music_track_by_file_path(conn, &key)? {
+        return require_indexed(conn, media_root, &track, &lexical);
+    }
+    let raw = normalize_path(requested);
+    if raw != key {
+        if let Some(track) = db::music_track_by_file_path(conn, &raw)? {
+            let stored = lexical_absolute(Path::new(track.file_path.trim()))?;
+            return require_indexed(conn, media_root, &track, &stored);
+        }
+    }
+    Ok(crate::engine::ensure_under_root(media_root, requested)?)
+}
+
+pub(crate) fn require_playable_track(
+    conn: &Connection,
+    media_root: &Path,
+    track: &MusicTrack,
+) -> AppResult<PathBuf> {
+    if track.file_path.trim().is_empty() {
+        return Err(AppError::msg("Spåret saknar lokal fil."));
+    }
+    let lexical = lexical_absolute(Path::new(track.file_path.trim()))?;
+    require_indexed(conn, media_root, track, &lexical)
+}
+
+fn require_indexed(
+    conn: &Connection,
+    media_root: &Path,
+    track: &MusicTrack,
+    lexical: &Path,
+) -> AppResult<PathBuf> {
+    let stored = track.file_path.trim().replace('\\', "/");
+    if stored.is_empty() || normalize_path(lexical) != stored {
+        return Err(AppError::msg("Sökvägen lämnar den indexerade filen."));
+    }
+    let folders = db::list_music_folder_paths(conn)?;
+    let boundary = playback_boundary(lexical, &folders, media_root)?;
+    reject_links_between(&boundary, lexical, true)?;
+    assert_regular_file(lexical, MAX_MEDIA_BYTES, true)?;
+    Ok(lexical.to_path_buf())
+}
+
+fn playback_boundary(file: &Path, folders: &[String], media_root: &Path) -> AppResult<PathBuf> {
+    let mut best: Option<&str> = None;
+    for folder in folders {
+        let folder_path = Path::new(folder.trim());
+        if file.starts_with(folder_path)
+            && best
+                .map(|prev| folder_path.components().count() > Path::new(prev).components().count())
+                .unwrap_or(true)
+        {
+            best = Some(folder.trim());
+        }
+    }
+    if let Some(folder) = best {
+        return lexical_absolute(Path::new(folder));
+    }
+    let root = lexical_absolute(media_root)?;
+    if file.starts_with(&root) {
+        return Ok(root);
+    }
+    Err(AppError::msg("Sökvägen lämnar den indexerade filen."))
 }
 
 fn collect_audio_files(root: &Path) -> AppResult<Vec<PathBuf>> {
@@ -252,12 +400,13 @@ fn walk(dir: &Path, out: &mut Vec<PathBuf>, depth: u32) -> AppResult<()> {
         return Err(AppError::msg("Katalogstrukturen är för djup."));
     }
     let meta = fs::symlink_metadata(dir)?;
-    if meta.file_type().is_symlink() {
+    if metadata_is_link(&meta) {
         return Err(AppError::msg("Symlänkar importeras inte."));
     }
     if !meta.is_dir() {
         return Err(AppError::msg("Sökvägen är inte en mapp."));
     }
+    confirm_open_nofollow(dir, false)?;
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();
@@ -266,7 +415,7 @@ fn walk(dir: &Path, out: &mut Vec<PathBuf>, depth: u32) -> AppResult<()> {
             continue;
         }
         let meta = fs::symlink_metadata(&path)?;
-        if meta.file_type().is_symlink() {
+        if metadata_is_link(&meta) {
             return Err(AppError::msg(format!(
                 "Symlänkar importeras inte ({}).",
                 path.display()
@@ -294,7 +443,8 @@ fn walk(dir: &Path, out: &mut Vec<PathBuf>, depth: u32) -> AppResult<()> {
                     path.display()
                 )));
             }
-            out.push(path);
+            let linked = contained_file(dir, &path)?;
+            out.push(linked);
         }
     }
     Ok(())
@@ -462,7 +612,9 @@ fn merge_tags(into: &mut Tags, other: Tags) {
 }
 
 fn nonempty(v: Option<&str>) -> Option<String> {
-    v.map(str::trim).filter(|s| !s.is_empty()).map(|s| s.to_string())
+    v.map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
 }
 
 fn read_flac_vorbis(path: &Path) -> Tags {
@@ -564,7 +716,30 @@ pub fn list_tracks(conn: &Connection, album_id: Option<i64>) -> AppResult<Vec<Mu
 mod tests {
     use super::*;
     use crate::db;
+    use crate::download;
     use rusqlite::Connection;
+
+    fn files_under(dir: &Path) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        if !dir.exists() {
+            return out;
+        }
+        fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+            let Ok(rd) = fs::read_dir(dir) else {
+                return;
+            };
+            for entry in rd.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    walk(&path, out);
+                } else {
+                    out.push(path);
+                }
+            }
+        }
+        walk(dir, &mut out);
+        out
+    }
 
     fn conn() -> Connection {
         let c = Connection::open_in_memory().unwrap();
@@ -624,18 +799,23 @@ mod tests {
     }
 
     #[test]
-    fn import_uses_music_tables_not_episodes() {
+    fn import_links_file_in_place_and_does_not_copy() {
         let db = conn();
         let tmp = tempfile::tempdir().unwrap();
         let media = tmp.path().join("media");
         download::ensure_media_layout(&media).unwrap();
-        let folder = tmp.path().join("Downloads").join("Miles").join("Kind of Blue");
+        let folder = tmp
+            .path()
+            .join("Downloads")
+            .join("Miles")
+            .join("Kind of Blue");
         fs::create_dir_all(&folder).unwrap();
         let wav = folder.join("01 So What.wav");
         crate::engine::test_wav::write_sine_wav(&wav, 44100, 2, 440.0, 0.2, 0.2);
+        let original = fs::read(&wav).unwrap();
         fs::write(folder.join("notes.txt"), "ignore").unwrap();
 
-        let out = import_folder(&db, &media, tmp.path().join("Downloads").as_path()).unwrap();
+        let out = import_folder(&db, tmp.path().join("Downloads").as_path()).unwrap();
         assert_eq!(out.imported_tracks, 1);
         assert_eq!(out.skipped_tracks, 0);
         assert_eq!(out.album_count, 1);
@@ -648,18 +828,34 @@ mod tests {
         assert_eq!(tracks[0].title, "So What");
         assert_eq!(tracks[0].track_no, Some(1));
         assert_eq!(tracks[0].format, "wav");
-        assert!(Path::new(&tracks[0].file_path).starts_with(&media.join("music")));
-        assert!(Path::new(&tracks[0].file_path).is_file());
+        assert_eq!(tracks[0].file_path, normalize_path(&wav));
+        assert_eq!(tracks[0].source_path, tracks[0].file_path);
+        assert_eq!(tracks[0].bytes, Some(original.len() as i64));
+        assert_eq!(fs::read(&wav).unwrap(), original);
+        assert!(files_under(&media.join("music")).is_empty());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let src = fs::metadata(&wav).unwrap();
+            let linked = fs::metadata(&tracks[0].file_path).unwrap();
+            assert_eq!(src.dev(), linked.dev());
+            assert_eq!(src.ino(), linked.ino());
+        }
 
         let shows: i64 = db
             .query_row("SELECT COUNT(*) FROM episode", [], |r| r.get(0))
             .unwrap();
         assert_eq!(shows, 0);
 
-        let again = import_folder(&db, &media, tmp.path().join("Downloads").as_path()).unwrap();
+        let again = import_folder(&db, tmp.path().join("Downloads").as_path()).unwrap();
         assert_eq!(again.imported_tracks, 0);
         assert_eq!(again.skipped_tracks, 1);
         assert_eq!(again.track_count, 1);
+        assert!(files_under(&media.join("music")).is_empty());
+
+        let playable =
+            authorize_playback_path(&db, &media, Path::new(&tracks[0].file_path)).unwrap();
+        assert_eq!(normalize_path(&playable), tracks[0].file_path);
     }
 
     #[test]
@@ -680,7 +876,7 @@ mod tests {
     }
 
     #[test]
-    fn repairs_empty_file_path_on_reimport() {
+    fn relinks_empty_file_path_without_copying() {
         let db = conn();
         let tmp = tempfile::tempdir().unwrap();
         let media = tmp.path().join("media");
@@ -689,67 +885,74 @@ mod tests {
         fs::create_dir_all(&folder).unwrap();
         let wav = folder.join("tune.wav");
         crate::engine::test_wav::write_sine_wav(&wav, 44100, 1, 440.0, 0.1, 0.2);
-        import_folder(&db, &media, &folder).unwrap();
+        let original = fs::read(&wav).unwrap();
+        import_folder(&db, &folder).unwrap();
         let track = list_tracks(&db, None).unwrap().remove(0);
-        fs::remove_file(&track.file_path).unwrap();
         db::set_music_track_file(&db, track.id, "", None).unwrap();
-        let again = import_folder(&db, &media, &folder).unwrap();
+        let again = import_folder(&db, &folder).unwrap();
         assert_eq!(again.imported_tracks, 1);
         assert_eq!(again.skipped_tracks, 0);
         let repaired = list_tracks(&db, None).unwrap().remove(0);
         assert_eq!(repaired.id, track.id);
-        assert!(Path::new(&repaired.file_path).is_file());
+        assert_eq!(repaired.file_path, normalize_path(&wav));
+        assert_eq!(fs::read(&wav).unwrap(), original);
+        assert!(files_under(&media.join("music")).is_empty());
     }
 
     #[test]
-    fn copy_rejects_oversize_and_leaves_no_dest() {
+    fn link_rejects_oversize_and_leaves_the_source() {
         let tmp = tempfile::tempdir().unwrap();
-        let src = tmp.path().join("big.wav");
+        let root = tmp.path().join("lib");
+        fs::create_dir_all(&root).unwrap();
+        let src = root.join("big.wav");
         fs::write(&src, vec![0u8; 64]).unwrap();
-        let dest = tmp.path().join("out.wav");
-        let err = copy_regular_limited(&src, &dest, 8).unwrap_err();
+        let err = link_source(&root, &src, 8).unwrap_err();
         assert!(err.to_string().contains("större än tillåtet"));
-        assert!(!dest.exists());
-        assert!(!PathBuf::from(format!("{}.part", dest.display())).exists());
+        assert_eq!(fs::read(&src).unwrap(), vec![0u8; 64]);
+        assert_eq!(files_under(&root).len(), 1);
     }
 
     #[test]
-    fn import_fails_closed_when_a_file_cannot_be_copied() {
+    fn import_rejects_file_over_media_limit_without_copying() {
         let db = conn();
         let tmp = tempfile::tempdir().unwrap();
         let media = tmp.path().join("media");
         download::ensure_media_layout(&media).unwrap();
-        let folder = tmp.path().join("mix");
+        let folder = tmp.path().join("lib");
         fs::create_dir_all(&folder).unwrap();
-        let good = folder.join("ok.wav");
-        crate::engine::test_wav::write_sine_wav(&good, 44100, 1, 440.0, 0.1, 0.2);
-        fs::remove_dir_all(media.join("music")).unwrap();
-        fs::write(media.join("music"), b"not-a-directory").unwrap();
-        let err = import_folder(&db, &media, &folder).unwrap_err();
-        assert!(err.to_string().contains("Import misslyckades"));
+        let big = folder.join("huge.flac");
+        let file = fs::File::create(&big).unwrap();
+        file.set_len(MAX_MEDIA_BYTES + 1).unwrap();
+        let err = import_folder(&db, &folder).unwrap_err();
+        assert!(err.to_string().contains("större än tillåtet"));
         assert_eq!(db::count_music_tracks(&db).unwrap(), 0);
         assert!(db::last_music_import_root(&db).unwrap().is_none());
+        assert!(files_under(&media.join("music")).is_empty());
+        assert_eq!(fs::metadata(&big).unwrap().len(), MAX_MEDIA_BYTES + 1);
     }
 
     #[test]
-    fn import_rolls_back_earlier_tracks_and_copied_files() {
+    fn import_rolls_back_when_a_later_path_leaves_the_folder() {
         let db = conn();
         let tmp = tempfile::tempdir().unwrap();
         let media = tmp.path().join("media");
         download::ensure_media_layout(&media).unwrap();
         let folder = tmp.path().join("mix");
         fs::create_dir_all(&folder).unwrap();
-        let a = folder.join("a.wav");
-        let b = folder.join("b.wav");
-        crate::engine::test_wav::write_sine_wav(&a, 44100, 1, 440.0, 0.05, 0.2);
-        crate::engine::test_wav::write_sine_wav(&b, 44100, 1, 440.0, 0.05, 0.2);
-        fs::create_dir_all(media.join("music").join("1").join("2.wav")).unwrap();
-        let err = import_folder(&db, &media, &folder).unwrap_err();
+        let inside = folder.join("a.wav");
+        crate::engine::test_wav::write_sine_wav(&inside, 44100, 1, 440.0, 0.05, 0.2);
+        let outside = tmp.path().join("outside.wav");
+        crate::engine::test_wav::write_sine_wav(&outside, 44100, 1, 440.0, 0.05, 0.2);
+        let err =
+            import_indexed_files(&db, &folder, &[inside.clone(), outside.clone()]).unwrap_err();
         assert!(err.to_string().contains("Import misslyckades"));
+        assert!(err.to_string().contains("lämnar den valda mappen"));
         assert_eq!(db::count_music_tracks(&db).unwrap(), 0);
         assert_eq!(db::count_music_albums(&db).unwrap(), 0);
-        assert!(!media.join("music").join("1").join("1.wav").is_file());
         assert!(db::last_music_import_root(&db).unwrap().is_none());
+        assert!(files_under(&media.join("music")).is_empty());
+        assert!(inside.is_file());
+        assert!(outside.is_file());
     }
 
     #[test]
@@ -762,29 +965,28 @@ mod tests {
         fs::create_dir_all(&good).unwrap();
         let wav = good.join("tune.wav");
         crate::engine::test_wav::write_sine_wav(&wav, 44100, 1, 440.0, 0.05, 0.2);
-        import_folder(&db, &media, &good).unwrap();
+        import_folder(&db, &good).unwrap();
         let remembered = db::last_music_import_root(&db).unwrap().unwrap();
         assert!(remembered.contains("good"));
 
         let bad = tmp.path().join("bad");
         fs::create_dir_all(&bad).unwrap();
-        let ok = bad.join("ok.wav");
-        let later = bad.join("later.wav");
-        crate::engine::test_wav::write_sine_wav(&ok, 44100, 1, 440.0, 0.05, 0.2);
-        crate::engine::test_wav::write_sine_wav(&later, 44100, 1, 440.0, 0.05, 0.2);
-        fs::create_dir_all(media.join("music").join("2").join("3.wav")).unwrap();
-        let err = import_folder(&db, &media, &bad).unwrap_err();
-        assert!(err.to_string().contains("Import misslyckades"));
+        let huge = bad.join("huge.flac");
+        let file = fs::File::create(&huge).unwrap();
+        file.set_len(MAX_MEDIA_BYTES + 1).unwrap();
+        let err = import_folder(&db, &bad).unwrap_err();
+        assert!(err.to_string().contains("större än tillåtet"));
         assert_eq!(db::count_music_tracks(&db).unwrap(), 1);
         assert_eq!(
             db::last_music_import_root(&db).unwrap().as_deref(),
             Some(remembered.as_str())
         );
+        assert!(files_under(&media.join("music")).is_empty());
     }
 
     #[cfg(unix)]
     #[test]
-    fn import_rejects_symlinked_audio() {
+    fn import_rejects_symlinked_audio_and_does_not_follow_a_link_out() {
         let db = conn();
         let tmp = tempfile::tempdir().unwrap();
         let media = tmp.path().join("media");
@@ -794,8 +996,93 @@ mod tests {
         let wav = folder.join("real.wav");
         crate::engine::test_wav::write_sine_wav(&wav, 44100, 1, 440.0, 0.1, 0.2);
         std::os::unix::fs::symlink(&wav, folder.join("alias.wav")).unwrap();
-        let err = import_folder(&db, &media, &folder).unwrap_err();
+        let err = import_folder(&db, &folder).unwrap_err();
         assert!(err.to_string().contains("Symlänk"));
         assert_eq!(db::count_music_tracks(&db).unwrap(), 0);
+        assert!(files_under(&media.join("music")).is_empty());
+
+        let outside = tmp.path().join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        let secret = outside.join("secret.wav");
+        crate::engine::test_wav::write_sine_wav(&secret, 44100, 1, 880.0, 0.1, 0.2);
+        let chosen = tmp.path().join("chosen");
+        fs::create_dir_all(&chosen).unwrap();
+        std::os::unix::fs::symlink(&outside, chosen.join("linked")).unwrap();
+        let err = import_folder(&db, &chosen).unwrap_err();
+        assert!(err.to_string().contains("Symlänk"));
+        assert_eq!(db::count_music_tracks(&db).unwrap(), 0);
+        let stored = db::list_music_tracks(&db, None).unwrap();
+        assert!(stored.iter().all(|t| !t.file_path.contains("secret")));
+
+        let real_only = tmp.path().join("real-only");
+        fs::create_dir_all(&real_only).unwrap();
+        let only = real_only.join("only.wav");
+        crate::engine::test_wav::write_sine_wav(&only, 44100, 1, 440.0, 0.05, 0.2);
+        let via = tmp.path().join("via-link");
+        std::os::unix::fs::symlink(&real_only, &via).unwrap();
+        let err = import_folder(&db, &via).unwrap_err();
+        assert!(err.to_string().contains("Symlänk"));
+        assert_eq!(db::count_music_tracks(&db).unwrap(), 0);
+        assert!(files_under(&media.join("music")).is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn play_rejects_symlink_that_escapes_the_indexed_file() {
+        let db = conn();
+        let tmp = tempfile::tempdir().unwrap();
+        let media = tmp.path().join("media");
+        download::ensure_media_layout(&media).unwrap();
+        let folder = tmp.path().join("lib");
+        fs::create_dir_all(&folder).unwrap();
+        let wav = folder.join("tune.wav");
+        crate::engine::test_wav::write_sine_wav(&wav, 44100, 1, 440.0, 0.1, 0.2);
+        import_folder(&db, &folder).unwrap();
+        let track = list_tracks(&db, None).unwrap().remove(0);
+        let outside = tmp.path().join("outside.wav");
+        crate::engine::test_wav::write_sine_wav(&outside, 44100, 1, 880.0, 0.1, 0.2);
+        fs::remove_file(&wav).unwrap();
+        std::os::unix::fs::symlink(&outside, &wav).unwrap();
+
+        let err = authorize_playback_path(&db, &media, Path::new(&track.file_path)).unwrap_err();
+        assert!(err.to_string().contains("Symlänk"));
+        let escaped = authorize_playback_path(&db, &media, &outside).unwrap_err();
+        assert!(
+            escaped.to_string().contains("Otillåten")
+                || escaped.to_string().contains("indexerade filen")
+                || escaped.to_string().contains("hittades inte")
+        );
+        let dotted = folder
+            .join("nope")
+            .join("..")
+            .join("..")
+            .join("outside.wav");
+        let dotted_err = authorize_playback_path(&db, &media, &dotted).unwrap_err();
+        let dotted_msg = dotted_err.to_string();
+        assert!(
+            dotted_msg.contains("Otillåten")
+                || dotted_msg.contains("indexerade filen")
+                || dotted_msg.contains("hittades inte"),
+            "{dotted_msg}"
+        );
+    }
+
+    #[test]
+    fn play_rejects_indexed_file_that_grew_past_the_size_limit() {
+        let db = conn();
+        let tmp = tempfile::tempdir().unwrap();
+        let media = tmp.path().join("media");
+        download::ensure_media_layout(&media).unwrap();
+        let folder = tmp.path().join("lib");
+        fs::create_dir_all(&folder).unwrap();
+        let wav = folder.join("tune.wav");
+        crate::engine::test_wav::write_sine_wav(&wav, 44100, 1, 440.0, 0.05, 0.2);
+        import_folder(&db, &folder).unwrap();
+        let track = list_tracks(&db, None).unwrap().remove(0);
+        let file = fs::OpenOptions::new().write(true).open(&wav).unwrap();
+        file.set_len(MAX_MEDIA_BYTES + 1).unwrap();
+        let err = authorize_playback_path(&db, &media, Path::new(&track.file_path)).unwrap_err();
+        assert!(err.to_string().contains("större än tillåtet"));
+        assert!(files_under(&media.join("music")).is_empty());
     }
 }

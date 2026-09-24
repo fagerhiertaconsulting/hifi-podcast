@@ -19,13 +19,13 @@ Lokal uppspelning i foobar2000-klass:
 | Kö | Up Next för avsnitt | Nästa spår i **samma album** (ingen blandad kö) |
 | Motor | Delad hi-fi engine | Delad hi-fi engine |
 | Output | Samma DAC / exclusive-läge | Samma |
-| Disk | `media/podcasts/<id>/` | `media/music/<album_id>/<track_id>.<ext>` |
+| Disk | `media/podcasts/<id>/` | Kvar i den valda mappen. Index och länk i `music_track`, ingen kopia till appdata |
 
 Blanda aldrig podcast-kö med musikbibliotek. Gemensamt är motor + globala output-inställningar (enhet, buffer, exclusive WASAPI).
 
 ## MVP (den här PR:n)
 
-1. Importera mapp från disk (rekursivt FLAC/WAV/AIFF/DSD/MP3/…). Original **kopieras** till `media/music/` (ingen omkodning).
+1. Importera mapp från disk (rekursivt FLAC/WAV/AIFF/DSD/MP3/…). Originalet **ligger kvar**. Appen indexerar sökvägen och spelar den filen (ingen kopia till appdata, ingen omkodning).
 2. Metadata: taggar (ID3, FLAC Vorbis) + mappstruktur `Artist/Album/01 Titel.flac`.
 3. Bläddra album → spår, spela via `engine_open` (samma väg som lokal podd/DSD).
 4. Hoppa tystnad och reklam används **inte** för musik.
