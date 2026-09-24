@@ -3,6 +3,8 @@ use crate::intel::{parse_srt, parse_whisper_json, Segment};
 use crate::models::AsrStatus;
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 
 pub const MODEL_NAME: &str = "ggml-small.bin";
@@ -27,12 +29,159 @@ pub fn nvidia_gpu_present() -> bool {
     #[cfg(windows)]
     {
         std::path::Path::new(r"C:\Windows\System32\nvcuda.dll").is_file()
+            || std::path::Path::new(r"C:\Windows\SysWOW64\nvcuda.dll").is_file()
             || which::which("nvidia-smi").is_ok()
+            || nvidia_driver_registered()
     }
     #[cfg(not(windows))]
     {
         which::which("nvidia-smi").is_ok()
+            || Path::new("/dev/nvidia0").exists()
+            || Path::new("/proc/driver/nvidia/version").is_file()
     }
+}
+
+#[cfg(windows)]
+fn nvidia_driver_registered() -> bool {
+    use winreg::enums::HKEY_LOCAL_MACHINE;
+    use winreg::RegKey;
+    RegKey::predef(HKEY_LOCAL_MACHINE)
+        .open_subkey("SOFTWARE\\NVIDIA Corporation\\Global")
+        .is_ok()
+}
+
+/// CUDA whisper-cli uses the NVIDIA GPU (RTX 4070 Laptop on the target machine).
+/// A CPU build cannot, even when the GPU is present.
+pub fn use_nvidia_gpu(nvidia_present: bool, cli_backend: &str) -> bool {
+    nvidia_present && cli_backend.eq_ignore_ascii_case("cuda")
+}
+
+pub fn gpu_disable_arg(use_gpu: bool) -> Option<&'static str> {
+    if use_gpu {
+        None
+    } else {
+        Some("-ng")
+    }
+}
+
+/// Shared playback flag. Transcription waits and freezes whisper-cli while this is set.
+#[derive(Clone, Debug)]
+pub struct PlaybackGate {
+    playing: Arc<AtomicBool>,
+}
+
+impl PlaybackGate {
+    pub fn new() -> Self {
+        Self {
+            playing: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    pub fn set_playing(&self, playing: bool) {
+        self.playing.store(playing, Ordering::SeqCst);
+    }
+
+    pub fn is_playing(&self) -> bool {
+        self.playing.load(Ordering::SeqCst)
+    }
+}
+
+impl Default for PlaybackGate {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WhisperPause {
+    Suspend,
+    Resume,
+    Keep,
+}
+
+pub fn transcription_allowed(audio_playing: bool) -> bool {
+    !audio_playing
+}
+
+pub fn whisper_pause_transition(audio_playing: bool, process_suspended: bool) -> WhisperPause {
+    match (audio_playing, process_suspended) {
+        (true, false) => WhisperPause::Suspend,
+        (false, true) => WhisperPause::Resume,
+        _ => WhisperPause::Keep,
+    }
+}
+
+fn suspend_pid(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        unsafe { kill(pid as i32, SIGSTOP) == 0 }
+    }
+    #[cfg(windows)]
+    {
+        windows_process(pid, true)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = pid;
+        false
+    }
+}
+
+fn resume_pid(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        unsafe { kill(pid as i32, SIGCONT) == 0 }
+    }
+    #[cfg(windows)]
+    {
+        windows_process(pid, false)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = pid;
+        false
+    }
+}
+
+#[cfg(unix)]
+const SIGSTOP: i32 = if cfg!(target_os = "linux") { 19 } else { 17 };
+#[cfg(unix)]
+const SIGCONT: i32 = if cfg!(target_os = "linux") { 18 } else { 19 };
+
+#[cfg(unix)]
+unsafe extern "C" {
+    fn kill(pid: i32, sig: i32) -> i32;
+}
+
+#[cfg(windows)]
+fn windows_process(pid: u32, suspend: bool) -> bool {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_SUSPEND_RESUME};
+    unsafe {
+        let handle = OpenProcess(PROCESS_SUSPEND_RESUME, 0, pid);
+        if handle.is_null() {
+            return false;
+        }
+        let status = if suspend {
+            NtSuspendProcess(handle)
+        } else {
+            NtResumeProcess(handle)
+        };
+        let _ = CloseHandle(handle);
+        status == 0
+    }
+}
+
+#[cfg(windows)]
+#[link(name = "ntdll")]
+unsafe extern "system" {
+    fn NtSuspendProcess(process: *mut core::ffi::c_void) -> i32;
+    fn NtResumeProcess(process: *mut core::ffi::c_void) -> i32;
+}
+
+#[cfg(all(unix, test))]
+fn process_is_alive(pid: u32) -> bool {
+    unsafe { kill(pid as i32, 0) == 0 }
 }
 
 pub fn cli_backend(data_dir: &Path) -> String {
@@ -89,15 +238,20 @@ pub fn status(data_dir: &Path) -> AsrStatus {
     let nvidia_present = nvidia_gpu_present();
     let backend = cli_backend(data_dir);
     let hint = match (model_present, cli_present, backend.as_str(), nvidia_present) {
-        (true, true, "cuda", _) => {
-            "Whisper är redo med NVIDIA CUDA. Transkribering körs lokalt (BYOK av).".into()
+        (true, true, "cuda", true) => {
+            "Whisper är redo med NVIDIA CUDA. Transkribering använder GPU och pausas medan ljud spelas."
+                .into()
+        }
+        (true, true, "cuda", false) => {
+            "Whisper CUDA är installerad men ingen NVIDIA-GPU hittades. Transkribering körs på CPU och pausas medan ljud spelas."
+                .into()
         }
         (true, true, _, true) => {
             "Whisper är redo på CPU. NVIDIA GPU hittad — Ladda ner whisper-cli igen för CUDA (~640 MB)."
                 .into()
         }
         (true, true, _, false) => {
-            "Whisper är redo (CPU). Transkribering körs lokalt (BYOK av).".into()
+            "Whisper är redo (CPU). Transkribering pausas medan ljud spelas.".into()
         }
         (false, true, _, _) => "Ladda ner ggml-small via Inställningar.".into(),
         (true, false, _, true) => {
@@ -325,9 +479,20 @@ async fn run_whisper_cli(
     lang: &str,
     prefix: &Path,
     use_gpu: bool,
+    gate: &PlaybackGate,
     progress: &Option<tokio::sync::mpsc::UnboundedSender<String>>,
     log: &mut tokio::fs::File,
 ) -> AppResult<std::process::ExitStatus> {
+    let mut announced_pause = false;
+    while !transcription_allowed(gate.is_playing()) {
+        if !announced_pause {
+            if let Some(tx) = progress {
+                let _ = tx.send("Pausad medan ljud spelas.".into());
+            }
+            announced_pause = true;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
     let mut cmd = tokio::process::Command::new(cli);
     cmd.current_dir(bin_dir(data_dir))
         .stdin(std::process::Stdio::null())
@@ -339,8 +504,8 @@ async fn run_whisper_cli(
         .arg(audio)
         .arg("-l")
         .arg(lang);
-    if !use_gpu {
-        cmd.arg("-ng");
+    if let Some(flag) = gpu_disable_arg(use_gpu) {
+        cmd.arg(flag);
     }
     cmd.arg("-pp")
         .arg("-oj")
@@ -359,6 +524,40 @@ async fn run_whisper_cli(
             bin_dir(data_dir).display()
         ))
     })?;
+    let watchdog = child.id().map(|pid| {
+        let gate = gate.clone();
+        let progress = progress.clone();
+        let suspended = Arc::new(AtomicBool::new(false));
+        let suspended_flag = suspended.clone();
+        let handle = tokio::spawn(async move {
+            let mut is_suspended = false;
+            loop {
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                match whisper_pause_transition(gate.is_playing(), is_suspended) {
+                    WhisperPause::Suspend => {
+                        if suspend_pid(pid) {
+                            is_suspended = true;
+                            suspended_flag.store(true, Ordering::SeqCst);
+                            if let Some(tx) = &progress {
+                                let _ = tx.send("Pausad medan ljud spelas.".into());
+                            }
+                        }
+                    }
+                    WhisperPause::Resume => {
+                        if resume_pid(pid) {
+                            is_suspended = false;
+                            suspended_flag.store(false, Ordering::SeqCst);
+                            if let Some(tx) = &progress {
+                                let _ = tx.send("Transkribering återupptas.".into());
+                            }
+                        }
+                    }
+                    WhisperPause::Keep => {}
+                }
+            }
+        });
+        (handle, pid, suspended)
+    });
     if let Some(out) = child.stdout.take() {
         tokio::spawn(async move {
             use tokio::io::AsyncReadExt;
@@ -385,16 +584,24 @@ async fn run_whisper_cli(
             }
         }
     }
-    child
+    let status = child
         .wait()
         .await
-        .map_err(|e| AppError::msg(format!("whisper-cli avbröts: {e}")))
+        .map_err(|e| AppError::msg(format!("whisper-cli avbröts: {e}")))?;
+    if let Some((handle, pid, suspended)) = watchdog {
+        handle.abort();
+        if suspended.load(Ordering::SeqCst) {
+            let _ = resume_pid(pid);
+        }
+    }
+    Ok(status)
 }
 
 pub async fn transcribe_file(
     data_dir: &Path,
     audio: &Path,
     language: &str,
+    gate: &PlaybackGate,
     progress: Option<tokio::sync::mpsc::UnboundedSender<String>>,
 ) -> AppResult<(Vec<Segment>, String)> {
     let cli = require_cli(data_dir)?;
@@ -425,19 +632,21 @@ pub async fn transcribe_file(
     tokio::fs::create_dir_all(&logs).await?;
     let log_path = logs.join("whisper-last.log");
     let mut log = tokio::fs::File::create(&log_path).await?;
-    let want_gpu = cli_backend(data_dir) == "cuda";
+    let backend = cli_backend(data_dir);
+    let want_gpu = use_nvidia_gpu(nvidia_gpu_present(), &backend);
     let header = format!(
-        "cli={} model={} audio={} backend={} gpu={}\n",
+        "cli={} model={} audio={} backend={} nvidia={} gpu={}\n",
         cli.display(),
         model.display(),
         audio.display(),
-        cli_backend(data_dir),
+        backend,
+        nvidia_gpu_present(),
         want_gpu
     );
     log.write_all(header.as_bytes()).await?;
 
     let mut status = run_whisper_cli(
-        &cli, data_dir, &model, audio, lang, &prefix, want_gpu, &progress, &mut log,
+        &cli, data_dir, &model, audio, lang, &prefix, want_gpu, gate, &progress, &mut log,
     )
     .await?;
     if !status.success() && want_gpu {
@@ -448,7 +657,7 @@ pub async fn transcribe_file(
             let _ = tx.send("GPU misslyckades, faller tillbaka till CPU…".into());
         }
         status = run_whisper_cli(
-            &cli, data_dir, &model, audio, lang, &prefix, false, &progress, &mut log,
+            &cli, data_dir, &model, audio, lang, &prefix, false, gate, &progress, &mut log,
         )
         .await?;
     }
@@ -608,5 +817,60 @@ mod tests {
         let err = verify_digest("abcd", MODEL_SHA256).unwrap_err();
         assert!(err.to_string().contains("SHA-256"));
         assert!(verify_digest(MODEL_SHA256, MODEL_SHA256).is_ok());
+    }
+
+    #[test]
+    fn keeps_ggml_small_and_uses_nvidia_gpu_only_with_cuda_build() {
+        assert_eq!(MODEL_NAME, "ggml-small.bin");
+        assert!(MODEL_URL.starts_with("https://huggingface.co/ggerganov/whisper.cpp/"));
+        assert!(MODEL_URL.ends_with("ggml-small.bin"));
+        assert!(use_nvidia_gpu(true, "cuda"));
+        assert!(!use_nvidia_gpu(false, "cuda"));
+        assert!(!use_nvidia_gpu(true, "cpu"));
+        assert!(!use_nvidia_gpu(true, "saknas"));
+        assert!(gpu_disable_arg(true).is_none());
+        assert_eq!(gpu_disable_arg(false), Some("-ng"));
+    }
+
+    #[test]
+    fn transcription_pauses_while_audio_plays_and_resumes_when_it_stops() {
+        let gate = PlaybackGate::new();
+        assert!(transcription_allowed(gate.is_playing()));
+        assert_eq!(
+            whisper_pause_transition(gate.is_playing(), false),
+            WhisperPause::Keep
+        );
+        gate.set_playing(true);
+        assert!(!transcription_allowed(gate.is_playing()));
+        assert_eq!(whisper_pause_transition(true, false), WhisperPause::Suspend);
+        assert_eq!(whisper_pause_transition(true, true), WhisperPause::Keep);
+        gate.set_playing(false);
+        assert!(transcription_allowed(gate.is_playing()));
+        assert_eq!(whisper_pause_transition(false, true), WhisperPause::Resume);
+        assert_eq!(whisper_pause_transition(false, false), WhisperPause::Keep);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn suspends_child_while_audio_would_be_playing_and_resumes() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("sleep");
+        let pid = child.id();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            assert_eq!(whisper_pause_transition(true, false), WhisperPause::Suspend);
+            assert!(suspend_pid(pid), "SIGSTOP");
+            assert!(process_is_alive(pid));
+            assert_eq!(whisper_pause_transition(true, true), WhisperPause::Keep);
+            assert_eq!(whisper_pause_transition(false, true), WhisperPause::Resume);
+            assert!(resume_pid(pid), "SIGCONT");
+            assert!(process_is_alive(pid));
+        }));
+        let _ = child.kill();
+        let _ = child.wait();
+        if let Err(err) = result {
+            std::panic::resume_unwind(err);
+        }
     }
 }

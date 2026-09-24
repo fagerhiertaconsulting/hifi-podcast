@@ -7,6 +7,7 @@ import type {
   InboxItem,
   JobRow,
   LibraryStats,
+  TranscriptSearchHit,
   TranscriptSegment,
 } from "./types";
 
@@ -23,12 +24,13 @@ export function TranscriptPane(props: {
   episodeId: number | null;
   positionMs: number;
   onSeekMs: (ms: number) => void;
+  onOpenHit: (hit: TranscriptSearchHit) => void;
   jobs?: JobRow[];
 }) {
   const [segments, setSegments] = useState<TranscriptSegment[]>([]);
   const [chapters, setChapters] = useState<Chapter[]>([]);
   const [query, setQuery] = useState("");
-  const [hits, setHits] = useState<TranscriptSegment[] | null>(null);
+  const [hits, setHits] = useState<TranscriptSearchHit[] | null>(null);
 
   const job = props.jobs?.find(
     (j) => j.episode_id === props.episodeId && j.job_type === "transcribe",
@@ -54,7 +56,7 @@ export function TranscriptPane(props: {
     if (job?.state === "running") {
       return job.error_msg
         ? `Transkriberar (lokal Whisper)… ${job.error_msg}`
-        : "Transkriberar med lokal Whisper. Ett 40-minutersavsnitt kan ta 15–60 minuter på CPU.";
+        : "Transkriberar med lokal Whisper. Jobbet pausas medan ljud spelas.";
     }
     if (job?.state === "queued") {
       return "Transkribering väntar i kön. Ett jobb i taget — se Statistik → Jobbkö.";
@@ -77,14 +79,14 @@ export function TranscriptPane(props: {
       <h2>Transkript</h2>
       <div className="row-actions">
         <input
-          placeholder="Sök i transkript"
+          placeholder="Sök i hela biblioteket"
           value={query}
           onChange={(e) => setQuery(e.target.value)}
         />
         <button
           disabled={!query.trim()}
           onClick={() => {
-            void api.searchTranscripts(query.trim()).then(setHits);
+            void api.searchTranscripts(query.trim(), props.episodeId).then(setHits);
           }}
         >
           Sök
@@ -92,11 +94,11 @@ export function TranscriptPane(props: {
       </div>
       {hits && (
         <ul className="hits">
-          {hits.length === 0 && <li className="empty">Inga träffar.</li>}
+          {hits.length === 0 && <li className="empty">Inga träffar i biblioteket.</li>}
           {hits.map((h) => (
             <li key={h.id}>
-              <button onClick={() => props.onSeekMs(h.start_ms)}>
-                {formatClock(h.start_ms)} · {h.text}
+              <button onClick={() => props.onOpenHit(h)}>
+                {h.podcast_title} · {h.episode_title} · {formatClock(h.start_ms)} · {h.text}
               </button>
             </li>
           ))}
@@ -215,9 +217,10 @@ export function StatsView(props: {
       </ul>
       <h2>Jobbkö</h2>
       <p className="empty">
-        Ett Whisper-jobb i taget. <code>running</code> betyder att Whisper
-        arbetar (GPU om CUDA är installerad, annars CPU). Äldre rader med error
-        är tidigare försök.
+        Ett Whisper-jobb i taget. Det pausas medan ljud spelas och fortsätter
+        när uppspelningen stannar. <code>running</code> betyder att Whisper
+        arbetar (NVIDIA GPU om CUDA är installerad, annars CPU). Äldre rader
+        med error är tidigare försök.
       </p>
       <ul className="hits">
         {props.jobs.slice(0, 12).map((j) => (

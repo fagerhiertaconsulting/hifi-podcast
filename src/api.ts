@@ -22,6 +22,7 @@ import type {
   FinishedCleanupSettings,
   UnsubscribeOutcome,
   Transcript,
+  TranscriptSearchHit,
   TranscriptSegment,
   UpnpSettings,
   UpnpStatus,
@@ -91,8 +92,13 @@ export const api = {
     invoke<Transcript | null>("get_transcript", { episodeId }),
   listSegments: (episodeId: number) =>
     invoke<TranscriptSegment[]>("list_segments", { episodeId }),
-  searchTranscripts: (query: string) =>
-    invoke<TranscriptSegment[]>("search_transcripts", { query }),
+  searchTranscripts: (query: string, playingEpisodeId?: number | null) =>
+    invoke<TranscriptSearchHit[]>("search_transcripts", {
+      query,
+      playingEpisodeId: playingEpisodeId ?? null,
+    }),
+  setAudioPlaying: (playing: boolean) =>
+    invoke<void>("set_audio_playing", { playing }),
   listChapters: (episodeId: number) =>
     invoke<Chapter[]>("list_chapters", { episodeId }),
   listAds: (episodeId: number) => invoke<AdSegment[]>("list_ads", { episodeId }),

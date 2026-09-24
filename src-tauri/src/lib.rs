@@ -32,6 +32,7 @@ pub struct AppState {
     pub smtc: smtc::Handle,
     pub upnp: upnp::Handle,
     pub engine: engine::Handle,
+    pub audio: asr::PlaybackGate,
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -65,6 +66,7 @@ pub fn run() {
                 smtc,
                 upnp: upnp::Handle::new(),
                 engine: engine.clone(),
+                audio: asr::PlaybackGate::new(),
             });
             engine.bind_app(app.handle().clone());
             #[cfg(windows)]
@@ -159,6 +161,7 @@ pub fn run() {
             commands::engine_open,
             commands::engine_play,
             commands::engine_pause,
+            commands::set_audio_playing,
             commands::engine_seek,
             commands::engine_set_speed,
             commands::engine_set_skip_silence,

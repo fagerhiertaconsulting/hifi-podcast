@@ -80,7 +80,9 @@ whisper-cli -m ggml-small.bin -f avsnitt.mp3 -l auto -oj -osrt -of …
 
 `-l` är `auto`, `sv` eller `en` från podcastinställningen.
 
-**CPU-tid:** `ggml-small` på CPU för ett 40-minutersavsnitt tar ofta **15–60 minuter**. Med **CUDA** på RTX 40-serie är samma jobb ofta några minuter. I Aktivitetshanteraren: GPU-grafen **CUDA** (inte 3D) — 3D kan stå på 0 % medan CUDA arbetar.
+**CPU-tid:** `ggml-small` på CPU för ett 40-minutersavsnitt tar ofta **15–60 minuter**. Med **CUDA** på RTX 40-serie (målmaskin: RTX 4070 Laptop) är samma jobb ofta några minuter. GPU används när NVIDIA hittas och whisper-cli är CUDA-bygget. Annars `-ng` (CPU). I Aktivitetshanteraren: GPU-grafen **CUDA** (inte 3D) — 3D kan stå på 0 % medan CUDA arbetar.
+
+**Paus under uppspelning:** transkribering startar inte medan ljud spelas (podd eller musik). Ett pågående `whisper-cli` fryses och fortsätter när uppspelningen stannar, utan att börja om från början.
 
 Jobbet syns som `running` under Statistik → Jobbkö. Logg: `%LOCALAPPDATA%\consulting.fagerhierta.hifi-podcast\logs\whisper-last.log`.
 
@@ -91,7 +93,7 @@ Ett Whisper-jobb körs i taget. Om appen startas om medan ett jobb hänger som `
 1. Avsnitt laddas ner (originalfil).
 2. Om **Auto-transkribera** är på köas jobbet `transcribe`.
 3. Efter lyckad ASR köas `generate_chapters` och `detect_ads`.
-4. UI: transkriptpanel (sök, klick → tid), kapitel, reklamskip under uppspelning om **Hoppa reklam** är på.
+4. UI: transkriptpanel (sök i hela biblioteket, klick på träff öppnar det avsnitt som texten tillhör — inte det avsnitt som redan spelas), kapitel, reklamskip under uppspelning om **Hoppa reklam** är på.
 
 ## 4. Kapitel
 
