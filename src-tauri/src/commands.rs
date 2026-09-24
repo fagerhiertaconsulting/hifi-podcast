@@ -9,8 +9,8 @@ use crate::models::{
     FinishedCleanupOutcome, FinishedCleanupSettings, ImportOutcome, InboxItem, JobRow,
     LibraryStats, MusicAlbum, MusicImportOutcome, MusicPlaybackState, MusicPlayerPayload,
     MusicTrack, OnlineMetadataOutcome, PlaybackState, Podcast, PodcastSettings, QueueItem,
-    SubscribeOutcome, Transcript,
-    TranscriptSegment, UnsubscribeOutcome, UpnpSettings, UpnpStatus,
+    SubscribeOutcome, Transcript, TranscriptSearchHit, TranscriptSegment, UnsubscribeOutcome,
+    UpnpSettings, UpnpStatus,
 };
 use crate::AppState;
 use tauri::State;
@@ -501,8 +501,21 @@ pub fn list_segments(state: State<AppState>, episode_id: i64) -> AppResult<Vec<T
 pub fn search_transcripts(
     state: State<AppState>,
     query: String,
-) -> AppResult<Vec<TranscriptSegment>> {
-    db::search_segments(&conn(&state), &query)
+    playing_episode_id: Option<i64>,
+) -> AppResult<Vec<TranscriptSearchHit>> {
+    let hits = db::search_segments(&conn(&state), &query)?;
+    Ok(hits
+        .into_iter()
+        .map(|mut hit| {
+            hit.episode_id = db::resolve_search_hit_episode(hit.episode_id, playing_episode_id);
+            hit
+        })
+        .collect())
+}
+
+#[tauri::command]
+pub fn set_audio_playing(state: State<AppState>, playing: bool) {
+    state.audio.set_playing(playing);
 }
 
 #[tauri::command]

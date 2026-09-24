@@ -31,6 +31,7 @@ import type {
   PlayerPayload,
   Podcast,
   QueueItem,
+  TranscriptSearchHit,
   View,
 } from "./types";
 
@@ -336,7 +337,7 @@ export default function App() {
   }, [payload, musicPayload, speed, duration]);
 
   const playEpisode = useCallback(
-    async (episodeId: number, enqueue = true) => {
+    async (episodeId: number, enqueue = true, startMsOverride?: number) => {
       setBusy(true);
       try {
         if (enqueue) {
@@ -355,9 +356,11 @@ export default function App() {
         const audio = audioRef.current;
         if (!audio) return;
         const startSec =
-          next.playback && !next.playback.completed
-            ? next.playback.position_ms / 1000
-            : next.podcast.intro_skip_sec;
+          startMsOverride != null
+            ? Math.max(0, startMsOverride) / 1000
+            : next.playback && !next.playback.completed
+              ? next.playback.position_ms / 1000
+              : next.podcast.intro_skip_sec;
         const nextSpeed = next.playback?.speed || next.podcast.speed || 1;
         setSpeed(nextSpeed);
         setPayload(next);
@@ -576,6 +579,27 @@ export default function App() {
   payloadRef.current = payload;
 
   useEffect(() => {
+    void api.setAudioPlaying(playing).catch(() => undefined);
+  }, [playing]);
+
+  const openSearchHit = useCallback((hit: TranscriptSearchHit) => {
+    setView("library");
+    setFilter("");
+    setOnlyDownloaded(false);
+    setSelectedId(hit.podcast_id);
+    const playingId = payloadRef.current?.episode.id ?? null;
+    if (playingId === hit.episode_id && filePathRef.current) {
+      if (nativeRef.current) void api.engineSeek(hit.start_ms);
+      else if (audioRef.current) audioRef.current.currentTime = hit.start_ms / 1000;
+      setPosition(hit.start_ms / 1000);
+      positionRef.current = hit.start_ms / 1000;
+      setStatus(`Öppnade träffen i ${hit.episode_title}.`);
+      return;
+    }
+    void playEpisodeRef.current(hit.episode_id, true, hit.start_ms);
+  }, []);
+
+  useEffect(() => {
     const unTick = listen<import("./types").EngineStatus>("engine-tick", (event) => {
       if (!nativeRef.current) return;
       const st = event.payload;
@@ -745,6 +769,7 @@ export default function App() {
             podcasts={podcasts}
             selected={selected}
             episodes={episodes}
+            activeEpisodeId={payload?.episode.id ?? null}
             busy={busy}
             onSelect={(id) => setSelectedId(id)}
             onAddFeed={async () => {
@@ -844,7 +869,7 @@ export default function App() {
               try {
                 setJobs(await api.enqueueTranscribe(id));
                 setStatus(
-                  "Transkribering startad. Ett jobb i taget — följ status under Statistik eller i transkriptpanelen. CPU kan ta 15–60 min för ett helt avsnitt.",
+                  "Transkribering köad. Den pausas medan ljud spelas och fortsätter när uppspelningen stannar. NVIDIA GPU används när CUDA-klienten är installerad.",
                 );
                 await refreshLibrary();
               } catch (err) {
@@ -1139,6 +1164,7 @@ export default function App() {
           if (nativeRef.current) void api.engineSeek(ms);
           else if (audioRef.current) audioRef.current.currentTime = ms / 1000;
         }}
+        onOpenHit={openSearchHit}
       />
 
       <footer className="player">
@@ -1531,6 +1557,7 @@ function Library(props: {
   podcasts: Podcast[];
   selected: Podcast | null;
   episodes: Episode[];
+  activeEpisodeId: number | null;
   busy: boolean;
   onSelect: (id: number) => void;
   onAddFeed: () => void;
@@ -1783,7 +1810,10 @@ function Library(props: {
               </div>
               <ul className="episodes">
                 {visible.map((episode) => (
-                  <li key={episode.id}>
+                  <li
+                    key={episode.id}
+                    className={props.activeEpisodeId === episode.id ? "active" : ""}
+                  >
                     <div>
                       <strong>{episode.title}</strong>
                       <span>

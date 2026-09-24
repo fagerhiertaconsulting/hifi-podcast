@@ -172,6 +172,21 @@ pub struct TranscriptSegment {
     pub text: String,
 }
 
+/// A transcript search hit in the whole library. `episode_id` is the episode
+/// that owns the text, never whichever episode happens to be playing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TranscriptSearchHit {
+    pub id: i64,
+    pub transcript_id: i64,
+    pub episode_id: i64,
+    pub podcast_id: i64,
+    pub episode_title: String,
+    pub podcast_title: String,
+    pub start_ms: i64,
+    pub end_ms: i64,
+    pub text: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Chapter {
     pub id: i64,

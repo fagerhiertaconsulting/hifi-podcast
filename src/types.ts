@@ -106,6 +106,18 @@ export type TranscriptSegment = {
   text: string;
 };
 
+export type TranscriptSearchHit = {
+  id: number;
+  transcript_id: number;
+  episode_id: number;
+  podcast_id: number;
+  episode_title: string;
+  podcast_title: string;
+  start_ms: number;
+  end_ms: number;
+  text: string;
+};
+
 export type Transcript = {
   id: number;
   episode_id: number;

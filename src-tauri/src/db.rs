@@ -3,7 +3,7 @@ use crate::models::{
     AdSegment, Bookmark, Chapter, DeleteEpisodeFileOutcome, Download, Episode,
     FinishedCleanupOutcome, FinishedCleanupSettings, InboxItem, JobRow, LibraryStats, MusicAlbum,
     MusicPlaybackState, MusicTrack, PlaybackState, Podcast, PodcastSettings, QueueItem, Transcript,
-    TranscriptSegment, UnsubscribeOutcome,
+    TranscriptSearchHit, TranscriptSegment, UnsubscribeOutcome,
 };
 use rusqlite::{params, Connection, OptionalExtension};
 
@@ -1294,13 +1294,17 @@ pub fn enqueue_job(
     Ok(conn.last_insert_rowid())
 }
 
-pub fn claim_next_job(conn: &Connection) -> AppResult<Option<(i64, String, i64)>> {
+pub fn claim_next_job(
+    conn: &Connection,
+    defer_transcribe: bool,
+) -> AppResult<Option<(i64, String, i64)>> {
+    let sql = if defer_transcribe {
+        "SELECT id, type, episode_id FROM job WHERE state = 'queued' AND type != 'transcribe' ORDER BY priority DESC, id ASC LIMIT 1"
+    } else {
+        "SELECT id, type, episode_id FROM job WHERE state = 'queued' ORDER BY priority DESC, id ASC LIMIT 1"
+    };
     let row: Option<(i64, String, i64)> = conn
-        .query_row(
-            "SELECT id, type, episode_id FROM job WHERE state = 'queued' ORDER BY priority DESC, id ASC LIMIT 1",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        )
+        .query_row(sql, [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
         .optional()?;
     if let Some((id, ty, eid)) = &row {
         conn.execute(
@@ -1424,22 +1428,52 @@ pub fn list_segments(conn: &Connection, episode_id: i64) -> AppResult<Vec<Transc
     Ok(rows.filter_map(|r| r.ok()).collect())
 }
 
-pub fn search_segments(conn: &Connection, query: &str) -> AppResult<Vec<TranscriptSegment>> {
-    let like = format!("%{}%", query);
+/// Episode a search hit opens. The episode that is already playing is ignored
+/// so a hit never seeks inside the wrong episode.
+pub fn resolve_search_hit_episode(hit_episode_id: i64, playing_episode_id: Option<i64>) -> i64 {
+    let _playing = playing_episode_id;
+    hit_episode_id
+}
+
+fn like_contains_pattern(query: &str) -> String {
+    let mut escaped = String::new();
+    for ch in query.chars() {
+        if matches!(ch, '\\' | '%' | '_') {
+            escaped.push('\\');
+        }
+        escaped.push(ch);
+    }
+    format!("%{escaped}%")
+}
+
+pub fn search_segments(conn: &Connection, query: &str) -> AppResult<Vec<TranscriptSearchHit>> {
+    let query = query.trim();
+    if query.is_empty() {
+        return Ok(Vec::new());
+    }
+    let like = like_contains_pattern(query);
     let mut stmt = conn.prepare(
-        "SELECT s.id, s.transcript_id, s.start_ms, s.end_ms, s.text
+        "SELECT s.id, s.transcript_id, e.id, e.podcast_id, e.title, p.title,
+                s.start_ms, s.end_ms, s.text
          FROM transcript_segment s
-         WHERE s.text LIKE ?1 COLLATE NOCASE
-         ORDER BY s.start_ms
+         JOIN transcript t ON t.id = s.transcript_id
+         JOIN episode e ON e.id = t.episode_id
+         JOIN podcast p ON p.id = e.podcast_id
+         WHERE (s.text COLLATE NOCASE) LIKE ?1 ESCAPE '\\'
+         ORDER BY s.start_ms, s.id
          LIMIT 200",
     )?;
     let rows = stmt.query_map(params![like], |row| {
-        Ok(TranscriptSegment {
+        Ok(TranscriptSearchHit {
             id: row.get(0)?,
             transcript_id: row.get(1)?,
-            start_ms: row.get(2)?,
-            end_ms: row.get(3)?,
-            text: row.get(4)?,
+            episode_id: row.get(2)?,
+            podcast_id: row.get(3)?,
+            episode_title: row.get(4)?,
+            podcast_title: row.get(5)?,
+            start_ms: row.get(6)?,
+            end_ms: row.get(7)?,
+            text: row.get(8)?,
         })
     })?;
     Ok(rows.filter_map(|r| r.ok()).collect())
@@ -2163,10 +2197,143 @@ mod tests {
         .unwrap();
         assert_eq!(get_playback(&conn, eid).unwrap().unwrap().position_ms, 1234);
         enqueue_job(&conn, "transcribe", eid, 10).unwrap();
-        assert!(claim_next_job(&conn).unwrap().is_some());
+        assert!(claim_next_job(&conn, false).unwrap().is_some());
         assert_eq!(requeue_running_jobs(&conn).unwrap(), 1);
         assert_eq!(list_jobs(&conn, 5).unwrap()[0].state, "queued");
         assert!(!get_podcast(&conn, pid).unwrap().auto_transcribe);
+    }
+
+    #[test]
+    fn transcribe_stays_queued_while_audio_plays_and_runs_when_it_stops() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize(&conn).unwrap();
+        let pid = upsert_podcast(
+            &conn,
+            "https://example.com/pause.xml",
+            "Pauspodd",
+            None,
+            None,
+            None,
+            Some("sv"),
+        )
+        .unwrap();
+        let eid =
+            upsert_episode(&conn, pid, "guid-pause", "Avsnitt", None, None, None, None).unwrap();
+        let transcribe_id = enqueue_job(&conn, "transcribe", eid, 10).unwrap();
+        let chapters_id = enqueue_job(&conn, "generate_chapters", eid, 5).unwrap();
+
+        let while_playing = claim_next_job(&conn, true).unwrap().unwrap();
+        assert_eq!(while_playing.0, chapters_id);
+        assert_eq!(while_playing.1, "generate_chapters");
+        assert!(claim_next_job(&conn, true).unwrap().is_none());
+        let queued = list_jobs(&conn, 10)
+            .unwrap()
+            .into_iter()
+            .find(|job| job.id == transcribe_id)
+            .unwrap();
+        assert_eq!(queued.state, "queued");
+        assert_eq!(queued.job_type, "transcribe");
+
+        let after_stop = claim_next_job(&conn, false).unwrap().unwrap();
+        assert_eq!(after_stop.0, transcribe_id);
+        assert_eq!(after_stop.1, "transcribe");
+        assert_eq!(after_stop.2, eid);
+    }
+
+    #[test]
+    fn search_hit_resolves_to_the_matching_episode_not_the_one_playing() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize(&conn).unwrap();
+        let playing_show = upsert_podcast(
+            &conn,
+            "https://playing.example/feed.xml",
+            "Podd som spelas",
+            None,
+            None,
+            None,
+            Some("sv"),
+        )
+        .unwrap();
+        let library_show = upsert_podcast(
+            &conn,
+            "https://library.example/feed.xml",
+            "Hela biblioteket",
+            None,
+            None,
+            None,
+            Some("sv"),
+        )
+        .unwrap();
+        let playing = upsert_episode(
+            &conn,
+            playing_show,
+            "guid-playing",
+            "Avsnitt som redan spelas",
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let matched = upsert_episode(
+            &conn,
+            library_show,
+            "guid-match",
+            "Rätt avsnitt",
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        replace_transcript(
+            &conn,
+            playing,
+            "local_whisper",
+            Some(crate::asr::MODEL_NAME),
+            Some("sv"),
+            &[crate::intel::Segment {
+                start_ms: 0,
+                end_ms: 1_500,
+                text: "det här är det spelande avsnittet".into(),
+            }],
+        )
+        .unwrap();
+        replace_transcript(
+            &conn,
+            matched,
+            "local_whisper",
+            Some(crate::asr::MODEL_NAME),
+            Some("sv"),
+            &[crate::intel::Segment {
+                start_ms: 88_000,
+                end_ms: 91_000,
+                text: "unik fras om fiolstråkar".into(),
+            }],
+        )
+        .unwrap();
+
+        let hits = search_segments(&conn, "fiolstråkar").unwrap();
+        let folded = search_segments(&conn, "FIOL").unwrap();
+        assert_eq!(folded.len(), 1);
+        assert_eq!(folded[0].episode_id, matched);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].episode_id, matched);
+        assert_ne!(hits[0].episode_id, playing);
+        assert_eq!(
+            resolve_search_hit_episode(hits[0].episode_id, Some(playing)),
+            matched
+        );
+        assert_ne!(
+            resolve_search_hit_episode(hits[0].episode_id, Some(playing)),
+            playing
+        );
+        assert_eq!(hits[0].podcast_id, library_show);
+        assert_eq!(hits[0].podcast_title, "Hela biblioteket");
+        assert_eq!(hits[0].episode_title, "Rätt avsnitt");
+        assert_eq!(hits[0].start_ms, 88_000);
+        assert!(search_segments(&conn, "%").unwrap().is_empty());
+        assert!(search_segments(&conn, "   ").unwrap().is_empty());
     }
 
     #[test]

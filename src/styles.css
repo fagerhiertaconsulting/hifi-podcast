@@ -198,6 +198,10 @@ textarea {
   flex-direction: column;
 }
 
+.episodes li.active {
+  border-color: var(--accent);
+}
+
 .podcast-head {
   display: flex;
   justify-content: space-between;

@@ -8,10 +8,14 @@ use tauri::{AppHandle, Emitter, Manager};
 
 pub async fn worker_loop(app: AppHandle) {
     loop {
+        let defer_transcribe = {
+            let state = app.state::<AppState>();
+            !asr::transcription_allowed(state.audio.is_playing())
+        };
         let claimed = {
             let state = app.state::<AppState>();
             let conn = state.db.lock().expect("db");
-            db::claim_next_job(&conn).ok().flatten()
+            db::claim_next_job(&conn, defer_transcribe).ok().flatten()
         };
         if let Some((job_id, job_type, episode_id)) = claimed {
             let _ = app.emit("jobs-changed", ());
@@ -101,7 +105,7 @@ async fn transcribe(app: &AppHandle, job_id: i64, episode_id: i64) -> AppResult<
             let _ = db::set_job_progress(
                 &conn,
                 job_id,
-                if asr::cli_backend(&data_dir) == "cuda" {
+                if asr::use_nvidia_gpu(asr::nvidia_gpu_present(), &asr::cli_backend(&data_dir)) {
                     "Startar whisper-cli på NVIDIA GPU…"
                 } else {
                     "Startar whisper-cli (CPU). Ett helt avsnitt kan ta många minuter…"
@@ -110,7 +114,11 @@ async fn transcribe(app: &AppHandle, job_id: i64, episode_id: i64) -> AppResult<
         }
         let _ = app.emit("jobs-changed", ());
     }
-    let result = asr::transcribe_file(&data_dir, &audio, &language, Some(tx)).await;
+    let gate = {
+        let state = app.state::<AppState>();
+        state.audio.clone()
+    };
+    let result = asr::transcribe_file(&data_dir, &audio, &language, &gate, Some(tx)).await;
     let _ = progress.await;
     let (segments, lang) = result?;
     {
