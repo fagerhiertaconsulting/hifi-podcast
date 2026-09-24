@@ -106,13 +106,20 @@ pub async fn add_feed(state: State<'_, AppState>, url: String) -> AppResult<Subs
     subscribe_url(&state, &url).await
 }
 
+pub(crate) async fn refresh_one_stored(
+    state: &AppState,
+    podcast_id: i64,
+) -> AppResult<SubscribeOutcome> {
+    let feed_url = db::get_podcast(&conn(state), podcast_id)?.feed_url;
+    subscribe_url(state, &feed_url).await
+}
+
 #[tauri::command]
 pub async fn refresh_feed(
     state: State<'_, AppState>,
     podcast_id: i64,
 ) -> AppResult<SubscribeOutcome> {
-    let feed_url = db::get_podcast(&conn(&state), podcast_id)?.feed_url;
-    subscribe_url(&state, &feed_url).await
+    refresh_one_stored(&state, podcast_id).await
 }
 
 #[tauri::command]

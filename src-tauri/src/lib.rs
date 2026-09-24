@@ -4,6 +4,7 @@ mod db;
 mod download;
 mod engine;
 mod error;
+mod feed_refresh;
 mod feeds;
 mod intel;
 mod jobs;
@@ -73,6 +74,10 @@ pub fn run() {
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 jobs::worker_loop(handle).await;
+            });
+            let refresh_app = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                feed_refresh::auto_refresh_loop(refresh_app).await;
             });
             let bind_app = app.handle().clone();
             tauri::async_runtime::spawn(async move {

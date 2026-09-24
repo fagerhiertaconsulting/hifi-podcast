@@ -144,6 +144,12 @@ textarea {
   flex: 1;
 }
 
+.auto-refresh-note {
+  margin: 0.35rem 0 0;
+  font-size: 0.82rem;
+  color: var(--muted);
+}
+
 .library textarea {
   width: 100%;
   min-height: 72px;
