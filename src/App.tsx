@@ -838,6 +838,46 @@ export default function App() {
                 current.map((p) => (p.id === selected?.id ? { ...p, ...patch } : p)),
               );
             }}
+            onUnsubscribe={async (deleteFiles) => {
+              if (!selected) return;
+              const id = selected.id;
+              const title = selected.title;
+              setBusy(true);
+              try {
+                if (payload?.podcast.id === id) {
+                  const audio = audioRef.current;
+                  if (audio) {
+                    audio.pause();
+                    audio.removeAttribute("src");
+                    audio.load();
+                  }
+                  await api.engineStop().catch(() => undefined);
+                  setPlaying(false);
+                  setPayload(null);
+                  filePathRef.current = null;
+                  void api.smtcNowPlaying(title, "", false);
+                }
+                const result = await api.unsubscribePodcast(id, deleteFiles);
+                setEpisodes([]);
+                setSelectedId((current) => (current === id ? null : current));
+                await refreshLibrary();
+                const fileNote = !deleteFiles
+                  ? "Lokala filer behölls."
+                  : result.warnings.length
+                    ? "Lokala filer raderades bara där det var säkert."
+                    : "Lokala filer raderades.";
+                const warn = result.warnings.length
+                  ? ` ${result.warnings.join(" ")}`
+                  : "";
+                setStatus(
+                  `Avslutade prenumerationen på ${result.title}. ${fileNote}${warn}`,
+                );
+              } catch (err) {
+                setStatus(String(err));
+              } finally {
+                setBusy(false);
+              }
+            }}
           />
         )}
 
@@ -1435,7 +1475,14 @@ function Library(props: {
   onTranscribe: (id: number) => void;
   onSaveSettings: () => void;
   onPatchSelected: (patch: Partial<Podcast>) => void;
+  onUnsubscribe: (deleteFiles: boolean) => void;
 }) {
+  const [confirmUnsubscribe, setConfirmUnsubscribe] = useState(false);
+  const [deleteLocalFiles, setDeleteLocalFiles] = useState(false);
+  useEffect(() => {
+    setConfirmUnsubscribe(false);
+    setDeleteLocalFiles(false);
+  }, [props.selected?.id]);
   const selected = props.selected;
   const visible = props.episodes.filter((ep) => {
     const q = props.filter.trim().toLowerCase();
@@ -1508,6 +1555,52 @@ function Library(props: {
                 <div>
                   <h1>{selected.title}</h1>
                   <p>{selected.description ?? "Ingen beskrivning i feeden."}</p>
+                </div>
+                <div className="unsubscribe">
+                  {confirmUnsubscribe ? (
+                    <div className="unsubscribe-panel">
+                      <p>
+                        Flödet tas bort från biblioteket. Avsnitt, kö och sparad
+                        uppspelning för den här podden försvinner.
+                      </p>
+                      <label className="check">
+                        <input
+                          type="checkbox"
+                          checked={deleteLocalFiles}
+                          onChange={(e) => setDeleteLocalFiles(e.target.checked)}
+                        />
+                        Radera även lokala filer för den här podden
+                      </label>
+                      <div className="row-actions">
+                        <button
+                          disabled={props.busy}
+                          onClick={() => {
+                            setConfirmUnsubscribe(false);
+                            setDeleteLocalFiles(false);
+                          }}
+                        >
+                          Avbryt
+                        </button>
+                        <button
+                          className="danger"
+                          disabled={props.busy}
+                          onClick={() => props.onUnsubscribe(deleteLocalFiles)}
+                        >
+                          Avsluta prenumeration
+                        </button>
+                      </div>
+                    </div>
+                  ) : (
+                    <button
+                      disabled={props.busy}
+                      onClick={() => {
+                        setDeleteLocalFiles(false);
+                        setConfirmUnsubscribe(true);
+                      }}
+                    >
+                      Avsluta prenumeration
+                    </button>
+                  )}
                 </div>
               </div>
               <div className="settings-grid">

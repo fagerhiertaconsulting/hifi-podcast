@@ -1,8 +1,8 @@
 mod asr;
 mod commands;
 mod db;
-mod engine;
 mod download;
+mod engine;
 mod error;
 mod feeds;
 mod intel;
@@ -101,6 +101,7 @@ pub fn run() {
             commands::update_podcast_settings,
             commands::add_feed,
             commands::refresh_feed,
+            commands::unsubscribe_podcast,
             commands::import_opml,
             commands::import_opml_file,
             commands::export_opml,

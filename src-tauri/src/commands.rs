@@ -7,7 +7,7 @@ use crate::models::{
     AdSegment, AppPaths, AsrStatus, Bookmark, Chapter, Download, Episode, ImportOutcome, InboxItem,
     JobRow, LibraryStats, MusicAlbum, MusicImportOutcome, MusicPlaybackState, MusicPlayerPayload,
     MusicTrack, PlaybackState, Podcast, PodcastSettings, QueueItem, SubscribeOutcome, Transcript,
-    TranscriptSegment, UpnpSettings, UpnpStatus,
+    TranscriptSegment, UnsubscribeOutcome, UpnpSettings, UpnpStatus,
 };
 use crate::AppState;
 use tauri::State;
@@ -112,6 +112,15 @@ pub async fn refresh_feed(
 ) -> AppResult<SubscribeOutcome> {
     let feed_url = db::get_podcast(&conn(&state), podcast_id)?.feed_url;
     subscribe_url(&state, &feed_url).await
+}
+
+#[tauri::command]
+pub fn unsubscribe_podcast(
+    state: State<AppState>,
+    podcast_id: i64,
+    delete_files: bool,
+) -> AppResult<UnsubscribeOutcome> {
+    db::unsubscribe_podcast(&conn(&state), &state.media_root, podcast_id, delete_files)
 }
 
 #[tauri::command]
@@ -611,7 +620,9 @@ pub fn engine_list_devices() -> Vec<crate::engine::OutputDeviceInfo> {
 }
 
 #[tauri::command]
-pub fn engine_get_settings(state: State<AppState>) -> AppResult<crate::models::AudioEngineSettings> {
+pub fn engine_get_settings(
+    state: State<AppState>,
+) -> AppResult<crate::models::AudioEngineSettings> {
     db::audio_engine_settings(&conn(&state))
 }
 
@@ -718,7 +729,10 @@ pub fn import_music_folder(state: State<AppState>, path: String) -> AppResult<Mu
 }
 
 #[tauri::command]
-pub fn music_track_for_player(state: State<AppState>, track_id: i64) -> AppResult<MusicPlayerPayload> {
+pub fn music_track_for_player(
+    state: State<AppState>,
+    track_id: i64,
+) -> AppResult<MusicPlayerPayload> {
     let conn = conn(&state);
     let track = db::get_music_track(&conn, track_id)?;
     if track.file_path.trim().is_empty() {
