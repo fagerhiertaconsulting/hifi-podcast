@@ -389,7 +389,21 @@ pub struct PlayerPayload {
 /// so playback can use a same-origin blob URL (Web Audio + asset.localhost CORS).
 #[tauri::command]
 pub fn read_media_file(state: State<AppState>, path: String) -> AppResult<Vec<u8>> {
-    read_media_file_from(state.media_root.as_path(), std::path::Path::new(&path))
+    let file = crate::music::authorize_playback_path(
+        &conn(&state),
+        state.media_root.as_path(),
+        std::path::Path::new(&path),
+    )?;
+    let meta = std::fs::symlink_metadata(&file)?;
+    if crate::music::metadata_is_link(&meta) {
+        return Err(crate::error::AppError::msg("Symlänkar spelas inte."));
+    }
+    if meta.len() > crate::net::MAX_MEDIA_BYTES {
+        return Err(crate::error::AppError::msg(
+            "Ljudfilen är större än tillåtet (2 GB).",
+        ));
+    }
+    Ok(std::fs::read(file)?)
 }
 
 pub(crate) fn read_media_file_from(
@@ -688,7 +702,11 @@ pub fn engine_save_settings(
 
 #[tauri::command]
 pub fn engine_probe(state: State<AppState>, path: String) -> AppResult<crate::engine::ProbeInfo> {
-    let file = crate::engine::ensure_under_root(&state.media_root, std::path::Path::new(&path))?;
+    let file = crate::music::authorize_playback_path(
+        &conn(&state),
+        &state.media_root,
+        std::path::Path::new(&path),
+    )?;
     Ok(crate::engine::Handle::probe(&file)?)
 }
 
@@ -701,7 +719,11 @@ pub fn engine_open(
     output_api: Option<String>,
     device_name: Option<String>,
 ) -> AppResult<crate::engine::EngineStatus> {
-    let file = crate::engine::ensure_under_root(&state.media_root, std::path::Path::new(&path))?;
+    let file = crate::music::authorize_playback_path(
+        &conn(&state),
+        &state.media_root,
+        std::path::Path::new(&path),
+    )?;
     let saved = db::audio_engine_settings(&conn(&state))?;
     let status = state.engine.open(crate::engine::OpenParams {
         path: file,
@@ -775,7 +797,7 @@ pub fn last_music_import_root(state: State<AppState>) -> AppResult<Option<String
 #[tauri::command]
 pub fn import_music_folder(state: State<AppState>, path: String) -> AppResult<MusicImportOutcome> {
     let folder = std::path::PathBuf::from(path);
-    crate::music::import_folder(&conn(&state), &state.media_root, &folder)
+    crate::music::import_folder(&conn(&state), &folder)
 }
 
 #[tauri::command]
@@ -784,10 +806,9 @@ pub fn music_track_for_player(
     track_id: i64,
 ) -> AppResult<MusicPlayerPayload> {
     let conn = conn(&state);
-    let track = db::get_music_track(&conn, track_id)?;
-    if track.file_path.trim().is_empty() {
-        return Err(crate::error::AppError::msg("Spåret saknar lokal fil."));
-    }
+    let mut track = db::get_music_track(&conn, track_id)?;
+    let playable = crate::music::require_playable_track(&conn, &state.media_root, &track)?;
+    track.file_path = playable.display().to_string().replace('\\', "/");
     let album = db::get_music_album(&conn, track.album_id)?;
     let playback = db::get_music_playback(&conn, track_id)?;
     Ok(MusicPlayerPayload {

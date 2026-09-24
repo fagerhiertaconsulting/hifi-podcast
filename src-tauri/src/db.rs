@@ -1787,6 +1787,33 @@ pub fn delete_music_track(conn: &Connection, track_id: i64) -> AppResult<()> {
     Ok(())
 }
 
+pub fn list_music_folder_paths(conn: &Connection) -> AppResult<Vec<String>> {
+    let mut stmt = conn.prepare("SELECT path FROM music_folder")?;
+    let rows = stmt.query_map([], |row| row.get(0))?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+pub fn music_track_by_file_path(
+    conn: &Connection,
+    file_path: &str,
+) -> AppResult<Option<MusicTrack>> {
+    let mut stmt = conn.prepare(
+        r#"
+        SELECT id, album_id, source_path, file_path, title, artist, album, track_no,
+               duration_ms, format, codec, sample_rate, bits_per_sample, channels, bytes, created_at
+        FROM music_track WHERE file_path = ?1
+        "#,
+    )?;
+    let row = stmt
+        .query_row(params![file_path], map_music_track)
+        .optional()?;
+    Ok(row)
+}
+
 pub fn music_track_by_source(
     conn: &Connection,
     source_path: &str,

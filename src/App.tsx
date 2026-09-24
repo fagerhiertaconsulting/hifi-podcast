@@ -1894,8 +1894,9 @@ function MusicView(props: {
       </header>
       <p className="empty music-lead">
         Eget bibliotek, skilt från podcasts. Importera mappar med FLAC/DSD (t.ex. under
-        Downloads). Originalfiler kopieras till media/music utan omkodning och spelas i
-        samma hi-fi-motor (ASIO/FiiO, WASAPI, native DSD). SACD-ISO rippning ingår inte.
+        Downloads). Filerna lämnas kvar där de ligger: appen indexerar och länkar dem,
+        utan kopia till appdata och utan omkodning, och spelar dem i samma hi-fi-motor
+        (ASIO/FiiO, WASAPI, native DSD). SACD-ISO rippning ingår inte.
       </p>
       <div className="toolbar">
         <input
