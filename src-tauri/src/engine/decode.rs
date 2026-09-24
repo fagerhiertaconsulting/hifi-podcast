@@ -270,6 +270,50 @@ impl Decoder {
     }
 }
 
+/// Container duration in milliseconds, when the file header knows it.
+pub fn file_duration_ms(path: &Path) -> Result<i64, EngineError> {
+    let dec = Decoder::open(path)?;
+    dec.spec()
+        .duration_ms
+        .map(|ms| ms as i64)
+        .filter(|ms| *ms > 0)
+        .ok_or_else(|| EngineError::msg("Ljudfilen saknar längd."))
+}
+
+/// 100 ms RMS windows for silence detection. Decodes locally. No output device.
+pub fn collect_rms_windows(path: &Path) -> Result<(Vec<(i64, i64, f32)>, i64), EngineError> {
+    let mut dec = Decoder::open(path)?;
+    let rate = dec.spec().sample_rate;
+    if rate == 0 {
+        return Err(EngineError::msg("Ljudspåret saknar samplingsfrekvens."));
+    }
+    let channels = usize::from(dec.spec().channels.max(1));
+    let header_duration = dec.spec().duration_ms.map(|ms| ms as i64).unwrap_or(0);
+    let window_frames = ((u64::from(rate) * 100) / 1000).max(1) as usize;
+    let window_samples = window_frames.saturating_mul(channels).max(1);
+    let mut pending = Vec::new();
+    let mut windows = Vec::new();
+    let mut frame_at: i64 = 0;
+    loop {
+        let chunk = dec.read_interleaved(window_samples)?;
+        if chunk.is_empty() {
+            break;
+        }
+        pending.extend_from_slice(&chunk);
+        while pending.len() >= window_samples {
+            let block: Vec<f32> = pending.drain(..window_samples).collect();
+            let rms = crate::intel::rms_of(&block);
+            let start_ms = frame_at.saturating_mul(1000) / i64::from(rate);
+            frame_at += window_frames as i64;
+            let end_ms = frame_at.saturating_mul(1000) / i64::from(rate);
+            windows.push((start_ms, end_ms, rms));
+        }
+    }
+    let scanned = windows.last().map(|w| w.1).unwrap_or(0);
+    let duration = header_duration.max(scanned);
+    Ok((windows, duration))
+}
+
 fn copy_i32_interleaved(decoded: AudioBufferRef<'_>) -> Result<Vec<i32>, EngineError> {
     let AudioBufferRef::S32(buf) = decoded else {
         return Err(EngineError::msg(

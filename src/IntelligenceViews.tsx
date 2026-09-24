@@ -1,9 +1,11 @@
 import { useEffect, useMemo, useState } from "react";
 import { api } from "./api";
 import type {
+  AdSegment,
   AsrStatus,
   Bookmark,
   Chapter,
+  FfmpegStatus,
   InboxItem,
   JobRow,
   LibraryStats,
@@ -25,10 +27,16 @@ export function TranscriptPane(props: {
   positionMs: number;
   onSeekMs: (ms: number) => void;
   onOpenHit: (hit: TranscriptSearchHit) => void;
+  onAdsChanged?: (ads: AdSegment[]) => void;
+  onNotice?: (message: string) => void;
   jobs?: JobRow[];
 }) {
   const [segments, setSegments] = useState<TranscriptSegment[]>([]);
   const [chapters, setChapters] = useState<Chapter[]>([]);
+  const [chapterDrafts, setChapterDrafts] = useState<Record<number, string>>({});
+  const [ads, setAds] = useState<AdSegment[]>([]);
+  const [ffmpeg, setFfmpeg] = useState<FfmpegStatus | null>(null);
+  const [busy, setBusy] = useState(false);
   const [query, setQuery] = useState("");
   const [hits, setHits] = useState<TranscriptSearchHit[] | null>(null);
 
@@ -40,14 +48,23 @@ export function TranscriptPane(props: {
     if (props.episodeId == null) {
       setSegments([]);
       setChapters([]);
+      setChapterDrafts({});
+      setAds([]);
       return;
     }
+    const episodeId = props.episodeId;
     void Promise.all([
-      api.listSegments(props.episodeId),
-      api.listChapters(props.episodeId),
-    ]).then(([s, c]) => {
+      api.listSegments(episodeId),
+      api.listChapters(episodeId),
+      api.listAds(episodeId),
+      api.ffmpegStatus(),
+    ]).then(([s, c, a, ff]) => {
       setSegments(s);
       setChapters(c);
+      setChapterDrafts(Object.fromEntries(c.map((ch) => [ch.id, ch.title])));
+      setAds(a);
+      setFfmpeg(ff);
+      props.onAdsChanged?.(a);
     });
   }, [props.episodeId, job?.id, job?.state]);
 
@@ -66,6 +83,38 @@ export function TranscriptPane(props: {
     }
     return "Inget transkript ännu. Ladda ner avsnittet och tryck Transkribera.";
   })();
+
+  function adLabel(ad: AdSegment) {
+    const flag =
+      ad.user_label === "ad"
+        ? "detta var reklam"
+        : ad.user_label === "not_ad"
+          ? "inte reklam"
+          : ad.method === "silence"
+            ? "tystnad"
+            : ad.method;
+    return `${flag}${ad.enabled ? "" : ", hoppas inte över"}`;
+  }
+
+  function labelAt(
+    episodeId: number,
+    positionMs: number,
+    label: "ad" | "not_ad",
+    adId: number | null,
+  ) {
+    setBusy(true);
+    void api
+      .setAdFeedback(episodeId, positionMs, label, adId)
+      .then((next) => {
+        setAds(next);
+        props.onAdsChanged?.(next);
+        props.onNotice?.(
+          label === "ad" ? "Markerat: detta var reklam." : "Markerat: inte reklam.",
+        );
+      })
+      .catch((err) => props.onNotice?.(String(err)))
+      .finally(() => setBusy(false));
+  }
 
   const activeId = useMemo(() => {
     const hit = segments.find(
@@ -109,14 +158,154 @@ export function TranscriptPane(props: {
           <h3>Kapitel</h3>
           <ul className="hits">
             {chapters.map((ch) => (
-              <li key={ch.id}>
+              <li key={ch.id} className="chapter-edit">
                 <button onClick={() => props.onSeekMs(ch.start_ms)}>
-                  {formatClock(ch.start_ms)} · {ch.title}
-                  <span> ({ch.source})</span>
+                  {formatClock(ch.start_ms)}
+                </button>
+                <input
+                  aria-label={`Kapiteltitel ${formatClock(ch.start_ms)}`}
+                  value={chapterDrafts[ch.id] ?? ch.title}
+                  onChange={(e) =>
+                    setChapterDrafts((prev) => ({ ...prev, [ch.id]: e.target.value }))
+                  }
+                />
+                <button
+                  onClick={() => {
+                    const title = (chapterDrafts[ch.id] ?? ch.title).trim();
+                    void api
+                      .updateChapterTitle(ch.id, title)
+                      .then((saved) => {
+                        setChapters((prev) =>
+                          prev.map((row) => (row.id === saved.id ? saved : row)),
+                        );
+                        setChapterDrafts((prev) => ({ ...prev, [saved.id]: saved.title }));
+                        props.onNotice?.("Kapiteltiteln är sparad.");
+                      })
+                      .catch((err) => props.onNotice?.(String(err)));
+                  }}
+                >
+                  Spara titel
                 </button>
               </li>
             ))}
           </ul>
+        </>
+      )}
+      {props.episodeId != null && (
+        <>
+          <h3>Reklam</h3>
+          <p className="empty">
+            Tystnad runt 15, 30 eller 60 sekunder nära start, mitten eller slutet
+            markeras som reklam. Originalfilen behålls. Klippet är en ny fil för
+            privat bruk och kodas inte om.
+          </p>
+          <div className="ad-actions">
+            <button
+              disabled={busy}
+              onClick={() => {
+                if (props.episodeId == null) return;
+                void labelAt(props.episodeId, props.positionMs, "ad", null);
+              }}
+            >
+              detta var reklam
+            </button>
+            <button
+              disabled={busy}
+              onClick={() => {
+                if (props.episodeId == null) return;
+                void labelAt(props.episodeId, props.positionMs, "not_ad", null);
+              }}
+            >
+              inte reklam
+            </button>
+            <button
+              disabled={busy}
+              onClick={() => {
+                if (props.episodeId == null) return;
+                setBusy(true);
+                void api
+                  .scanSilenceAds(props.episodeId)
+                  .then((next) => {
+                    setAds(next);
+                    props.onAdsChanged?.(next);
+                    props.onNotice?.("Tystnadsanalysen är klar.");
+                  })
+                  .catch((err) => props.onNotice?.(String(err)))
+                  .finally(() => setBusy(false));
+              }}
+            >
+              Sök reklam via tystnad
+            </button>
+          </div>
+          <ul className="hits">
+            {ads.length === 0 && <li className="empty">Inga reklamblock.</li>}
+            {ads.map((ad) => (
+              <li key={ad.id} className="ad-row">
+                <button onClick={() => props.onSeekMs(ad.start_ms)}>
+                  {formatClock(ad.start_ms)}–{formatClock(ad.end_ms)} · {adLabel(ad)}
+                </button>
+                <div className="ad-actions">
+                  <button
+                    disabled={busy}
+                    onClick={() => {
+                      if (props.episodeId == null) return;
+                      void labelAt(props.episodeId, ad.start_ms, "ad", ad.id);
+                    }}
+                  >
+                    detta var reklam
+                  </button>
+                  <button
+                    disabled={busy}
+                    onClick={() => {
+                      if (props.episodeId == null) return;
+                      void labelAt(props.episodeId, ad.start_ms, "not_ad", ad.id);
+                    }}
+                  >
+                    inte reklam
+                  </button>
+                </div>
+              </li>
+            ))}
+          </ul>
+          <div className="ad-actions">
+            <button
+              className="primary"
+              disabled={busy || props.episodeId == null}
+              onClick={() => {
+                if (props.episodeId == null) return;
+                setBusy(true);
+                void api
+                  .cutEpisodeAds(props.episodeId)
+                  .then((out) => {
+                    props.onNotice?.(
+                      `Ny fil utan markerad reklam. Originalet är kvar. ${out.cut_path}`,
+                    );
+                  })
+                  .catch((err) => props.onNotice?.(String(err)))
+                  .finally(() => setBusy(false));
+              }}
+            >
+              Klipp bort reklam till ny fil
+            </button>
+            {ffmpeg && !ffmpeg.present && (
+              <button
+                disabled={busy}
+                onClick={() => {
+                  setBusy(true);
+                  void api
+                    .downloadFfmpeg()
+                    .then((next) => {
+                      setFfmpeg(next);
+                      props.onNotice?.(next.hint);
+                    })
+                    .catch((err) => props.onNotice?.(String(err)))
+                    .finally(() => setBusy(false));
+                }}
+              >
+                Ladda ner ffmpeg
+              </button>
+            )}
+          </div>
         </>
       )}
       <ul className="segments">

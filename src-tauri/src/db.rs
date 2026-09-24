@@ -522,7 +522,8 @@ fn migrate_v1(conn: &Connection) -> AppResult<()> {
           end_ms INTEGER NOT NULL,
           confidence REAL NOT NULL,
           method TEXT NOT NULL,
-          enabled INTEGER NOT NULL DEFAULT 1
+          enabled INTEGER NOT NULL DEFAULT 1,
+          user_label TEXT NOT NULL DEFAULT 'unset'
         );
         CREATE TABLE IF NOT EXISTS job (
           id INTEGER PRIMARY KEY,
@@ -546,6 +547,10 @@ fn migrate_v1(conn: &Connection) -> AppResult<()> {
         );
         "#,
     )?;
+    let _ = conn.execute(
+        "ALTER TABLE ad_segment ADD COLUMN user_label TEXT NOT NULL DEFAULT 'unset'",
+        [],
+    );
     Ok(())
 }
 
@@ -1548,41 +1553,168 @@ pub fn list_chapters(conn: &Connection, episode_id: i64) -> AppResult<Vec<Chapte
     Ok(rows.filter_map(|r| r.ok()).collect())
 }
 
+pub fn update_chapter_title(conn: &Connection, chapter_id: i64, title: &str) -> AppResult<Chapter> {
+    let title = title.trim();
+    if title.is_empty() {
+        return Err(crate::error::AppError::msg("Titeln kan inte vara tom."));
+    }
+    if title.chars().count() > 120 {
+        return Err(crate::error::AppError::msg("Titeln är för lång."));
+    }
+    if title.chars().any(|c| c.is_control()) {
+        return Err(crate::error::AppError::msg(
+            "Titeln innehåller otillåtna tecken.",
+        ));
+    }
+    let changed = conn.execute(
+        "UPDATE chapter SET title = ?1, source = 'user' WHERE id = ?2",
+        params![title, chapter_id],
+    )?;
+    if changed == 0 {
+        return Err(crate::error::AppError::msg("Kapitlet hittades inte."));
+    }
+    conn.query_row(
+        "SELECT id, episode_id, start_ms, end_ms, title, source FROM chapter WHERE id = ?1",
+        params![chapter_id],
+        |row| {
+            Ok(Chapter {
+                id: row.get(0)?,
+                episode_id: row.get(1)?,
+                start_ms: row.get(2)?,
+                end_ms: row.get(3)?,
+                title: row.get(4)?,
+                source: row.get(5)?,
+            })
+        },
+    )
+    .map_err(|_| crate::error::AppError::msg("Kapitlet hittades inte."))
+}
+
 pub fn replace_ads(
     conn: &Connection,
     episode_id: i64,
     ads: &[crate::intel::AdDraft],
 ) -> AppResult<()> {
+    let preserved = list_ads(conn, episode_id)?
+        .into_iter()
+        .filter(|ad| ad.user_label != "unset" || ad.method == "user")
+        .collect::<Vec<_>>();
     conn.execute(
-        "DELETE FROM ad_segment WHERE episode_id = ?1 AND method != 'user'",
+        "DELETE FROM ad_segment WHERE episode_id = ?1 AND user_label = 'unset' AND method != 'user'",
         params![episode_id],
     )?;
     for ad in ads {
+        if ad.end_ms <= ad.start_ms {
+            continue;
+        }
+        if preserved
+            .iter()
+            .any(|old| spans_overlap(old.start_ms, old.end_ms, ad.start_ms, ad.end_ms))
+        {
+            continue;
+        }
         conn.execute(
-            "INSERT INTO ad_segment (episode_id, start_ms, end_ms, confidence, method, enabled)
-             VALUES (?1, ?2, ?3, ?4, ?5, 1)",
+            "INSERT INTO ad_segment (episode_id, start_ms, end_ms, confidence, method, enabled, user_label)
+             VALUES (?1, ?2, ?3, ?4, ?5, 1, 'unset')",
             params![episode_id, ad.start_ms, ad.end_ms, ad.confidence, ad.method],
         )?;
     }
     Ok(())
 }
 
+fn spans_overlap(a0: i64, a1: i64, b0: i64, b1: i64) -> bool {
+    a0 < b1 && b0 < a1
+}
+
 pub fn list_ads(conn: &Connection, episode_id: i64) -> AppResult<Vec<AdSegment>> {
     let mut stmt = conn.prepare(
-        "SELECT id, episode_id, start_ms, end_ms, confidence, method, enabled FROM ad_segment WHERE episode_id = ?1 ORDER BY start_ms",
+        "SELECT id, episode_id, start_ms, end_ms, confidence, method, enabled, user_label
+         FROM ad_segment WHERE episode_id = ?1 ORDER BY start_ms",
     )?;
-    let rows = stmt.query_map(params![episode_id], |row| {
-        Ok(AdSegment {
-            id: row.get(0)?,
-            episode_id: row.get(1)?,
-            start_ms: row.get(2)?,
-            end_ms: row.get(3)?,
-            confidence: row.get(4)?,
-            method: row.get(5)?,
-            enabled: row.get::<_, i64>(6)? != 0,
-        })
-    })?;
+    let rows = stmt.query_map(params![episode_id], map_ad_segment)?;
     Ok(rows.filter_map(|r| r.ok()).collect())
+}
+
+fn map_ad_segment(row: &rusqlite::Row<'_>) -> rusqlite::Result<AdSegment> {
+    Ok(AdSegment {
+        id: row.get(0)?,
+        episode_id: row.get(1)?,
+        start_ms: row.get(2)?,
+        end_ms: row.get(3)?,
+        confidence: row.get(4)?,
+        method: row.get(5)?,
+        enabled: row.get::<_, i64>(6)? != 0,
+        user_label: row.get(7)?,
+    })
+}
+
+/// `label` is `ad` («detta var reklam») or `not_ad` («inte reklam»).
+/// `ad_id` updates that row. Without it, the row under `position_ms` is
+/// updated, or a 30 s user mark is created.
+pub fn set_ad_feedback(
+    conn: &Connection,
+    episode_id: i64,
+    ad_id: Option<i64>,
+    position_ms: i64,
+    label: &str,
+    duration_ms: Option<i64>,
+) -> AppResult<AdSegment> {
+    if episode_id <= 0 {
+        return Err(crate::error::AppError::msg("Ogiltigt avsnitts-id."));
+    }
+    let (enabled, user_label) = match label {
+        "ad" => (1i64, "ad"),
+        "not_ad" => (0, "not_ad"),
+        _ => return Err(crate::error::AppError::msg("Okänd reklammarkering.")),
+    };
+    if let Some(id) = ad_id {
+        let changed = conn.execute(
+            "UPDATE ad_segment SET user_label = ?1, enabled = ?2 WHERE id = ?3 AND episode_id = ?4",
+            params![user_label, enabled, id, episode_id],
+        )?;
+        if changed == 0 {
+            return Err(crate::error::AppError::msg("Reklamblocket hittades inte."));
+        }
+        return ad_by_id(conn, id);
+    }
+    if position_ms < 0 {
+        return Err(crate::error::AppError::msg("Ogiltig tid."));
+    }
+    let existing = list_ads(conn, episode_id)?;
+    if let Some(hit) = existing
+        .iter()
+        .find(|ad| position_ms >= ad.start_ms && position_ms < ad.end_ms)
+    {
+        conn.execute(
+            "UPDATE ad_segment SET user_label = ?1, enabled = ?2 WHERE id = ?3",
+            params![user_label, enabled, hit.id],
+        )?;
+        return ad_by_id(conn, hit.id);
+    }
+    let mut end_ms = position_ms.saturating_add(30_000);
+    if let Some(duration) = duration_ms.filter(|ms| *ms > position_ms) {
+        end_ms = end_ms.min(duration);
+    }
+    if end_ms <= position_ms {
+        end_ms = position_ms.saturating_add(1_000);
+    }
+    conn.execute(
+        "INSERT INTO ad_segment (episode_id, start_ms, end_ms, confidence, method, enabled, user_label)
+         VALUES (?1, ?2, ?3, 1.0, 'user', ?4, ?5)",
+        params![episode_id, position_ms, end_ms, enabled, user_label],
+    )?;
+    let id = conn.last_insert_rowid();
+    ad_by_id(conn, id)
+}
+
+fn ad_by_id(conn: &Connection, id: i64) -> AppResult<AdSegment> {
+    conn.query_row(
+        "SELECT id, episode_id, start_ms, end_ms, confidence, method, enabled, user_label
+         FROM ad_segment WHERE id = ?1",
+        params![id],
+        map_ad_segment,
+    )
+    .map_err(|_| crate::error::AppError::msg("Reklamblocket hittades inte."))
 }
 
 pub fn add_bookmark(
@@ -3861,5 +3993,119 @@ mod tests {
                 .unwrap()
                 .inbox
         );
+    }
+
+    #[test]
+    fn chapter_title_edit_is_saved_and_kept() {
+        let conn = open_db();
+        let (_pid, eid) = add_show(&conn, "https://ch.example/feed.xml", "Kapitel");
+        replace_generated_chapters(
+            &conn,
+            eid,
+            &[crate::intel::ChapterDraft {
+                start_ms: 0,
+                end_ms: Some(1_000),
+                title: "Gammal".into(),
+                source: "generated".into(),
+            }],
+        )
+        .unwrap();
+        let id = list_chapters(&conn, eid).unwrap()[0].id;
+        let updated = update_chapter_title(&conn, id, "  Ny rubrik  ").unwrap();
+        assert_eq!(updated.title, "Ny rubrik");
+        assert_eq!(updated.source, "user");
+        replace_generated_chapters(
+            &conn,
+            eid,
+            &[crate::intel::ChapterDraft {
+                start_ms: 5_000,
+                end_ms: Some(8_000),
+                title: "Genererad igen".into(),
+                source: "generated".into(),
+            }],
+        )
+        .unwrap();
+        let chapters = list_chapters(&conn, eid).unwrap();
+        assert!(chapters
+            .iter()
+            .any(|c| c.title == "Ny rubrik" && c.source == "user"));
+        assert!(update_chapter_title(&conn, id, "   ").is_err());
+        assert!(update_chapter_title(&conn, id, "rad\nbryt").is_err());
+    }
+
+    #[test]
+    fn ad_feedback_flags_mark_ad_and_not_ad() {
+        let conn = open_db();
+        let (_pid, eid) = add_show(&conn, "https://ad.example/feed.xml", "Reklam");
+        replace_ads(
+            &conn,
+            eid,
+            &[
+                crate::intel::AdDraft {
+                    start_ms: 1_000,
+                    end_ms: 5_000,
+                    confidence: 0.8,
+                    method: "phrase".into(),
+                },
+                crate::intel::AdDraft {
+                    start_ms: 8_000,
+                    end_ms: 12_000,
+                    confidence: 0.5,
+                    method: "silence".into(),
+                },
+            ],
+        )
+        .unwrap();
+        let ads = list_ads(&conn, eid).unwrap();
+        assert_eq!(ads[0].user_label, "unset");
+        assert!(ads[0].enabled);
+        let marked = set_ad_feedback(&conn, eid, Some(ads[0].id), 0, "ad", None).unwrap();
+        assert_eq!(marked.user_label, "ad");
+        assert!(marked.enabled);
+        let rejected = set_ad_feedback(&conn, eid, Some(ads[1].id), 0, "not_ad", None).unwrap();
+        assert_eq!(rejected.user_label, "not_ad");
+        assert!(!rejected.enabled);
+        replace_ads(
+            &conn,
+            eid,
+            &[
+                crate::intel::AdDraft {
+                    start_ms: 1_000,
+                    end_ms: 5_000,
+                    confidence: 0.9,
+                    method: "phrase".into(),
+                },
+                crate::intel::AdDraft {
+                    start_ms: 8_000,
+                    end_ms: 12_000,
+                    confidence: 0.9,
+                    method: "silence".into(),
+                },
+                crate::intel::AdDraft {
+                    start_ms: 20_000,
+                    end_ms: 25_000,
+                    confidence: 0.7,
+                    method: "phrase".into(),
+                },
+            ],
+        )
+        .unwrap();
+        let ads = list_ads(&conn, eid).unwrap();
+        let kept = ads.iter().find(|a| a.start_ms == 1_000).unwrap();
+        assert_eq!(kept.user_label, "ad");
+        assert_eq!(ads.iter().filter(|a| a.start_ms == 1_000).count(), 1);
+        let not_ad = ads.iter().find(|a| a.start_ms == 8_000).unwrap();
+        assert_eq!(not_ad.user_label, "not_ad");
+        assert!(!not_ad.enabled);
+        assert!(ads
+            .iter()
+            .any(|a| a.start_ms == 20_000 && a.user_label == "unset" && a.enabled));
+        let created = set_ad_feedback(&conn, eid, None, 40_000, "ad", Some(120_000)).unwrap();
+        assert_eq!(created.method, "user");
+        assert_eq!(created.user_label, "ad");
+        assert!(created.enabled);
+        assert_eq!(created.start_ms, 40_000);
+        assert_eq!(created.end_ms, 70_000);
+        assert!(set_ad_feedback(&conn, eid, None, 0, "kanske", None).is_err());
     }
 }

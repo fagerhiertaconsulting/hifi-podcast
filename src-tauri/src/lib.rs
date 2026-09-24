@@ -1,3 +1,4 @@
+mod ad_cut;
 mod asr;
 mod auto_download;
 mod commands;
@@ -7,6 +8,7 @@ mod engine;
 mod error;
 mod feed_refresh;
 mod feeds;
+mod ffmpeg_bin;
 mod intel;
 mod jobs;
 mod media_mime;
@@ -139,7 +141,13 @@ pub fn run() {
             commands::list_segments,
             commands::search_transcripts,
             commands::list_chapters,
+            commands::update_chapter_title,
             commands::list_ads,
+            commands::set_ad_feedback,
+            commands::scan_silence_ads,
+            commands::cut_episode_ads,
+            commands::ffmpeg_status,
+            commands::download_ffmpeg,
             commands::add_bookmark,
             commands::list_bookmarks,
             commands::delete_bookmark,

@@ -63,7 +63,7 @@ Tauri lägger appdata under `%LOCALAPPDATA%\consulting.fagerhierta.hifi-podcast\
 - **Musik:** separat flik, import av mapp (FLAC/DSD), uppspelning i samma native-motor
 - **Online metadata:** av tills användaren sparar samtycke. Då bara `musicbrainz.org` och `coverartarchive.org` (https, port 443). Omslag max 2 MiB under `media/music/covers/`
 
-**Inte i koden ännu:** SACD-ISO-rippning, reklam-cut, moln-ASR, in-app UPnP-renderer, UPnP-träd för musik.
+**Inte i koden ännu:** SACD-ISO-rippning, moln-ASR, in-app UPnP-renderer.
 
 v1 (lokal intelligens) finns i appen: se [docs/v1-asr.md](docs/v1-asr.md).
 

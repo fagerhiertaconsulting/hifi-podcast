@@ -183,6 +183,26 @@ fn classify_show_dir(media_root: &Path, podcast_id: i64) -> AppResult<ShowDirKin
     Ok(ShowDirKind::Ready(show_canon))
 }
 
+/// The show directory for a new file. Symlinks and paths that leave the
+/// media root are refused, same as episode delete.
+pub fn ready_show_dir(media_root: &Path, podcast_id: i64) -> AppResult<PathBuf> {
+    match classify_show_dir(media_root, podcast_id)? {
+        ShowDirKind::Ready(show) => Ok(show),
+        ShowDirKind::Absent => Err(AppError::msg(
+            "Poddens mediamapp saknas. Ingen ny fil skrevs.",
+        )),
+        ShowDirKind::Symlink(_) => Err(AppError::msg(
+            "Poddens mediamapp är en symlänk. Ingen ny fil skrevs.",
+        )),
+        ShowDirKind::NotDirectory => Err(AppError::msg(
+            "Poddens mediamapp är inte en vanlig katalog. Ingen ny fil skrevs.",
+        )),
+        ShowDirKind::Escapes => Err(AppError::msg(
+            "Poddens mediamapp pekar utanför den egna katalogen. Ingen ny fil skrevs.",
+        )),
+    }
+}
+
 /// Delete files that belong to one show. The walk stays inside
 /// `media/podcasts/<podcast_id>/`. Symlinks are unlinked and never followed.
 /// Stored paths outside that directory are not accepted here at all.
@@ -323,6 +343,61 @@ fn name_is_safe(name: &str) -> bool {
         && !name.contains('/')
         && !name.contains('\\')
         && !name.contains('\0')
+}
+
+pub fn episode_original_in_show(show: &Path, episode_id: i64) -> AppResult<PathBuf> {
+    ensure_show_still_ready(show)?;
+    let mut found: Option<PathBuf> = None;
+    for entry in std::fs::read_dir(show)? {
+        let entry = entry?;
+        let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        if !name_is_safe(&name) || !episode_media_name(episode_id, &name) {
+            continue;
+        }
+        if name.to_ascii_lowercase().ends_with(".part") {
+            continue;
+        }
+        let path = show.join(&name);
+        if path.parent() != Some(show) {
+            continue;
+        }
+        let meta = std::fs::symlink_metadata(&path)?;
+        if meta.file_type().is_symlink() || !meta.is_file() {
+            continue;
+        }
+        if meta.len() > crate::net::MAX_MEDIA_BYTES {
+            return Err(AppError::msg(
+                "Ljudfilen är större än tillåtet (2 GB). Ingen ny fil skrevs.",
+            ));
+        }
+        let prefer = found
+            .as_ref()
+            .map(|cur| original_rank(&path) < original_rank(cur));
+        if found.is_none() || prefer.unwrap_or(false) {
+            found = Some(path);
+        }
+    }
+    found.ok_or_else(|| AppError::msg("Avsnittet har ingen vanlig ljudfil i sin mediamapp."))
+}
+
+fn original_rank(path: &Path) -> u8 {
+    match path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "mp3" => 0,
+        "m4a" | "m4b" => 1,
+        "mp4" | "aac" => 2,
+        "ogg" | "opus" => 3,
+        "flac" => 4,
+        "wav" => 5,
+        _ => 9,
+    }
 }
 
 fn episode_media_name(episode_id: i64, name: &str) -> bool {

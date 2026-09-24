@@ -5,6 +5,7 @@ import type {
   AsrStatus,
   Bookmark,
   Chapter,
+  CutAdsOutcome,
   Download,
   Episode,
   ImportOutcome,
@@ -18,6 +19,7 @@ import type {
   QueueItem,
   SubscribeOutcome,
   DeleteEpisodeFileOutcome,
+  FfmpegStatus,
   FinishedCleanupOutcome,
   FinishedCleanupSettings,
   UnsubscribeOutcome,
@@ -101,7 +103,27 @@ export const api = {
     invoke<void>("set_audio_playing", { playing }),
   listChapters: (episodeId: number) =>
     invoke<Chapter[]>("list_chapters", { episodeId }),
+  updateChapterTitle: (chapterId: number, title: string) =>
+    invoke<Chapter>("update_chapter_title", { chapterId, title }),
   listAds: (episodeId: number) => invoke<AdSegment[]>("list_ads", { episodeId }),
+  setAdFeedback: (
+    episodeId: number,
+    positionMs: number,
+    label: "ad" | "not_ad",
+    adId?: number | null,
+  ) =>
+    invoke<AdSegment[]>("set_ad_feedback", {
+      episodeId,
+      adId: adId ?? null,
+      positionMs,
+      label,
+    }),
+  scanSilenceAds: (episodeId: number) =>
+    invoke<AdSegment[]>("scan_silence_ads", { episodeId }),
+  cutEpisodeAds: (episodeId: number) =>
+    invoke<CutAdsOutcome>("cut_episode_ads", { episodeId }),
+  ffmpegStatus: () => invoke<FfmpegStatus>("ffmpeg_status"),
+  downloadFfmpeg: () => invoke<FfmpegStatus>("download_ffmpeg"),
   addBookmark: (episodeId: number, positionMs: number, note: string) =>
     invoke<Bookmark[]>("add_bookmark", { episodeId, positionMs, note }),
   listBookmarks: () => invoke<Bookmark[]>("list_bookmarks"),

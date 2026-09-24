@@ -211,6 +211,190 @@ const AD_PHRASES: &[&str] = &[
     "reklampaus",
 ];
 
+/// RMS under this is silence. Same ballpark as opt-in skip-silence, and it
+/// does not need a playback device.
+pub const SILENCE_RMS: f32 = 0.012;
+pub const SILENCE_GAP_MIN_MS: i64 = 500;
+const AD_BLOCK_MIN_MS: i64 = 12_000;
+const AD_BLOCK_MAX_MS: i64 = 90_000;
+const AD_NEAR_START_MS: i64 = 120_000;
+const AD_NEAR_END_MS: i64 = 90_000;
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RmsWindow {
+    pub start_ms: i64,
+    pub end_ms: i64,
+    pub rms: f32,
+}
+
+pub fn rms_of(samples: &[f32]) -> f32 {
+    if samples.is_empty() {
+        return 0.0;
+    }
+    let sum: f64 = samples.iter().map(|s| (*s as f64) * (*s as f64)).sum();
+    (sum / samples.len() as f64).sqrt() as f32
+}
+
+/// Window interleaved PCM into RMS blocks. No device and no file.
+pub fn rms_windows_from_pcm(
+    samples: &[f32],
+    sample_rate: u32,
+    channels: u16,
+    window_ms: i64,
+) -> Vec<RmsWindow> {
+    if sample_rate == 0 || channels == 0 || window_ms <= 0 || samples.is_empty() {
+        return Vec::new();
+    }
+    let ch = channels as usize;
+    let frames = ((sample_rate as i64 * window_ms) / 1000).max(1) as usize;
+    let window = frames.saturating_mul(ch);
+    if window == 0 {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let mut offset = 0usize;
+    let mut frame_at = 0i64;
+    while offset + window <= samples.len() {
+        let rms = rms_of(&samples[offset..offset + window]);
+        let start_ms = frame_at.saturating_mul(1000) / i64::from(sample_rate);
+        frame_at += frames as i64;
+        let end_ms = frame_at.saturating_mul(1000) / i64::from(sample_rate);
+        out.push(RmsWindow {
+            start_ms,
+            end_ms,
+            rms,
+        });
+        offset += window;
+    }
+    out
+}
+
+/// Merge windows below `threshold` into gaps of at least [`SILENCE_GAP_MIN_MS`].
+pub fn silence_gaps(windows: &[RmsWindow], threshold: f32) -> Vec<(i64, i64)> {
+    let mut gaps = Vec::new();
+    let mut open: Option<(i64, i64)> = None;
+    for w in windows {
+        if w.end_ms <= w.start_ms {
+            continue;
+        }
+        if w.rms < threshold {
+            open = Some(match open {
+                Some((start, _)) => (start, w.end_ms),
+                None => (w.start_ms, w.end_ms),
+            });
+        } else if let Some((start, end)) = open.take() {
+            if end - start >= SILENCE_GAP_MIN_MS {
+                gaps.push((start, end));
+            }
+        }
+    }
+    if let Some((start, end)) = open {
+        if end - start >= SILENCE_GAP_MIN_MS {
+            gaps.push((start, end));
+        }
+    }
+    gaps
+}
+
+/// Ad-sized blocks bounded by silence, near the start, the outro, or mid-roll.
+/// Typical sponsor reads are about 15, 30, or 60 seconds.
+pub fn detect_silence_ad_blocks(gaps: &[(i64, i64)], duration_ms: i64) -> Vec<AdDraft> {
+    if duration_ms <= 0 {
+        return Vec::new();
+    }
+    let gaps = normalized_gaps(gaps, duration_ms);
+    let mut regions: Vec<(i64, i64, bool)> = Vec::new();
+    let mut cursor = 0i64;
+    let mut gap_before = false;
+    for (gs, ge) in &gaps {
+        if *gs > cursor {
+            regions.push((cursor, *gs, true));
+        }
+        cursor = (*ge).max(cursor);
+        gap_before = true;
+    }
+    if cursor < duration_ms {
+        regions.push((cursor, duration_ms, gap_before));
+    }
+    let mut ads = Vec::new();
+    for (start, end, bounded) in regions {
+        let len = end - start;
+        if !bounded || len < AD_BLOCK_MIN_MS || len > AD_BLOCK_MAX_MS {
+            continue;
+        }
+        if !ad_position(start, end, duration_ms) {
+            continue;
+        }
+        let near_standard = [15_000i64, 30_000, 60_000]
+            .iter()
+            .any(|n| (len - n).abs() <= 3_000);
+        ads.push(AdDraft {
+            start_ms: start,
+            end_ms: end,
+            confidence: if near_standard { 0.7 } else { 0.5 },
+            method: "silence".into(),
+        });
+    }
+    ads
+}
+
+fn normalized_gaps(gaps: &[(i64, i64)], duration_ms: i64) -> Vec<(i64, i64)> {
+    let mut gaps: Vec<(i64, i64)> = gaps
+        .iter()
+        .map(|(a, b)| ((*a).max(0), (*b).min(duration_ms)))
+        .filter(|(a, b)| *b - *a >= SILENCE_GAP_MIN_MS)
+        .collect();
+    gaps.sort_by_key(|(a, b)| (*a, *b));
+    let mut merged: Vec<(i64, i64)> = Vec::new();
+    for (start, end) in gaps {
+        if let Some(last) = merged.last_mut() {
+            if start <= last.1 {
+                last.1 = last.1.max(end);
+                continue;
+            }
+        }
+        merged.push((start, end));
+    }
+    merged
+}
+
+fn ad_position(start: i64, end: i64, duration_ms: i64) -> bool {
+    if start < AD_NEAR_START_MS {
+        return true;
+    }
+    if start >= duration_ms.saturating_sub(AD_NEAR_END_MS) {
+        return true;
+    }
+    let center = start + (end - start) / 2;
+    let mid = duration_ms / 2;
+    (center - mid).abs() <= (duration_ms * 12) / 100
+}
+
+pub fn dedupe_ad_drafts(mut ads: Vec<AdDraft>) -> Vec<AdDraft> {
+    ads.sort_by(|a, b| a.start_ms.cmp(&b.start_ms).then(a.end_ms.cmp(&b.end_ms)));
+    let mut out: Vec<AdDraft> = Vec::new();
+    for ad in ads {
+        if ad.end_ms <= ad.start_ms {
+            continue;
+        }
+        if let Some(prev) = out.last_mut() {
+            let overlap = prev.end_ms.min(ad.end_ms) - prev.start_ms.max(ad.start_ms);
+            let shorter = (prev.end_ms - prev.start_ms).min(ad.end_ms - ad.start_ms);
+            if overlap > 0 && shorter > 0 && overlap * 2 >= shorter {
+                if ad.confidence > prev.confidence {
+                    prev.confidence = ad.confidence;
+                    prev.method = ad.method.clone();
+                }
+                prev.start_ms = prev.start_ms.min(ad.start_ms);
+                prev.end_ms = prev.end_ms.max(ad.end_ms);
+                continue;
+            }
+        }
+        out.push(ad);
+    }
+    out
+}
+
 pub fn detect_ads(segments: &[Segment]) -> Vec<AdDraft> {
     let mut ads = Vec::new();
     for (i, seg) in segments.iter().enumerate() {
@@ -291,6 +475,44 @@ mod tests {
             text: "Avsnittet är sponsrad av Acme".into(),
         }];
         assert!(!detect_ads(&sponsor).is_empty());
+    }
+
+    #[test]
+    fn silence_blocks_detected_without_a_device() {
+        let duration = 600_000;
+        let gaps = vec![(8_000, 8_800), (38_800, 39_600)];
+        let ads = detect_silence_ad_blocks(&gaps, duration);
+        assert_eq!(ads.len(), 1, "{ads:?}");
+        assert_eq!(ads[0].method, "silence");
+        assert_eq!(ads[0].start_ms, 8_800);
+        assert_eq!(ads[0].end_ms, 38_800);
+        assert!(ads[0].confidence >= 0.7);
+
+        let tiny = vec![(8_000, 8_200), (38_200, 38_400)];
+        assert!(detect_silence_ad_blocks(&tiny, duration).is_empty());
+
+        let off_position = vec![(180_000, 180_800), (210_800, 211_600)];
+        assert!(
+            detect_silence_ad_blocks(&off_position, duration).is_empty(),
+            "a pause away from start, outro and mid-roll is not an ad"
+        );
+        assert!(detect_silence_ad_blocks(&[], duration).is_empty());
+
+        let rate = 8_000u32;
+        let mut samples = Vec::new();
+        for n in 0..rate {
+            samples.push((n as f32 * 0.05).sin() * 0.4);
+        }
+        samples.extend(std::iter::repeat(0.0f32).take((rate as usize * 7) / 10));
+        for n in 0..rate {
+            samples.push((n as f32 * 0.05).sin() * 0.4);
+        }
+        let windows = rms_windows_from_pcm(&samples, rate, 1, 100);
+        let found = silence_gaps(&windows, SILENCE_RMS);
+        assert!(
+            found.iter().any(|(start, end)| end - start >= 500),
+            "{found:?}"
+        );
     }
 
     #[test]
