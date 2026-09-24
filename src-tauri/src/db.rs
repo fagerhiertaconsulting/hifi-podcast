@@ -1342,6 +1342,10 @@ fn music_album_key(title: &str, artist: &str) -> String {
     )
 }
 
+pub fn last_music_import_root(conn: &Connection) -> AppResult<Option<String>> {
+    get_setting(conn, "music_last_import_root")
+}
+
 pub fn upsert_music_folder(conn: &Connection, path: &str) -> AppResult<i64> {
     let ts = now_rfc3339();
     conn.execute(

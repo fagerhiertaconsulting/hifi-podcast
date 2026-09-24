@@ -131,6 +131,7 @@ export const api = {
   listMusicAlbums: () => invoke<MusicAlbum[]>("list_music_albums"),
   listMusicTracks: (albumId?: number | null) =>
     invoke<MusicTrack[]>("list_music_tracks", { albumId: albumId ?? null }),
+  lastMusicImportRoot: () => invoke<string | null>("last_music_import_root"),
   importMusicFolder: (path: string) =>
     invoke<MusicImportOutcome>("import_music_folder", { path }),
   musicTrackForPlayer: (trackId: number) =>

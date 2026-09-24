@@ -342,6 +342,7 @@ export default function App() {
           audio.removeAttribute("src");
           audio.load();
           try {
+            setEngineStatus(await qualityStripPending(filePath));
             const st = await api.engineOpen({
               path: filePath,
               speed: nextSpeed,
@@ -355,16 +356,7 @@ export default function App() {
             setDuration((st.duration_ms || 0) / 1000);
             setPosition(startSec);
             positionRef.current = startSec;
-            const apiLabel =
-              st.output_path === "native_dsd"
-                ? `native DSD ${st.dsd_rate} / ${st.device_name}`
-                : st.output_path === "dop"
-                  ? `DoP ${st.dsd_rate} (inte native DSD) / ${st.output_api}`
-                  : engineSettings?.output_api === "asio" ||
-                      !engineSettings?.output_api ||
-                      engineSettings.output_api === "auto"
-                    ? "ASIO/WASAPI"
-                    : engineSettings.output_api;
+            const apiLabel = nativeOutputLabel(st, engineSettings);
             const diag = st.dsd_diag ? ` [${st.dsd_diag}]` : "";
             statusLine = `Spelar native (${apiLabel}): ${next.episode.title}${diag}`;
             setEngineStatus(st);
@@ -448,6 +440,7 @@ export default function App() {
           audio.removeAttribute("src");
           audio.load();
           try {
+            setEngineStatus(await qualityStripPending(filePath));
             const st = await api.engineOpen({
               path: filePath,
               speed: 1,
@@ -461,16 +454,7 @@ export default function App() {
             setDuration((st.duration_ms || 0) / 1000);
             setPosition(startSec);
             positionRef.current = startSec;
-            const apiLabel =
-              st.output_path === "native_dsd"
-                ? `native DSD ${st.dsd_rate} / ${st.device_name}`
-                : st.output_path === "dop"
-                  ? `DoP ${st.dsd_rate} (inte native DSD) / ${st.output_api}`
-                  : engineSettings?.output_api === "asio" ||
-                      !engineSettings?.output_api ||
-                      engineSettings.output_api === "auto"
-                    ? "ASIO/WASAPI"
-                    : engineSettings.output_api;
+            const apiLabel = nativeOutputLabel(st, engineSettings);
             const diag = st.dsd_diag ? ` [${st.dsd_diag}]` : "";
             statusLine = `Musik native (${apiLabel}): ${next.track.title}${diag}`;
             setEngineStatus(st);
@@ -868,10 +852,12 @@ export default function App() {
             onSelectAlbum={setSelectedAlbumId}
             onPlay={(id) => void playMusicTrack(id)}
             onImport={async () => {
+              const lastRoot = await api.lastMusicImportRoot().catch(() => null);
               const path = await open({
                 directory: true,
                 multiple: false,
                 title: "Välj mapp med FLAC/DSD",
+                defaultPath: lastRoot || undefined,
               });
               if (!path || Array.isArray(path)) return;
               setBusy(true);
@@ -1196,9 +1182,14 @@ export default function App() {
             <option value="30">30 min</option>
             <option value="45">45 min</option>
             <option value="60">60 min</option>
-            <option value="episode">Slut på avsnitt</option>
+            <option value="episode">{musicPayload ? "Slut på spår" : "Slut på avsnitt"}</option>
           </select>
         </label>
+        {musicPayload ? (
+          <span className="player-note" title="Bokmärken är knutna till podcastavsnitt.">
+            Bokmärken gäller podcasts
+          </span>
+        ) : (
           <button
             disabled={!payload}
             onClick={() => {
@@ -1211,6 +1202,7 @@ export default function App() {
           >
             Bokmärke
           </button>
+        )}
         <QualityStrip status={engineStatus} webview={outputIsWebview} />
         <div className="status">
           {status}
@@ -1272,6 +1264,74 @@ async function probeFileQuality(path: string): Promise<EngineStatus | null> {
   }
 }
 
+async function qualityStripPending(path: string): Promise<EngineStatus> {
+  const probed = await probeFileQuality(path);
+  if (probed) {
+    return {
+      ...probed,
+      output_api: "",
+      output_path: "",
+      output_path_sv: "Öppnar utgång, väntar på enhet.",
+      output_quality_sv: "Förhandlar ASIO/WASAPI…",
+      output_rate: 0,
+      output_bits: 0,
+      output_sample: "",
+      quality_delta: [],
+      quality_delta_sv: "",
+    };
+  }
+  return {
+    loaded: true,
+    playing: false,
+    ended: false,
+    position_ms: 0,
+    duration_ms: 0,
+    sample_rate: 0,
+    channels: 0,
+    codec: "",
+    path,
+    exclusive: false,
+    output_api: "",
+    device_name: "",
+    output_rate: 0,
+    resampled: false,
+    speed: 1,
+    skip_silence: false,
+    underruns: 0,
+    error: null,
+    format: "pcm",
+    dsd_rate: "",
+    output_path: "",
+    output_path_sv: "Öppnar utgång, väntar på enhet.",
+    callback_reentries: 0,
+    dsd_diag: "",
+    file_bits: 0,
+    output_bits: 0,
+    output_sample: "",
+    file_quality_sv: "Läser fil…",
+    output_quality_sv: "Förhandlar ASIO/WASAPI…",
+    quality_delta: [],
+    quality_delta_sv: "",
+  };
+}
+
+function nativeOutputLabel(st: EngineStatus, settings: AudioEngineSettings | null): string {
+  if (st.output_path === "native_dsd") {
+    return `Native DSD ${st.dsd_rate} / ${st.device_name}`.trim();
+  }
+  if (st.output_path === "dop") {
+    return `DoP ${st.dsd_rate} (inte native DSD) / ${st.output_api}`;
+  }
+  if (
+    settings?.output_api === "asio" ||
+    !settings?.output_api ||
+    settings.output_api === "auto"
+  ) {
+    return "ASIO/WASAPI";
+  }
+  return settings.output_api;
+}
+
 function dsdRateLabel(hz: number): string {
   switch (hz) {
     case 2_822_400:
@@ -1312,17 +1372,24 @@ function fileQualityFromProbe(
 
 function QualityStrip(props: { status: EngineStatus | null; webview: boolean }) {
   const st = props.status;
-  if (!st?.loaded || !st.file_quality_sv) return null;
-  const changed = !props.webview && (st.quality_delta?.length ?? 0) > 0;
-  const output = props.webview ? "WebView2 (systemmixer)" : st.output_quality_sv;
+  if (!st) return null;
+  if (!st.file_quality_sv && !st.output_quality_sv) return null;
+  const pending =
+    !props.webview &&
+    (!st.output_path || st.output_quality_sv.startsWith("Förhandlar"));
+  const changed = !props.webview && !pending && (st.quality_delta?.length ?? 0) > 0;
+  const output = props.webview
+    ? "WebView2 (systemmixer)"
+    : st.output_quality_sv || "Förhandlar ASIO/WASAPI…";
+  const original = st.file_quality_sv || "Läser fil…";
   return (
     <div
-      className={`quality${changed ? " quality-changed" : ""}`}
+      className={`quality${changed ? " quality-changed" : ""}${pending ? " quality-pending" : ""}`}
       title={st.output_path_sv || undefined}
     >
       <span className="quality-pair">
         <span className="quality-k">Original</span>
-        <strong>{st.file_quality_sv}</strong>
+        <strong>{original}</strong>
       </span>
       <span className="quality-arrow" aria-hidden>
         →
@@ -1332,7 +1399,7 @@ function QualityStrip(props: { status: EngineStatus | null; webview: boolean }) 
         <strong>{output}</strong>
       </span>
       {changed ? <span className="quality-delta">{st.quality_delta_sv}</span> : null}
-      {!props.webview && st.device_name ? (
+      {!props.webview && !pending && st.device_name ? (
         <span className="quality-dev">{st.device_name}</span>
       ) : null}
     </div>
@@ -1574,6 +1641,25 @@ function formatDurationMs(ms: number | null) {
   return formatTime(ms / 1000);
 }
 
+function trackQualityHint(track: MusicTrack): string {
+  const fmt = (track.format || "").toLowerCase();
+  const dsd = fmt === "dsf" || fmt === "dff" || fmt === "dsd";
+  if (dsd) {
+    const label = dsdRateLabel(track.sample_rate ?? 0);
+    return label ? ` · ${label}` : "";
+  }
+  const rate = track.sample_rate
+    ? track.sample_rate % 1000 === 0
+      ? `${track.sample_rate / 1000} kHz`
+      : `${track.sample_rate} Hz`
+    : "";
+  const bits = track.bits_per_sample && track.bits_per_sample > 0 ? `${track.bits_per_sample}-bit` : "";
+  if (rate && bits) return ` · ${rate} / ${bits}`;
+  if (rate) return ` · ${rate}`;
+  if (bits) return ` · ${bits}`;
+  return "";
+}
+
 function MusicView(props: {
   albums: MusicAlbum[];
   tracks: MusicTrack[];
@@ -1655,8 +1741,7 @@ function MusicView(props: {
                       <span>
                         {track.artist}
                         {track.format ? ` · ${track.format.toUpperCase()}` : ""}
-                        {track.sample_rate ? ` · ${track.sample_rate} Hz` : ""}
-                        {track.bits_per_sample ? ` / ${track.bits_per_sample}-bit` : ""}
+                        {trackQualityHint(track)}
                         {track.duration_ms ? ` · ${formatDurationMs(track.duration_ms)}` : ""}
                       </span>
                     </div>

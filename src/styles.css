@@ -322,6 +322,17 @@ textarea {
   font-size: 0.78rem;
 }
 
+.quality-pending strong {
+  font-weight: 500;
+  color: var(--muted);
+}
+
+.player-note {
+  font-size: 0.78rem;
+  color: var(--muted);
+  max-width: 16ch;
+}
+
 .quality-dev {
   margin-left: auto;
   max-width: 28ch;

@@ -154,6 +154,7 @@ pub fn run() {
             commands::engine_status,
             commands::list_music_albums,
             commands::list_music_tracks,
+            commands::last_music_import_root,
             commands::import_music_folder,
             commands::music_track_for_player,
             commands::save_music_playback,

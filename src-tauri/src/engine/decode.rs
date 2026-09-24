@@ -3,6 +3,7 @@
 use super::formats::{classify_magic, FormatKind};
 use super::EngineError;
 use std::fs::File;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 use symphonia::core::audio::{AudioBufferRef, SampleBuffer};
 use symphonia::core::codecs::{CodecType, DecoderOptions, CODEC_TYPE_NULL};
@@ -38,7 +39,6 @@ impl Decoder {
         let mut header = [0u8; 16];
         {
             let mut f = File::open(path)?;
-            use std::io::Read;
             let _ = f.read(&mut header);
         }
         match classify_magic(&header, Some(path)) {
@@ -112,6 +112,8 @@ impl Decoder {
             .codec_params
             .bits_per_sample
             .or(track.codec_params.bits_per_coded_sample)
+            .filter(|b| *b > 0)
+            .or_else(|| container_bits_per_sample(path))
             .unwrap_or(0);
 
         Ok(Self {
@@ -288,6 +290,70 @@ fn codec_label(codec: CodecType) -> String {
     raw
 }
 
+/// Bit depth from the container when Symphonia omits `bits_per_sample`.
+/// Returns `None` rather than guessing (no misleading 16/24).
+pub fn container_bits_per_sample(path: &Path) -> Option<u32> {
+    wav_fmt_bits(path).or_else(|| flac_streaminfo_bits(path))
+}
+
+fn wav_fmt_bits(path: &Path) -> Option<u32> {
+    let mut file = File::open(path).ok()?;
+    let mut hdr = [0u8; 12];
+    file.read_exact(&mut hdr).ok()?;
+    if &hdr[0..4] != b"RIFF" || &hdr[8..12] != b"WAVE" {
+        return None;
+    }
+    loop {
+        let mut chunk = [0u8; 8];
+        if file.read_exact(&mut chunk).is_err() {
+            return None;
+        }
+        let id = &chunk[0..4];
+        let len = u32::from_le_bytes(chunk[4..8].try_into().ok()?) as u64;
+        if id == b"fmt " {
+            let mut body = vec![0u8; (len as usize).min(64)];
+            file.read_exact(&mut body).ok()?;
+            if body.len() < 16 {
+                return None;
+            }
+            let bits = u16::from_le_bytes(body[14..16].try_into().ok()?);
+            return if bits > 0 { Some(u32::from(bits)) } else { None };
+        }
+                file.seek(SeekFrom::Current(len as i64 + (len % 2) as i64))
+                    .ok()?;
+    }
+}
+
+fn flac_streaminfo_bits(path: &Path) -> Option<u32> {
+    let mut file = File::open(path).ok()?;
+    let mut magic = [0u8; 4];
+    file.read_exact(&mut magic).ok()?;
+    if &magic != b"fLaC" {
+        return None;
+    }
+    loop {
+        let mut header = [0u8; 4];
+        file.read_exact(&mut header).ok()?;
+        let last = header[0] & 0x80 != 0;
+        let block_type = header[0] & 0x7f;
+        let len = u32::from_be_bytes([0, header[1], header[2], header[3]]) as usize;
+        let mut body = vec![0u8; len];
+        file.read_exact(&mut body).ok()?;
+        if block_type == 0 && body.len() >= 18 {
+            let packed = u64::from_be_bytes(body[10..18].try_into().ok()?);
+            let bits = ((packed >> 36) & 0x1F) as u32 + 1;
+            return if (4..=32).contains(&bits) {
+                Some(bits)
+            } else {
+                None
+            };
+        }
+        if last {
+            return None;
+        }
+    }
+}
+
 /// Downmix/upmix to stereo without extra gain. Mono is doubled; >2 channels fold to L/R.
 pub fn to_stereo(interleaved: &[f32], channels: u16) -> Vec<f32> {
     match channels {
@@ -315,6 +381,15 @@ mod tests {
     use super::*;
     use crate::engine::test_wav::write_sine_wav;
     use std::f32::consts::PI;
+
+    #[test]
+    fn wav_container_bits_are_16() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tone.wav");
+        write_sine_wav(&path, 44100, 2, 440.0, 0.05, 0.2);
+        assert_eq!(container_bits_per_sample(&path), Some(16));
+        assert_eq!(flac_streaminfo_bits(&path), None);
+    }
 
     #[test]
     fn decodes_wav_sine_to_f32() {
