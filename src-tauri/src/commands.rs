@@ -328,6 +328,11 @@ pub fn get_playback_state(
 }
 
 #[tauri::command]
+pub fn resume_episode_id(state: State<AppState>) -> AppResult<Option<i64>> {
+    db::latest_incomplete_playback(&conn(&state))
+}
+
+#[tauri::command]
 pub fn list_queue(state: State<AppState>) -> AppResult<Vec<QueueItem>> {
     db::list_queue(&conn(&state))
 }

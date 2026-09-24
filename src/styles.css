@@ -501,3 +501,145 @@ button.danger {
   background: var(--bg);
   flex: none;
 }
+
+.drive-enter {
+  font-weight: 700;
+}
+
+.app-drive {
+  grid-template-columns: 1fr;
+  background: #000;
+  color: #fff;
+}
+
+.app-drive .player {
+  grid-column: 1;
+  height: 0;
+  overflow: hidden;
+  background: #000;
+  border: 0;
+  padding: 0;
+}
+
+.drive {
+  grid-column: 1;
+  grid-row: 1;
+  min-height: 0;
+  overflow: auto;
+  padding: 1.25rem 1.5rem 2rem;
+  background: #000;
+  color: #fff;
+  display: flex;
+  flex-direction: column;
+  gap: 1.25rem;
+}
+
+.drive-top {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 1rem;
+}
+
+.drive-kicker,
+.drive-now p,
+.drive-queue span {
+  margin: 0;
+  color: #fff;
+}
+
+.drive-exit {
+  min-height: 3rem;
+  padding: 0.6rem 1rem;
+  background: #000;
+  color: #fff;
+  border: 3px solid #fff;
+  font-weight: 700;
+}
+
+.drive-now h1 {
+  margin: 0;
+  font-size: 2rem;
+  line-height: 1.15;
+}
+
+.drive-time {
+  margin: 0.4rem 0 0;
+  font-size: 2.4rem;
+  font-variant-numeric: tabular-nums;
+  font-weight: 700;
+}
+
+.drive-time span {
+  color: #d0d0d0;
+  font-weight: 600;
+}
+
+.drive-transport {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+}
+
+.drive button {
+  min-height: 4.75rem;
+  min-width: 6.5rem;
+  padding: 0.8rem 1rem;
+  font-size: 1.55rem;
+  font-weight: 800;
+  background: #000;
+  color: #fff;
+  border: 3px solid #fff;
+  border-radius: 12px;
+}
+
+.drive button.drive-play,
+.drive button.drive-resume {
+  background: #fff;
+  color: #000;
+}
+
+.drive-play {
+  min-width: 9rem;
+}
+
+.drive-resume {
+  align-self: flex-start;
+}
+
+.drive-queue h2 {
+  margin: 0 0 0.6rem;
+  font-size: 1.4rem;
+}
+
+.drive-queue ol {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.drive-queue li {
+  display: flex;
+  justify-content: space-between;
+  gap: 1rem;
+  align-items: center;
+  padding: 0.85rem 0;
+  border-top: 2px solid #fff;
+}
+
+.drive-queue strong,
+.drive-queue span {
+  display: block;
+}
+
+.drive-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  align-items: center;
+}
+
+.drive-row button {
+  min-height: 3.4rem;
+  font-size: 1.15rem;
+}

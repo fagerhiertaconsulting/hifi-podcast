@@ -1211,6 +1211,21 @@ pub fn get_playback(conn: &Connection, episode_id: i64) -> AppResult<Option<Play
     Ok(row)
 }
 
+/// Senaste ofärdiga avsnittet, så bil-läge kan fortsätta där användaren var.
+pub fn latest_incomplete_playback(conn: &Connection) -> AppResult<Option<i64>> {
+    let id = conn
+        .query_row(
+            "SELECT episode_id FROM playback_state
+             WHERE completed = 0 AND last_played_at IS NOT NULL
+             ORDER BY last_played_at DESC
+             LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(id)
+}
+
 pub fn list_queue(conn: &Connection) -> AppResult<Vec<QueueItem>> {
     let mut stmt = conn.prepare(
         r#"
@@ -2367,6 +2382,89 @@ mod tests {
         assert_eq!(requeue_running_jobs(&conn).unwrap(), 1);
         assert_eq!(list_jobs(&conn, 5).unwrap()[0].state, "queued");
         assert!(!get_podcast(&conn, pid).unwrap().auto_transcribe);
+    }
+
+    #[test]
+    fn resume_picks_latest_incomplete_episode() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize(&conn).unwrap();
+        let pid = upsert_podcast(
+            &conn,
+            "https://example.com/resume.xml",
+            "Fortsätt",
+            None,
+            None,
+            None,
+            Some("sv"),
+        )
+        .unwrap();
+        let older = upsert_episode(
+            &conn,
+            pid,
+            "guid-older",
+            "Äldre",
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let newer = upsert_episode(
+            &conn,
+            pid,
+            "guid-newer",
+            "Nyare",
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let done = upsert_episode(
+            &conn,
+            pid,
+            "guid-done",
+            "Klar",
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        save_playback(
+            &conn,
+            &PlaybackState {
+                episode_id: older,
+                position_ms: 1000,
+                speed: 1.0,
+                completed: false,
+                last_played_at: Some("2026-01-01T00:00:00Z".into()),
+            },
+        )
+        .unwrap();
+        save_playback(
+            &conn,
+            &PlaybackState {
+                episode_id: newer,
+                position_ms: 2500,
+                speed: 1.0,
+                completed: false,
+                last_played_at: Some("2026-02-01T00:00:00Z".into()),
+            },
+        )
+        .unwrap();
+        save_playback(
+            &conn,
+            &PlaybackState {
+                episode_id: done,
+                position_ms: 9000,
+                speed: 1.0,
+                completed: true,
+                last_played_at: Some("2026-03-01T00:00:00Z".into()),
+            },
+        )
+        .unwrap();
+        assert_eq!(latest_incomplete_playback(&conn).unwrap(), Some(newer));
     }
 
     #[test]

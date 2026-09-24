@@ -74,6 +74,7 @@ export const api = {
     invoke<void>("save_playback_state", { playback }),
   getPlaybackState: (episodeId: number) =>
     invoke<PlaybackState | null>("get_playback_state", { episodeId }),
+  resumeEpisodeId: () => invoke<number | null>("resume_episode_id"),
   listQueue: () => invoke<QueueItem[]>("list_queue"),
   enqueueEpisode: (episodeId: number) =>
     invoke<QueueItem[]>("enqueue_episode", { episodeId }),

@@ -8,6 +8,14 @@ import {
   blobUrlForLocalFile,
   configureHiFiElement,
 } from "./audio/engine";
+import { DriveModeView } from "./DriveModeView";
+import {
+  DRIVE_LABELS,
+  driveNextIndex,
+  drivePreviousIndex,
+  driveSkipSeconds,
+  visibleChrome,
+} from "./driveMode";
 import {
   AsrSettings,
   InboxView,
@@ -62,8 +70,24 @@ export default function App() {
   const blobUrlRef = useRef<string | null>(null);
   const positionRef = useRef(0);
   const playingRef = useRef(false);
-
+  const musicPayloadRef = useRef<MusicPlayerPayload | null>(null);
+  const driveModeRef = useRef(false);
+  const sessionPlayingRef = useRef<boolean | null>(null);
+  const [driveMode, setDriveMode] = useState(() => {
+    try {
+      return localStorage.getItem("hifi-drive-mode") === "1";
+    } catch {
+      return false;
+    }
+  });
   const [view, setView] = useState<View>("library");
+  useEffect(() => {
+    try {
+      localStorage.setItem("hifi-drive-mode", driveMode ? "1" : "0");
+    } catch {
+      /* visningsflagga på den här datorn */
+    }
+  }, [driveMode]);
   const [filter, setFilter] = useState("");
   const [onlyDownloaded, setOnlyDownloaded] = useState(false);
   const [inbox, setInbox] = useState<InboxItem[]>([]);
@@ -577,6 +601,8 @@ export default function App() {
   queueRef.current = queue;
   const payloadRef = useRef(payload);
   payloadRef.current = payload;
+  musicPayloadRef.current = musicPayload;
+  driveModeRef.current = driveMode;
 
   useEffect(() => {
     void api.setAudioPlaying(playing).catch(() => undefined);
@@ -608,6 +634,16 @@ export default function App() {
       setPosition(pos);
       setDuration((st.duration_ms || 0) / 1000);
       setPlaying(st.playing);
+      if (sessionPlayingRef.current !== st.playing) {
+        sessionPlayingRef.current = st.playing;
+        const music = musicPayloadRef.current;
+        const episode = payloadRef.current;
+        if (music) {
+          void api.smtcNowPlaying(music.track.title, music.track.artist, st.playing);
+        } else if (episode) {
+          void api.smtcNowPlaying(episode.episode.title, episode.podcast.title, st.playing);
+        }
+      }
       if (st.loaded) {
         setEngineStatus(st);
       }
@@ -651,63 +687,106 @@ export default function App() {
     };
   }, [onEnded]);
 
+  const goNext = useCallback(() => {
+    const q = queueRef.current;
+    const currentId = payloadRef.current?.episode.id;
+    const idx = q.findIndex((item) => item.episode_id === currentId);
+    const next = driveNextIndex(idx, q.length);
+    if (next == null) return;
+    void playEpisodeRef.current(q[next].episode_id, false);
+  }, []);
+
+  const goPrevious = useCallback(() => {
+    const audio = audioRef.current;
+    const native = nativeRef.current;
+    const q = queueRef.current;
+    const currentId = payloadRef.current?.episode.id;
+    const idx = q.findIndex((item) => item.episode_id === currentId);
+    if (driveModeRef.current) {
+      const prev = drivePreviousIndex(idx);
+      if (prev != null) void playEpisodeRef.current(q[prev].episode_id, false);
+      return;
+    }
+    if (native && positionRef.current > 3) {
+      void api.engineSeek(0);
+      return;
+    }
+    if (audio && !native && audio.currentTime > 3) {
+      audio.currentTime = 0;
+      return;
+    }
+    if (idx > 0) {
+      void playEpisodeRef.current(q[idx - 1].episode_id, false);
+    } else if (native) {
+      void api.engineSeek(0);
+    } else if (audio) {
+      audio.currentTime = 0;
+    }
+  }, []);
+
+  const togglePlayback = useCallback(() => {
+    if (nativeRef.current) {
+      const next = !playingRef.current;
+      if (next) void api.enginePlay();
+      else void api.enginePause();
+      const music = musicPayloadRef.current;
+      const episode = payloadRef.current;
+      if (music) void api.smtcNowPlaying(music.track.title, music.track.artist, next);
+      else if (episode) void api.smtcNowPlaying(episode.episode.title, episode.podcast.title, next);
+      return;
+    }
+    const audio = audioRef.current;
+    if (!audio) return;
+    if (audio.paused) void audio.play();
+    else audio.pause();
+  }, []);
+
+  const resumeWhereLeft = useCallback(async () => {
+    if (payloadRef.current || musicPayloadRef.current) {
+      if (!playingRef.current) togglePlayback();
+      return;
+    }
+    try {
+      const episodeId = await api.resumeEpisodeId();
+      if (episodeId != null) {
+        await playEpisodeRef.current(episodeId, false);
+        return;
+      }
+    } catch (err) {
+      setStatus(String(err));
+      return;
+    }
+    const first = queueRef.current[0];
+    if (first) {
+      await playEpisodeRef.current(first.episode_id, false);
+      return;
+    }
+    setStatus(DRIVE_LABELS.nothingToResume);
+  }, [togglePlayback]);
+
   useEffect(() => {
     const un = listen<string>("smtc", (event) => {
       const audio = audioRef.current;
       const cmd = event.payload;
       const native = nativeRef.current;
-      if (cmd === "toggle") {
+      if (cmd === "toggle" || cmd === "play" || cmd === "pause") {
         if (native) {
-          if (playingRef.current) void api.enginePause();
-          else void api.enginePlay();
+          // Motorn har redan fått kommandot, så låsskärmen inte väntar på webview.
           return;
         }
         if (!audio) return;
-        if (audio.paused) void audio.play();
+        if (cmd === "pause") audio.pause();
+        else if (cmd === "play" || audio.paused) void audio.play();
         else audio.pause();
-      } else if (cmd === "play") {
-        if (native) void api.enginePlay();
-        else if (audio) void audio.play();
-      } else if (cmd === "pause") {
-        if (native) void api.enginePause();
-        else audio?.pause();
-      } else if (cmd === "next") {
-        const q = queueRef.current;
-        const currentId = payloadRef.current?.episode.id;
-        const idx = q.findIndex((item) => item.episode_id === currentId);
-        const nextItem = idx >= 0 ? q[idx + 1] : q[0];
-        if (nextItem && nextItem.episode_id !== currentId) {
-          void playEpisodeRef.current(nextItem.episode_id, false);
-        } else {
-          console.info("SMTC next: ingen nästa post i kön.");
-        }
-      } else if (cmd === "previous") {
-        if (native && positionRef.current > 3) {
-          void api.engineSeek(0);
-          return;
-        }
-        if (audio && !native && audio.currentTime > 3) {
-          audio.currentTime = 0;
-          return;
-        }
-        const q = queueRef.current;
-        const currentId = payloadRef.current?.episode.id;
-        const idx = q.findIndex((item) => item.episode_id === currentId);
-        if (idx > 0) {
-          void playEpisodeRef.current(q[idx - 1].episode_id, false);
-        } else if (native) {
-          void api.engineSeek(0);
-        } else if (audio) {
-          audio.currentTime = 0;
-        } else {
-          console.info("SMTC previous: ingen föregående post i kön.");
-        }
+        return;
       }
+      if (cmd === "next") goNext();
+      else if (cmd === "previous") goPrevious();
     });
     return () => {
       void un.then((fn) => fn());
     };
-  }, []);
+  }, [goNext, goPrevious]);
 
   const skipSeconds = (delta: number) => {
     if (nativeRef.current) {
@@ -720,8 +799,15 @@ export default function App() {
     skip(audioRef.current, delta);
   };
 
+  const chrome = visibleChrome(driveMode);
+  const nowTitle = musicPayload?.track.title ?? payload?.episode.title ?? "Inget spår";
+  const nowSubtitle = musicPayload
+    ? musicPayload.track.artist
+    : (payload?.podcast.title ?? "");
+
   return (
-    <div className="app">
+    <div className={chrome.drive ? "app app-drive" : "app"}>
+      {!chrome.drive && (
       <aside className="sidebar">
         <div className="brand">
           <span className="mark">HF</span>
@@ -730,33 +816,73 @@ export default function App() {
             <p>Lokal hi-fi-spelare</p>
           </div>
         </div>
+        <button type="button" className="drive-enter" onClick={() => setDriveMode(true)}>
+          {DRIVE_LABELS.enter}
+        </button>
         <nav>
+          {chrome.library ? (
           <button className={view === "library" ? "active" : ""} onClick={() => setView("library")}>
             Bibliotek
           </button>
+          ) : null}
+          {chrome.library && chrome.import ? (
           <button className={view === "music" ? "active" : ""} onClick={() => setView("music")}>
             Musik
           </button>
+          ) : null}
           <button className={view === "inbox" ? "active" : ""} onClick={() => setView("inbox")}>
             Inkorg ({inbox.length})
           </button>
           <button className={view === "queue" ? "active" : ""} onClick={() => setView("queue")}>
             Kö ({queue.length})
           </button>
+          {chrome.statistics ? (
           <button className={view === "stats" ? "active" : ""} onClick={() => setView("stats")}>
             Statistik
           </button>
+          ) : null}
+          {chrome.settings ? (
           <button className={view === "settings" ? "active" : ""} onClick={() => setView("settings")}>
             Inställningar
           </button>
+          ) : null}
         </nav>
         <div className="sidebar-note">
           Inga konton. Allt stannar på den här datorn.
         </div>
       </aside>
+      )}
 
+      {chrome.drive ? (
+        <DriveModeView
+          playing={playing}
+          title={nowTitle}
+          subtitle={nowSubtitle}
+          positionLabel={formatTime(position)}
+          durationLabel={formatTime(duration)}
+          queue={queue}
+          onPlayPause={togglePlayback}
+          onSkip={(seconds) => {
+            const allowed = driveSkipSeconds(seconds);
+            if (allowed == null) return;
+            skipSeconds(allowed);
+          }}
+          onPrevious={goPrevious}
+          onNext={goNext}
+          onResume={() => {
+            void resumeWhereLeft();
+          }}
+          onPlayQueue={(id) => {
+            void playEpisode(id, false);
+          }}
+          onRemoveQueue={(id) => {
+            void api.dequeueItem(id).then(setQueue).catch((err) => setStatus(String(err)));
+          }}
+          onExit={() => setDriveMode(false)}
+        />
+      ) : (
       <main className="main">
-        {view === "library" && (
+        {chrome.library && chrome.import && view === "library" && (
           <Library
             feedUrl={feedUrl}
             setFeedUrl={setFeedUrl}
@@ -972,7 +1098,7 @@ export default function App() {
           />
         )}
 
-        {view === "music" && (
+        {chrome.library && chrome.import && view === "music" && (
           <MusicView
             albums={musicAlbums}
             tracks={musicTracks}
@@ -1042,7 +1168,7 @@ export default function App() {
           />
         )}
 
-        {view === "stats" && (
+        {chrome.statistics && view === "stats" && (
           <StatsView
             stats={stats}
             bookmarks={bookmarks}
@@ -1057,7 +1183,7 @@ export default function App() {
           />
         )}
 
-        {view === "settings" && (
+        {chrome.settings && view === "settings" && (
           <SettingsView
             paths={paths}
             asr={asr}
@@ -1155,7 +1281,9 @@ export default function App() {
           />
         )}
       </main>
+      )}
 
+      {chrome.whisper && (
       <TranscriptPane
         episodeId={payload?.episode.id ?? null}
         positionMs={Math.floor(position * 1000)}
@@ -1172,6 +1300,7 @@ export default function App() {
           }
         }}
       />
+      )}
 
       <footer className="player">
         <audio
@@ -1219,6 +1348,8 @@ export default function App() {
           onEnded={() => void onEnded()}
           onLoadedMetadata={(e) => setDuration(e.currentTarget.duration || 0)}
         />
+        {!chrome.drive && (
+        <>
         <div className="now">
           <strong>
             {musicPayload?.track.title ?? payload?.episode.title ?? "Inget spår"}
@@ -1239,17 +1370,7 @@ export default function App() {
           <button
             className="play"
             disabled={!payload && !musicPayload}
-            onClick={() => {
-              if (nativeRef.current) {
-                if (playing) void api.enginePause();
-                else void api.enginePlay();
-                return;
-              }
-              const audio = audioRef.current;
-              if (!audio) return;
-              if (audio.paused) void audio.play();
-              else audio.pause();
-            }}
+            onClick={togglePlayback}
           >
             {playing ? "Paus" : "Spela"}
           </button>
@@ -1260,6 +1381,7 @@ export default function App() {
             +30
           </button>
         </div>
+        {chrome.seekSlider && (
         <div className="seek">
           <span>{formatTime(position)}</span>
           <input
@@ -1278,6 +1400,7 @@ export default function App() {
           />
           <span>{formatTime(duration)}</span>
         </div>
+        )}
         <label className="speed">
           Hastighet
           <select
@@ -1353,6 +1476,8 @@ export default function App() {
               : ""}
           {engineQa ? ` · ${engineQa}` : ""}
         </div>
+        </>
+        )}
       </footer>
     </div>
   );
