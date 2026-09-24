@@ -249,6 +249,14 @@ pub struct SubscribeOutcome {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UnsubscribeOutcome {
+    pub podcast_id: i64,
+    pub title: String,
+    pub files_removed: i64,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ImportOutcome {
     pub podcasts: Vec<Podcast>,
     pub warnings: Vec<String>,

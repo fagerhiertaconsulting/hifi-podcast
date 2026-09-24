@@ -85,6 +85,252 @@ pub fn episode_file(media_root: &Path, podcast_id: i64, episode_id: i64, ext: &s
         .join(format!("{episode_id}.{ext}"))
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShowMediaDelete {
+    pub removed_files: i64,
+    pub warnings: Vec<String>,
+}
+
+/// Delete files that belong to one show. The walk stays inside
+/// `media/podcasts/<podcast_id>/`. Symlinks are unlinked and never followed.
+/// Stored paths outside that directory are not accepted here at all.
+pub fn delete_show_media(media_root: &Path, podcast_id: i64) -> AppResult<ShowMediaDelete> {
+    if podcast_id <= 0 {
+        return Err(AppError::msg("Ogiltigt podcast-id."));
+    }
+    let id_name = podcast_id.to_string();
+    if !id_name.chars().all(|c| c.is_ascii_digit()) {
+        return Err(AppError::msg("Ogiltigt podcast-id."));
+    }
+
+    let root_meta = match std::fs::symlink_metadata(media_root) {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(ShowMediaDelete {
+                removed_files: 0,
+                warnings: Vec::new(),
+            });
+        }
+        Err(err) => return Err(err.into()),
+    };
+    if root_meta.file_type().is_symlink() || !root_meta.is_dir() {
+        return Err(AppError::msg(
+            "Mediaroten är inte en vanlig katalog. Inga filer raderades.",
+        ));
+    }
+    let root = std::fs::canonicalize(media_root)?;
+    let podcasts = podcasts_dir(&root);
+    let podcasts_meta = match std::fs::symlink_metadata(&podcasts) {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(ShowMediaDelete {
+                removed_files: 0,
+                warnings: Vec::new(),
+            });
+        }
+        Err(err) => return Err(err.into()),
+    };
+    if podcasts_meta.file_type().is_symlink() || !podcasts_meta.is_dir() {
+        return Err(AppError::msg(
+            "Mediamappen för podcasts är inte en vanlig katalog. Inga filer raderades.",
+        ));
+    }
+    let podcasts_canon = std::fs::canonicalize(&podcasts)?;
+    if podcasts_canon != root.join("podcasts") || !podcasts_canon.starts_with(&root) {
+        return Err(AppError::msg(
+            "Mediamappen för podcasts ligger utanför mediaroten. Inga filer raderades.",
+        ));
+    }
+
+    let show = podcasts_canon.join(&id_name);
+    if show.parent() != Some(podcasts_canon.as_path())
+        || show.file_name().map(|n| n == id_name.as_str()) != Some(true)
+    {
+        return Err(AppError::msg(
+            "Poddens mediamapp ligger utanför tillåten katalog. Inga filer raderades.",
+        ));
+    }
+
+    let show_meta = match std::fs::symlink_metadata(&show) {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(ShowMediaDelete {
+                removed_files: 0,
+                warnings: Vec::new(),
+            });
+        }
+        Err(err) => return Err(err.into()),
+    };
+
+    if show_meta.file_type().is_symlink() {
+        unlink_symlink(&show)?;
+        return Ok(ShowMediaDelete {
+            removed_files: 0,
+            warnings: vec!["Poddens mediamapp var en symlänk. Målet lämnades orört.".into()],
+        });
+    }
+    if !show_meta.is_dir() {
+        return Ok(ShowMediaDelete {
+            removed_files: 0,
+            warnings: vec![
+                "Poddens mediamapp är inte en vanlig katalog och lämnades orörd.".into(),
+            ],
+        });
+    }
+
+    let show_canon = std::fs::canonicalize(&show)?;
+    if show_canon != show {
+        return Ok(ShowMediaDelete {
+            removed_files: 0,
+            warnings: vec![
+                "Poddens mediamapp pekar utanför den egna katalogen och lämnades orörd.".into(),
+            ],
+        });
+    }
+
+    let removed = purge_show_tree(&show_canon, &show_canon, 0)?;
+    if let Ok(meta) = std::fs::symlink_metadata(&show_canon) {
+        if meta.is_dir() && !meta.file_type().is_symlink() {
+            if std::fs::canonicalize(&show_canon).ok().as_deref() == Some(show_canon.as_path()) {
+                match std::fs::remove_dir(&show_canon) {
+                    Ok(()) => {}
+                    Err(err) if err.kind() == std::io::ErrorKind::DirectoryNotEmpty => {}
+                    Err(err) => return Err(err.into()),
+                }
+            }
+        }
+    }
+    Ok(ShowMediaDelete {
+        removed_files: removed,
+        warnings: Vec::new(),
+    })
+}
+
+fn unlink_symlink(path: &Path) -> AppResult<()> {
+    let meta = std::fs::symlink_metadata(path)?;
+    if !meta.file_type().is_symlink() {
+        return Err(AppError::msg(
+            "Vägrade radera en sökväg som inte längre är en symlänk.",
+        ));
+    }
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(file_err) => {
+            let again = std::fs::symlink_metadata(path)?;
+            if !again.file_type().is_symlink() {
+                return Err(AppError::msg(
+                    "Vägrade radera en sökväg som inte längre är en symlänk.",
+                ));
+            }
+            match std::fs::remove_dir(path) {
+                Ok(()) => Ok(()),
+                Err(_) => Err(file_err.into()),
+            }
+        }
+    }
+}
+
+fn entry_name_is_safe(path: &Path) -> bool {
+    let Some(name) = path.file_name() else {
+        return false;
+    };
+    let name = name.to_string_lossy();
+    !name.is_empty()
+        && name != "."
+        && name != ".."
+        && !name.contains('/')
+        && !name.contains('\\')
+        && !name.contains('\0')
+}
+
+fn parent_is_inside(path: &Path, show_root: &Path) -> AppResult<bool> {
+    if !entry_name_is_safe(path) {
+        return Ok(false);
+    }
+    let Some(parent) = path.parent() else {
+        return Ok(false);
+    };
+    let parent_canon = std::fs::canonicalize(parent)?;
+    Ok(parent_canon == show_root || parent_canon.starts_with(show_root))
+}
+
+fn purge_show_tree(dir: &Path, show_root: &Path, depth: u32) -> AppResult<i64> {
+    if depth > 24 {
+        return Err(AppError::msg("Katalogstrukturen är för djup."));
+    }
+    let dir_meta = std::fs::symlink_metadata(dir)?;
+    if dir_meta.file_type().is_symlink() || !dir_meta.is_dir() {
+        return Err(AppError::msg("Kan inte radera utanför poddens mediamapp."));
+    }
+    let dir_canon = std::fs::canonicalize(dir)?;
+    if dir_canon != show_root && !dir_canon.starts_with(show_root) {
+        return Err(AppError::msg("Kan inte radera utanför poddens mediamapp."));
+    }
+
+    let mut removed = 0i64;
+    for entry in std::fs::read_dir(&dir_canon)? {
+        let entry = entry?;
+        let path = entry.path();
+        if !entry_name_is_safe(&path) || !parent_is_inside(&path, show_root)? {
+            continue;
+        }
+        let meta = std::fs::symlink_metadata(&path)?;
+        if meta.file_type().is_symlink() {
+            unlink_symlink(&path)?;
+            removed += 1;
+            continue;
+        }
+        if meta.is_dir() {
+            let child = std::fs::canonicalize(&path)?;
+            if !child.starts_with(show_root) || child == show_root {
+                continue;
+            }
+            let again = std::fs::symlink_metadata(&path)?;
+            if again.file_type().is_symlink() {
+                unlink_symlink(&path)?;
+                removed += 1;
+                continue;
+            }
+            if !again.is_dir() {
+                continue;
+            }
+            removed += purge_show_tree(&child, show_root, depth + 1)?;
+            if let Ok(after) = std::fs::symlink_metadata(&path) {
+                if after.is_dir() && !after.file_type().is_symlink() {
+                    if std::fs::canonicalize(&path)
+                        .ok()
+                        .is_some_and(|canon| canon.starts_with(show_root) && canon != show_root)
+                    {
+                        let _ = std::fs::remove_dir(&path);
+                    }
+                }
+            }
+            continue;
+        }
+        if meta.is_file() {
+            let canon = match std::fs::canonicalize(&path) {
+                Ok(canon) => canon,
+                Err(_) => continue,
+            };
+            if !canon.starts_with(show_root) || canon == show_root {
+                continue;
+            }
+            let again = std::fs::symlink_metadata(&path)?;
+            if again.file_type().is_symlink() {
+                unlink_symlink(&path)?;
+                removed += 1;
+                continue;
+            }
+            if !again.is_file() {
+                continue;
+            }
+            std::fs::remove_file(&path)?;
+            removed += 1;
+        }
+    }
+    Ok(removed)
+}
+
 /// Creates `media/podcasts` and `media/music`, then moves legacy
 /// `media/<podcast_id>/` trees into `media/podcasts/<podcast_id>/`.
 pub fn ensure_media_layout(media_root: &Path) -> AppResult<Vec<(PathBuf, PathBuf)>> {

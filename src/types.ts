@@ -332,6 +332,13 @@ export type SubscribeOutcome = {
   warnings: string[];
 };
 
+export type UnsubscribeOutcome = {
+  podcast_id: number;
+  title: string;
+  files_removed: number;
+  warnings: string[];
+};
+
 export type ImportOutcome = {
   podcasts: Podcast[];
   warnings: string[];

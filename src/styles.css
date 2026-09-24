@@ -185,11 +185,38 @@ textarea {
   flex-direction: column;
 }
 
+.podcast-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 1rem;
+}
+
 .podcast-head h1,
 .settings h1,
 .queue h1,
 .toolbar-title {
   margin: 0 0 0.35rem;
+}
+
+.unsubscribe-panel {
+  max-width: 28rem;
+  background: var(--bg-2);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 0.75rem;
+}
+
+.unsubscribe-panel p {
+  margin: 0 0 0.6rem;
+  color: var(--muted);
+  font-size: 0.9rem;
+  line-height: 1.4;
+}
+
+button.danger {
+  border-color: var(--danger);
+  color: var(--danger);
 }
 
 .toolbar-title {

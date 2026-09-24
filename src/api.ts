@@ -17,6 +17,7 @@ import type {
   PodcastSettings,
   QueueItem,
   SubscribeOutcome,
+  UnsubscribeOutcome,
   Transcript,
   TranscriptSegment,
   UpnpSettings,
@@ -45,6 +46,8 @@ export const api = {
   addFeed: (url: string) => invoke<SubscribeOutcome>("add_feed", { url }),
   refreshFeed: (podcastId: number) =>
     invoke<SubscribeOutcome>("refresh_feed", { podcastId }),
+  unsubscribePodcast: (podcastId: number, deleteFiles: boolean) =>
+    invoke<UnsubscribeOutcome>("unsubscribe_podcast", { podcastId, deleteFiles }),
   importOpml: (xml: string) => invoke<ImportOutcome>("import_opml", { xml }),
   importOpmlFile: (path: string) =>
     invoke<ImportOutcome>("import_opml_file", { path }),
