@@ -37,6 +37,7 @@ pub fn router(state: HttpState) -> Router {
             "/media/episode/{id}",
             get(serve_episode).head(serve_episode),
         )
+        .route("/media/track/{id}", get(serve_track).head(serve_track))
         .with_state(state)
 }
 
@@ -54,7 +55,7 @@ pub async fn serve(
 
 async fn status_page(State(state): State<HttpState>) -> impl IntoResponse {
     let body = format!(
-        "<html><body><h1>HIFI podcast UPnP</h1><p>Device: <a href=\"/upnp/device.xml\">device.xml</a></p><p>{}</p></body></html>",
+        "<html><body><h1>HIFI podcast UPnP</h1><p>Enhet: <a href=\"/upnp/device.xml\">device.xml</a></p><p>Poddar och indexerad musik. Originalfiler, ingen omkodning.</p><p>{}</p></body></html>",
         cds::xml_escape(&state.public_base)
     );
     ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], body)
@@ -178,7 +179,7 @@ async fn cm_control(req: Request) -> Response {
         Some("GetProtocolInfo") => xml_response(cds::soap_ok(
             "GetProtocolInfo",
             service,
-            "<Source>http-get:*:audio/mpeg:*,http-get:*:audio/mp4:*,http-get:*:audio/flac:*,http-get:*:audio/ogg:*,http-get:*:audio/wav:*,http-get:*:audio/aiff:*</Source><Sink></Sink>",
+            "<Source>http-get:*:audio/mpeg:*,http-get:*:audio/mp4:*,http-get:*:audio/flac:*,http-get:*:audio/ogg:*,http-get:*:audio/wav:*,http-get:*:audio/aiff:*,http-get:*:audio/x-dsd:*</Source><Sink></Sink>",
         )),
         Some("GetCurrentConnectionIDs") => xml_response(cds::soap_ok(
             "GetCurrentConnectionIDs",
@@ -271,7 +272,172 @@ async fn serve_episode(
     };
     let file_len = meta.len();
     let mime = media_mime::for_serving(episode.mime.as_deref(), &path);
+    let file = match tokio::fs::File::open(&path).await {
+        Ok(f) => f,
+        Err(_) => return StatusCode::NOT_FOUND.into_response(),
+    };
+    respond_with_file(file, file_len, &mime, &headers, &method).await
+}
 
+#[derive(Debug, PartialEq, Eq)]
+pub enum MusicHttpDeny {
+    NotFound,
+    Forbidden,
+}
+
+/// Opens the file indexed for `track_id` after the same checks as local playback.
+/// `request_path` is never used as the file to open. A supplied path is accepted
+/// only when it is that indexed file; any other path is rejected.
+pub fn authorize_indexed_music_file(
+    conn: &Connection,
+    media_root: &Path,
+    track_id: i64,
+    request_path: Option<&Path>,
+) -> Result<PathBuf, MusicHttpDeny> {
+    let track = db::get_music_track(conn, track_id).map_err(|_| MusicHttpDeny::NotFound)?;
+    let indexed =
+        crate::music::require_playable_track(conn, media_root, &track).map_err(|err| {
+            if err.to_string().contains("saknar lokal fil") {
+                MusicHttpDeny::NotFound
+            } else {
+                MusicHttpDeny::Forbidden
+            }
+        })?;
+    if let Some(requested) = request_path {
+        if !crate::music::request_path_is_indexed_file(requested, &indexed) {
+            return Err(MusicHttpDeny::Forbidden);
+        }
+    }
+    Ok(indexed)
+}
+
+/// The URL may name a track id. It may not name a file.
+pub fn foreign_music_request(path: &str, query: Option<&str>, track_id: i64) -> bool {
+    if path != format!("/media/track/{track_id}") {
+        return true;
+    }
+    query.is_some_and(query_names_a_file)
+}
+
+fn query_names_a_file(query: &str) -> bool {
+    decode_percent(query)
+        .to_ascii_lowercase()
+        .split('&')
+        .any(|pair| {
+            let key = pair.split('=').next().unwrap_or("").trim();
+            matches!(
+                key,
+                "path" | "file" | "url" | "src" | "filename" | "filepath"
+            )
+        })
+}
+
+fn decode_percent(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let Ok(hex) = std::str::from_utf8(&bytes[i + 1..i + 3]) {
+                if let Ok(value) = u8::from_str_radix(hex, 16) {
+                    out.push(value);
+                    i += 3;
+                    continue;
+                }
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+async fn serve_track(
+    State(state): State<HttpState>,
+    AxPath(id): AxPath<i64>,
+    req: Request,
+) -> Response {
+    let method = req.method().clone();
+    if method != Method::GET && method != Method::HEAD {
+        return StatusCode::METHOD_NOT_ALLOWED.into_response();
+    }
+    if foreign_music_request(req.uri().path(), req.uri().query(), id) {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    let headers = req.headers().clone();
+    let path = {
+        let conn = match state.db.lock() {
+            Ok(c) => c,
+            Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        };
+        match authorize_indexed_music_file(&conn, &state.media_root, id, None) {
+            Ok(path) => path,
+            Err(MusicHttpDeny::NotFound) => return StatusCode::NOT_FOUND.into_response(),
+            Err(MusicHttpDeny::Forbidden) => return StatusCode::FORBIDDEN.into_response(),
+        }
+    };
+    let mime = media_mime::for_serving(None, &path);
+    let file = match open_indexed_music_file(&path) {
+        Ok(file) => file,
+        Err(status) => return status.into_response(),
+    };
+    let file_len = match file.metadata().await {
+        Ok(meta) if meta.len() <= crate::net::MAX_MEDIA_BYTES => meta.len(),
+        Ok(_) => return StatusCode::FORBIDDEN.into_response(),
+        Err(_) => return StatusCode::NOT_FOUND.into_response(),
+    };
+    respond_with_file(file, file_len, &mime, &headers, &method).await
+}
+
+fn open_indexed_music_file(path: &Path) -> Result<tokio::fs::File, StatusCode> {
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(_) => return Err(StatusCode::NOT_FOUND),
+    };
+    if crate::music::metadata_is_link(&meta) {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    if !meta.is_file() || meta.len() > crate::net::MAX_MEDIA_BYTES {
+        return Err(if meta.is_file() {
+            StatusCode::FORBIDDEN
+        } else {
+            StatusCode::NOT_FOUND
+        });
+    }
+    let std_file = open_nofollow(path)?;
+    Ok(tokio::fs::File::from_std(std_file))
+}
+
+fn open_nofollow(path: &Path) -> Result<std::fs::File, StatusCode> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        const O_NOFOLLOW: i32 = 0x20000;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(O_NOFOLLOW)
+            .open(path)
+            .map_err(|err| {
+                if err.raw_os_error() == Some(40) {
+                    StatusCode::FORBIDDEN
+                } else {
+                    StatusCode::NOT_FOUND
+                }
+            })
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        std::fs::File::open(path).map_err(|_| StatusCode::NOT_FOUND)
+    }
+}
+
+async fn respond_with_file(
+    mut file: tokio::fs::File,
+    file_len: u64,
+    mime: &str,
+    headers: &HeaderMap,
+    method: &Method,
+) -> Response {
     let range_header = headers
         .get(header::RANGE)
         .and_then(|v| v.to_str().ok())
@@ -313,20 +479,14 @@ async fn serve_episode(
         );
     }
 
-    if method == Method::HEAD {
+    if *method == Method::HEAD {
         return builder
             .body(Body::empty())
             .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
     }
 
-    let mut file = match tokio::fs::File::open(&path).await {
-        Ok(f) => f,
-        Err(_) => return StatusCode::NOT_FOUND.into_response(),
-    };
-    if start > 0 {
-        if file.seek(SeekFrom::Start(start)).await.is_err() {
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-        }
+    if start > 0 && file.seek(SeekFrom::Start(start)).await.is_err() {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
     let stream = ReaderStream::new(file.take(content_len));
     builder
@@ -356,7 +516,7 @@ pub fn device_xml(uuid: &str, public_base: &str) -> String {
     <manufacturerURL>https://github.com/fagerhiertaconsulting/hifi-podcast</manufacturerURL>
     <modelName>HIFI podcast</modelName>
     <modelNumber>0.1</modelNumber>
-    <modelDescription>UPnP AV Media Server for downloaded podcasts</modelDescription>
+    <modelDescription>UPnP AV Media Server for podcasts and the local music library</modelDescription>
     <UDN>uuid:{uuid}</UDN>
     <dlna:X_DLNADOC>DMS-1.50</dlna:X_DLNADOC>
     <serviceList>
@@ -464,6 +624,8 @@ const CM_SCPD: &str = r#"<?xml version="1.0" encoding="utf-8"?>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rusqlite::Connection;
+    use std::path::Path;
 
     #[test]
     fn parses_open_and_closed_ranges() {
@@ -576,5 +738,251 @@ mod tests {
         let bytes = ranged.bytes().await.unwrap();
         assert_eq!(&bytes[..], b"0123");
         let _ = tx.send(true);
+    }
+
+    #[test]
+    fn rejects_request_path_that_is_not_the_indexed_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let media = dir.path().join("media");
+        crate::download::ensure_media_layout(&media).unwrap();
+        let folder = dir.path().join("library");
+        std::fs::create_dir_all(&folder).unwrap();
+        let indexed = folder.join("tune.wav");
+        let other = folder.join("other.wav");
+        crate::engine::test_wav::write_sine_wav(&indexed, 44100, 1, 440.0, 0.05, 0.2);
+        crate::engine::test_wav::write_sine_wav(&other, 44100, 1, 880.0, 0.05, 0.2);
+        let conn = Connection::open_in_memory().unwrap();
+        db::initialize(&conn).unwrap();
+        crate::music::import_folder(&conn, &folder).unwrap();
+        let tracks = crate::music::list_tracks(&conn, None).unwrap();
+        let tune = tracks
+            .iter()
+            .find(|t| t.file_path.ends_with("tune.wav"))
+            .unwrap();
+        let other_track = tracks
+            .iter()
+            .find(|t| t.file_path.ends_with("other.wav"))
+            .unwrap();
+
+        let opened = authorize_indexed_music_file(&conn, &media, tune.id, None).unwrap();
+        assert!(opened.ends_with("tune.wav"));
+        assert!(!opened.starts_with(&media));
+        assert_eq!(
+            authorize_indexed_music_file(&conn, &media, tune.id, Some(&indexed)).unwrap(),
+            opened
+        );
+        assert_eq!(
+            authorize_indexed_music_file(&conn, &media, tune.id, Some(&other)).unwrap_err(),
+            MusicHttpDeny::Forbidden
+        );
+        assert_eq!(
+            authorize_indexed_music_file(
+                &conn,
+                &media,
+                tune.id,
+                Some(Path::new(&other_track.file_path))
+            )
+            .unwrap_err(),
+            MusicHttpDeny::Forbidden
+        );
+        let outside = dir.path().join("secret.wav");
+        crate::engine::test_wav::write_sine_wav(&outside, 44100, 1, 100.0, 0.05, 0.2);
+        assert_eq!(
+            authorize_indexed_music_file(&conn, &media, tune.id, Some(&outside)).unwrap_err(),
+            MusicHttpDeny::Forbidden
+        );
+        let dotted = folder.join("nope").join("..").join("..").join("secret.wav");
+        assert_eq!(
+            authorize_indexed_music_file(&conn, &media, tune.id, Some(&dotted)).unwrap_err(),
+            MusicHttpDeny::Forbidden
+        );
+        assert!(foreign_music_request(
+            "/media/track/1",
+            Some("path=/tmp/secret.wav"),
+            1
+        ));
+        assert!(foreign_music_request(
+            "/tmp/library/tune.wav",
+            None,
+            tune.id
+        ));
+        assert!(!foreign_music_request(
+            &format!("/media/track/{}", tune.id),
+            None,
+            tune.id
+        ));
+
+        let grown = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&other)
+            .unwrap();
+        grown.set_len(crate::net::MAX_MEDIA_BYTES + 1).unwrap();
+        drop(grown);
+        assert_eq!(
+            authorize_indexed_music_file(&conn, &media, other_track.id, None).unwrap_err(),
+            MusicHttpDeny::Forbidden
+        );
+
+        #[cfg(unix)]
+        {
+            std::fs::remove_file(&indexed).unwrap();
+            std::os::unix::fs::symlink(&outside, &indexed).unwrap();
+            assert_eq!(
+                authorize_indexed_music_file(&conn, &media, tune.id, None).unwrap_err(),
+                MusicHttpDeny::Forbidden
+            );
+        }
+        let music_dir = media.join("music");
+        let copied = std::fs::read_dir(&music_dir).unwrap().count();
+        assert_eq!(copied, 0);
+    }
+
+    #[tokio::test]
+    async fn music_browse_and_get_use_the_indexed_file_only() {
+        use tokio::net::TcpListener;
+        use tokio::sync::watch;
+
+        let dir = tempfile::tempdir().unwrap();
+        let media = dir.path().join("media");
+        crate::download::ensure_media_layout(&media).unwrap();
+        let folder = dir.path().join("library");
+        let album_dir = folder.join("Miles Davis").join("Kind of Blue");
+        std::fs::create_dir_all(&album_dir).unwrap();
+        let indexed = album_dir.join("01 So What.wav");
+        crate::engine::test_wav::write_sine_wav(&indexed, 44100, 1, 440.0, 0.05, 0.2);
+        let original = std::fs::read(&indexed).unwrap();
+        let secret = dir.path().join("secret.bin");
+        std::fs::write(&secret, b"SECRET-NOT-INDEXED-BYTES").unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        db::initialize(&conn).unwrap();
+        crate::music::import_folder(&conn, &folder).unwrap();
+        let track = crate::music::list_tracks(&conn, None).unwrap().remove(0);
+        assert!(!track.file_path.starts_with(&media.display().to_string()));
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = watch::channel(false);
+        let state = HttpState {
+            db: Arc::new(Mutex::new(conn)),
+            media_root: media,
+            uuid: "music-test".into(),
+            public_base: format!("http://{addr}"),
+        };
+        tokio::spawn(async move {
+            let _ = serve(listener, state, rx).await;
+        });
+
+        let client = reqwest::Client::new();
+        let browse = |oid: &str| {
+            let body = format!(
+                r#"<?xml version="1.0"?><s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"><s:Body><u:Browse xmlns:u="urn:schemas-upnp-org:service:ContentDirectory:1"><ObjectID>{oid}</ObjectID><BrowseFlag>BrowseDirectChildren</BrowseFlag><Filter>*</Filter><StartingIndex>0</StartingIndex><RequestedCount>0</RequestedCount><SortCriteria></SortCriteria></u:Browse></s:Body></s:Envelope>"#
+            );
+            let url = format!("http://{addr}/upnp/control/cds");
+            let client = client.clone();
+            async move {
+                client
+                    .post(url)
+                    .header(
+                        "SOAPACTION",
+                        "\"urn:schemas-upnp-org:service:ContentDirectory:1#Browse\"",
+                    )
+                    .header("Content-Type", "text/xml")
+                    .body(body)
+                    .send()
+                    .await
+                    .unwrap()
+                    .text()
+                    .await
+                    .unwrap()
+            }
+        };
+        let root = browse("0").await;
+        assert!(root.contains("Podcasts"));
+        assert!(root.contains("id=&quot;music&quot;"));
+        assert!(root.contains("childCount=&quot;1&quot;"));
+        let music = browse("music").await;
+        assert!(music.contains("Kind of Blue"));
+        assert!(music.contains("album:"));
+        assert!(!music.contains("secret.bin"));
+        assert!(!music.contains(&indexed.display().to_string()));
+        let album_id = music
+            .split("album:")
+            .nth(1)
+            .unwrap()
+            .split(|c: char| !c.is_ascii_digit())
+            .next()
+            .unwrap();
+        let tracks = browse(&format!("album:{album_id}")).await;
+        assert!(tracks.contains("So What"));
+        assert!(tracks.contains(&format!("/media/track/{}", track.id)));
+        assert!(tracks.contains("audio/wav"));
+        assert!(tracks.contains("DLNA.ORG_CI=0"));
+        assert!(!tracks.contains("secret.bin"));
+        assert!(!tracks.contains(&indexed.display().to_string()));
+
+        let played = client
+            .get(format!("http://{addr}/media/track/{}", track.id))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(played.status(), reqwest::StatusCode::OK);
+        assert_eq!(played.headers()["content-type"], "audio/wav");
+        assert_eq!(
+            played.headers()["contentfeatures.dlna.org"],
+            "DLNA.ORG_OP=01;DLNA.ORG_CI=0"
+        );
+        let bytes = played.bytes().await.unwrap();
+        assert_eq!(&bytes[..], original.as_slice());
+
+        let ranged = client
+            .get(format!("http://{addr}/media/track/{}", track.id))
+            .header("Range", "bytes=0-3")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(ranged.status(), reqwest::StatusCode::PARTIAL_CONTENT);
+        assert_eq!(&ranged.bytes().await.unwrap()[..], &original[..4]);
+
+        let foreign = client
+            .get(format!(
+                "http://{addr}/media/track/{}?path={}",
+                track.id,
+                secret.display()
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(foreign.status(), reqwest::StatusCode::FORBIDDEN);
+        let foreign_body = foreign.bytes().await.unwrap();
+        assert!(!contains_bytes(&foreign_body, b"SECRET-NOT-INDEXED-BYTES"));
+
+        let by_path = client
+            .get(format!("http://{addr}{}", secret.display()))
+            .send()
+            .await
+            .unwrap();
+        assert_ne!(by_path.status(), reqwest::StatusCode::OK);
+        let by_path_body = by_path.bytes().await.unwrap();
+        assert!(!contains_bytes(&by_path_body, b"SECRET-NOT-INDEXED-BYTES"));
+
+        #[cfg(unix)]
+        {
+            std::fs::remove_file(&indexed).unwrap();
+            std::os::unix::fs::symlink(&secret, &indexed).unwrap();
+            let escaped = client
+                .get(format!("http://{addr}/media/track/{}", track.id))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(escaped.status(), reqwest::StatusCode::FORBIDDEN);
+            let escaped_body = escaped.bytes().await.unwrap();
+            assert!(!contains_bytes(&escaped_body, b"SECRET-NOT-INDEXED-BYTES"));
+        }
+        let _ = tx.send(true);
+    }
+
+    fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack.windows(needle.len()).any(|w| w == needle)
     }
 }

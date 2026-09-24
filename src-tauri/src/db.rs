@@ -428,6 +428,40 @@ pub fn get_upnp_episode(
     Ok(row)
 }
 
+pub fn list_upnp_music_albums(conn: &Connection) -> AppResult<Vec<(i64, String, String, i64)>> {
+    let mut stmt = conn.prepare(
+        r#"
+        SELECT a.id, a.title, a.artist, COUNT(t.id)
+        FROM music_album a
+        JOIN music_track t ON t.album_id = a.id
+        WHERE TRIM(t.file_path) != ''
+        GROUP BY a.id
+        ORDER BY a.artist COLLATE NOCASE, a.title COLLATE NOCASE, a.id
+        "#,
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+    })?;
+    Ok(rows.filter_map(|r| r.ok()).collect())
+}
+
+pub fn list_upnp_music_tracks(
+    conn: &Connection,
+    album_id: i64,
+) -> AppResult<Vec<crate::models::MusicTrack>> {
+    let mut stmt = conn.prepare(
+        r#"
+        SELECT id, album_id, source_path, file_path, title, artist, album, track_no,
+               duration_ms, format, codec, sample_rate, bits_per_sample, channels, bytes, created_at
+        FROM music_track
+        WHERE album_id = ?1 AND TRIM(file_path) != ''
+        ORDER BY track_no IS NULL, track_no, title COLLATE NOCASE, id
+        "#,
+    )?;
+    let rows = stmt.query_map(params![album_id], map_music_track)?;
+    Ok(rows.filter_map(|r| r.ok()).collect())
+}
+
 fn map_upnp_episode(row: &rusqlite::Row<'_>) -> rusqlite::Result<crate::models::UpnpEpisode> {
     Ok(crate::models::UpnpEpisode {
         episode_id: row.get(0)?,

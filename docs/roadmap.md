@@ -22,10 +22,10 @@ Se [music-roadmap.md](music-roadmap.md). Egna `music_*`-tabeller. Delad engine e
 
 ## UPnP/DLNA (PR #3 — podcastträd)
 
-Se [upnp-mediaserver.md](upnp-mediaserver.md). **Media Server** mot Onkyo TX-RZ50: ContentDirectory `Podcasts/<show>/<episode>` streamar originalfiler med HTTP Range. `Music/` är en tom stub. Renderer/control point *i appen* är v2+. Transkod-fallback är inte med i v1 av servern.
+Se [upnp-mediaserver.md](upnp-mediaserver.md). **Media Server** mot Onkyo TX-RZ50: ContentDirectory `Podcasts/<show>/<episode>` och `Music/<album>/<track>` streamar originalfiler med HTTP Range. Musik ligger kvar där den indexerades. Renderer/control point *i appen* är v2+. Transkod-fallback är inte med.
 
 ## Medvetet utanför
 
 ## Medvetet utanför
 
-foobar-skinn, SACD-ISO-rippning, moln-ASR, reklam-cut ML, Chromecast/Sonos-specifikt, in-app UPnP-renderer, UPnP-träd för musik (stub kvar).
+foobar-skinn, SACD-ISO-rippning, moln-ASR, reklam-cut ML, Chromecast/Sonos-specifikt, in-app UPnP-renderer.

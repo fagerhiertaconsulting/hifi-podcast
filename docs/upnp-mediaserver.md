@@ -27,10 +27,14 @@ HIFI podcast          (id 0)
  ├─ Podcasts          (id podcasts)
  │   └─ <show>        (id show:<podcast_id>)
  │       └─ <episode> (id ep:<episode_id>, originalfil)
- └─ Music             (id music, tom stub — musik spelas i appen, inte via UPnP i MVP)
+ └─ Music             (id music)
+     └─ <album>       (id album:<album_id>)
+         └─ <track>   (id track:<track_id>, originalfil där den indexerades)
 ```
 
-Titlar, duration och MIME kommer från **SQLite** (`episode.title`, `episode.duration_ms`, `download.mime`), inte från filnamn. `res`-URL: `http://<lan-ip>:<port>/media/episode/<id>`.
+Poddtitlar, duration och MIME kommer från **SQLite** (`episode.title`, `episode.duration_ms`, `download.mime`), inte från filnamn. `res`-URL: `http://<lan-ip>:<port>/media/episode/<id>`.
+
+Musiktitlar, artist, album, spårnummer, duration och storlek kommer från **SQLite** (`music_album`, `music_track`). Bara spår med indexerad filsökväg visas. `res`-URL: `http://<lan-ip>:<port>/media/track/<id>`. Adressen innehåller spår-id, aldrig en filsökväg. Servern öppnar den indexerade filen bara om den fortfarande klarar samma kontroller som lokal uppspelning: ingen symlink som leder ut, sökvägen är den indexerade filen, och storleken är högst 2 GB. En annan sökväg i anropet avvisas. Ingen omkodning.
 
 ## Media-root
 
@@ -43,8 +47,9 @@ Layout efter PR #3 (med migrering från MVP):
 ```
 media/
   podcasts/<podcast_id>/<episode_id>.<ext>
-  music/<album_id>/<track_id>.<ext>   (appens musikbibliotek; UPnP Music-stub tom)
 ```
+
+Musikfiler ligger kvar i den importerade mappen. UPnP kopierar dem inte till `media/music/` eller annan appdata.
 
 Befintliga `media/<podcast_id>/…` flyttas till `media/podcasts/<podcast_id>/…` och `download.file_path` uppdateras **bara om filen faktiskt flyttades**. Om målet redan finns lämnas källfil och DB-sökväg orörda.
 
@@ -69,7 +74,7 @@ DLNA/UPnP AV har **ingen inloggning** på SOAP (ContentDirectory), ConnectionMan
 4. Om receivern inte hittar servern, öppna manuellt:
    - **TCP** den valda porten (in, privat profil) — HTTP `device.xml` + media.
    - **UDP 1900** — SSDP på samma bind som HTTP. Om en annan DMS redan äger 1900 skickas ändå `NOTIFY`; M-SEARCH kan då missas.
-5. På TX-RZ50: Network / NET / DLNA (menyn varierar med firmware) → välj **HIFI podcast** → **Podcasts** → show → avsnitt. Play ska seeka (Range).
+5. På TX-RZ50: Network / NET / DLNA (menyn varierar med firmware) → välj **HIFI podcast** → **Podcasts** → show → avsnitt, eller **Music** → album → spår. Play ska seeka (Range). Originalbytes, ingen omkodning.
 6. Stoppa servern från samma inställningssida när den inte behövs.
 
 Sanity-check från en annan dator på LAN: öppna `http://<pc-ip>:8200/upnp/device.xml`.

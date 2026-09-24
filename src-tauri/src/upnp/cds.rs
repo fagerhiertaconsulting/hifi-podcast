@@ -1,5 +1,5 @@
 use crate::media_mime;
-use crate::models::UpnpEpisode;
+use crate::models::{MusicTrack, UpnpEpisode};
 use rusqlite::Connection;
 use std::path::Path;
 
@@ -14,6 +14,8 @@ pub enum ObjectId {
     Music,
     Show(i64),
     Episode(i64),
+    Album(i64),
+    Track(i64),
 }
 
 pub fn parse_object_id(id: &str) -> Option<ObjectId> {
@@ -33,6 +35,12 @@ pub fn parse_object_id(id: &str) -> Option<ObjectId> {
     if let Some(rest) = id.strip_prefix("ep:") {
         return rest.parse().ok().map(ObjectId::Episode);
     }
+    if let Some(rest) = id.strip_prefix("album:") {
+        return rest.parse().ok().map(ObjectId::Album);
+    }
+    if let Some(rest) = id.strip_prefix("track:") {
+        return rest.parse().ok().map(ObjectId::Track);
+    }
     None
 }
 
@@ -42,6 +50,14 @@ pub fn show_id(podcast_id: i64) -> String {
 
 pub fn episode_id(id: i64) -> String {
     format!("ep:{id}")
+}
+
+pub fn album_object_id(id: i64) -> String {
+    format!("album:{id}")
+}
+
+pub fn track_object_id(id: i64) -> String {
+    format!("track:{id}")
 }
 
 pub fn xml_escape(text: &str) -> String {
@@ -86,6 +102,71 @@ fn container_xml(id: &str, parent: &str, title: &str, child_count: i64, class: &
 
 pub fn episode_mime(ep: &UpnpEpisode) -> String {
     media_mime::for_serving(ep.mime.as_deref(), Path::new(&ep.file_path))
+}
+
+fn track_mime(track: &MusicTrack) -> String {
+    let from_path = media_mime::for_serving(None, Path::new(&track.file_path));
+    if from_path != "application/octet-stream" {
+        return from_path;
+    }
+    media_mime::from_extension(&track.format).to_string()
+}
+
+fn album_container_xml(id: i64, title: &str, artist: &str, child_count: i64) -> String {
+    let label = if artist.trim().is_empty() {
+        title.to_string()
+    } else {
+        format!("{artist} — {title}")
+    };
+    format!(
+        r#"<container id="{}" parentID="{MUSIC}" restricted="1" childCount="{child_count}"><dc:title>{}</dc:title><upnp:artist>{}</upnp:artist><upnp:album>{}</upnp:album><upnp:class>object.container.album.musicAlbum</upnp:class></container>"#,
+        album_object_id(id),
+        xml_escape(&label),
+        xml_escape(artist),
+        xml_escape(title),
+    )
+}
+
+/// DIDL item for an indexed track. `res` is the track id, never the file path.
+fn track_xml(track: &MusicTrack, public_base: &str) -> String {
+    let id = track_object_id(track.id);
+    let parent = album_object_id(track.album_id);
+    let mime = track_mime(track);
+    let protocol = media_mime::protocol_info(&mime);
+    let format_note = if media_mime::is_known_renderer_audio(&mime) {
+        String::new()
+    } else {
+        "<desc id=\"format\" nameSpace=\"urn:hifi-podcast:meta\">original-no-transcode</desc>"
+            .into()
+    };
+    let url = format!("{public_base}/media/track/{}", track.id);
+    let mut extra = String::new();
+    if let Some(bytes) = track.bytes.filter(|n| *n >= 0) {
+        extra.push_str(&format!(" size=\"{bytes}\""));
+    }
+    if let Some(ms) = track.duration_ms {
+        extra.push_str(&format!(" duration=\"{}\"", upnp_duration(ms)));
+    }
+    let track_no = track
+        .track_no
+        .filter(|n| *n > 0)
+        .map(|n| format!("<upnp:originalTrackNumber>{n}</upnp:originalTrackNumber>"))
+        .unwrap_or_default();
+    format!(
+        r#"<item id="{id}" parentID="{parent}" restricted="1"><dc:title>{}</dc:title><dc:creator>{}</dc:creator><upnp:artist>{}</upnp:artist><upnp:album>{}</upnp:album><upnp:class>object.item.audioItem.musicTrack</upnp:class>{track_no}{format_note}<res protocolInfo="{}"{extra}>{url}</res></item>"#,
+        xml_escape(&track.title),
+        xml_escape(&track.artist),
+        xml_escape(&track.artist),
+        xml_escape(&track.album),
+        xml_escape(&protocol),
+    )
+}
+
+fn playable_track(conn: &Connection, track_id: i64) -> Result<MusicTrack, i32> {
+    match crate::db::get_music_track(conn, track_id) {
+        Ok(track) if !track.file_path.trim().is_empty() => Ok(track),
+        _ => Err(701),
+    }
 }
 
 fn item_xml(ep: &UpnpEpisode, public_base: &str) -> String {
@@ -162,6 +243,7 @@ pub fn browse(
     match id {
         ObjectId::Root => {
             let shows = crate::db::list_upnp_podcasts(conn).map_err(|_| 501)?;
+            let albums = crate::db::list_upnp_music_albums(conn).map_err(|_| 501)?;
             let xmls = vec![
                 container_xml(
                     PODCASTS,
@@ -170,7 +252,13 @@ pub fn browse(
                     shows.len() as i64,
                     "object.container.storageFolder",
                 ),
-                container_xml(MUSIC, ROOT, "Music", 0, "object.container.storageFolder"),
+                container_xml(
+                    MUSIC,
+                    ROOT,
+                    "Music",
+                    albums.len() as i64,
+                    "object.container.storageFolder",
+                ),
             ];
             let total = xmls.len() as u32;
             let page = slice(&xmls, start, count);
@@ -202,11 +290,40 @@ pub fn browse(
                 total_matches: total,
             })
         }
-        ObjectId::Music => Ok(BrowseResult {
-            didl: didl_wrap(""),
-            number_returned: 0,
-            total_matches: 0,
-        }),
+        ObjectId::Music => {
+            let albums = crate::db::list_upnp_music_albums(conn).map_err(|_| 501)?;
+            let xmls: Vec<String> = albums
+                .iter()
+                .map(|(id, title, artist, n)| album_container_xml(*id, title, artist, *n))
+                .collect();
+            let total = xmls.len() as u32;
+            let page = slice(&xmls, start, count);
+            Ok(BrowseResult {
+                didl: didl_wrap(&page.join("")),
+                number_returned: page.len() as u32,
+                total_matches: total,
+            })
+        }
+        ObjectId::Album(aid) => {
+            let _album = crate::db::get_music_album(conn, aid).map_err(|_| 701)?;
+            let tracks = crate::db::list_upnp_music_tracks(conn, aid).map_err(|_| 501)?;
+            let xmls: Vec<String> = tracks.iter().map(|t| track_xml(t, public_base)).collect();
+            let total = xmls.len() as u32;
+            let page = slice(&xmls, start, count);
+            Ok(BrowseResult {
+                didl: didl_wrap(&page.join("")),
+                number_returned: page.len() as u32,
+                total_matches: total,
+            })
+        }
+        ObjectId::Track(tid) => {
+            let track = playable_track(conn, tid)?;
+            Ok(BrowseResult {
+                didl: didl_wrap(&track_xml(&track, public_base)),
+                number_returned: 1,
+                total_matches: 1,
+            })
+        }
         ObjectId::Show(pid) => {
             let eps = crate::db::list_upnp_episodes(conn, pid).map_err(|_| 501)?;
             let xmls: Vec<String> = eps.iter().map(|e| item_xml(e, public_base)).collect();
@@ -255,7 +372,25 @@ fn browse_metadata(
                 "object.container.storageFolder",
             )
         }
-        ObjectId::Music => container_xml(MUSIC, ROOT, "Music", 0, "object.container.storageFolder"),
+        ObjectId::Music => {
+            let albums = crate::db::list_upnp_music_albums(conn).map_err(|_| 501)?;
+            container_xml(
+                MUSIC,
+                ROOT,
+                "Music",
+                albums.len() as i64,
+                "object.container.storageFolder",
+            )
+        }
+        ObjectId::Album(aid) => {
+            let album = crate::db::get_music_album(conn, *aid).map_err(|_| 701)?;
+            let tracks = crate::db::list_upnp_music_tracks(conn, *aid).map_err(|_| 501)?;
+            album_container_xml(album.id, &album.title, &album.artist, tracks.len() as i64)
+        }
+        ObjectId::Track(tid) => {
+            let track = playable_track(conn, *tid)?;
+            track_xml(&track, public_base)
+        }
         ObjectId::Show(pid) => {
             let eps = crate::db::list_upnp_episodes(conn, *pid).map_err(|_| 501)?;
             let title = eps
@@ -387,7 +522,103 @@ mod tests {
         assert_eq!(parse_object_id("music"), Some(ObjectId::Music));
         assert_eq!(parse_object_id("show:12"), Some(ObjectId::Show(12)));
         assert_eq!(parse_object_id("ep:9"), Some(ObjectId::Episode(9)));
+        assert_eq!(parse_object_id("album:3"), Some(ObjectId::Album(3)));
+        assert_eq!(parse_object_id("track:4"), Some(ObjectId::Track(4)));
         assert!(parse_object_id("../etc").is_none());
+        assert!(parse_object_id("track:4/../../etc/passwd").is_none());
+        assert!(parse_object_id("/library/secret.flac").is_none());
+    }
+
+    #[test]
+    fn music_tree_lists_indexed_albums_and_tracks() {
+        let conn = seed();
+        let album = db::upsert_music_album(&conn, "Kind & Blue", "Miles Davis").unwrap();
+        let hidden = db::insert_music_track_placeholder(
+            &conn,
+            album,
+            "/library/miles/missing.flac",
+            "No File",
+            "Miles Davis",
+            "Kind & Blue",
+            Some(2),
+            None,
+            "flac",
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(db::get_music_track(&conn, hidden)
+            .unwrap()
+            .file_path
+            .is_empty());
+        let tid = db::insert_music_track_placeholder(
+            &conn,
+            album,
+            "/library/miles/so-what.flac",
+            "So What",
+            "Miles Davis",
+            "Kind & Blue",
+            Some(1),
+            Some(540_000),
+            "flac",
+            Some("FLAC"),
+            Some(44100),
+            Some(16),
+            Some(2),
+        )
+        .unwrap();
+        db::set_music_track_file(&conn, tid, "/library/miles/so-what.flac", Some(1234)).unwrap();
+
+        let root = browse(&conn, "0", false, 0, 0, "http://10.0.0.5:8200").unwrap();
+        assert!(root.didl.contains(">Podcasts<"));
+        assert!(root
+            .didl
+            .contains("id=\"music\" parentID=\"0\" restricted=\"1\" childCount=\"1\""));
+
+        let music = browse(&conn, "music", false, 0, 0, "http://10.0.0.5:8200").unwrap();
+        assert_eq!(music.total_matches, 1);
+        assert_eq!(music.number_returned, 1);
+        assert!(music.didl.contains("Miles Davis — Kind &amp; Blue"));
+        assert!(music.didl.contains(&album_object_id(album)));
+        assert!(music.didl.contains("object.container.album.musicAlbum"));
+        assert!(!music.didl.contains("No File"));
+        assert!(!music.didl.contains("/library/miles/so-what.flac"));
+
+        let tracks = browse(
+            &conn,
+            &album_object_id(album),
+            false,
+            0,
+            0,
+            "http://10.0.0.5:8200",
+        )
+        .unwrap();
+        assert_eq!(tracks.number_returned, 1);
+        assert!(tracks.didl.contains("So What"));
+        assert!(tracks.didl.contains("audio/flac"));
+        assert!(tracks.didl.contains(&format!("/media/track/{tid}")));
+        assert!(tracks.didl.contains("originalTrackNumber>1<"));
+        assert!(tracks.didl.contains("duration=\"0:09:00.000\""));
+        assert!(tracks.didl.contains("DLNA.ORG_CI=0"));
+        assert!(!tracks.didl.contains("/library/"));
+        assert!(!tracks.didl.contains("so-what.flac"));
+        assert!(!tracks.didl.contains("No File"));
+
+        let one = browse(
+            &conn,
+            &track_object_id(tid),
+            true,
+            0,
+            0,
+            "http://10.0.0.5:8200",
+        )
+        .unwrap();
+        assert_eq!(one.number_returned, 1);
+        assert!(one.didl.contains(&format!("/media/track/{tid}")));
+        assert!(browse(&conn, "album:999", false, 0, 0, "http://10.0.0.5:8200").is_err());
+        assert!(browse(&conn, &track_object_id(hidden), false, 0, 0, "http://x").is_err());
     }
 
     #[test]

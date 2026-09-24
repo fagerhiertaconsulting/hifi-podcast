@@ -349,6 +349,18 @@ pub(crate) fn require_playable_track(
     require_indexed(conn, media_root, track, &lexical)
 }
 
+/// True only when `requested` is the same lexical path as the indexed file.
+/// Symlinks are not resolved, and this function does not open `requested`.
+pub(crate) fn request_path_is_indexed_file(requested: &Path, indexed: &Path) -> bool {
+    let Ok(requested) = lexical_absolute(requested) else {
+        return false;
+    };
+    let Ok(indexed) = lexical_absolute(indexed) else {
+        return false;
+    };
+    normalize_path(&requested) == normalize_path(&indexed)
+}
+
 fn require_indexed(
     conn: &Connection,
     media_root: &Path,
