@@ -40,10 +40,7 @@ pub fn extension_of(path: &Path) -> String {
 }
 
 pub fn classify_extension(ext: &str) -> FormatKind {
-    let ext = ext
-        .trim()
-        .trim_start_matches('.')
-        .to_ascii_lowercase();
+    let ext = ext.trim().trim_start_matches('.').to_ascii_lowercase();
     if PCM_EXTS.contains(&ext.as_str()) {
         FormatKind::Pcm
     } else if DSD_EXTS.contains(&ext.as_str()) || ext == "iso" {
@@ -55,7 +52,10 @@ pub fn classify_extension(ext: &str) -> FormatKind {
 
 pub fn classify_mime(mime: &str) -> FormatKind {
     let mime = mime.trim().to_ascii_lowercase();
-    if mime == "audio/x-dsd" || mime == "audio/dsd" || mime == "audio/x-dsf" || mime == "audio/x-dff"
+    if mime == "audio/x-dsd"
+        || mime == "audio/dsd"
+        || mime == "audio/x-dsf"
+        || mime == "audio/x-dff"
     {
         return FormatKind::Dsd;
     }
@@ -108,6 +108,7 @@ pub fn support_for(path: &Path, stored_mime: Option<&str>) -> FormatSupport {
     if kind == FormatKind::Unknown {
         kind = classify_mime(&mime);
     }
+    let flac = ext == "flac";
     match kind {
         FormatKind::Pcm => FormatSupport {
             kind,
@@ -116,7 +117,11 @@ pub fn support_for(path: &Path, stored_mime: Option<&str>) -> FormatSupport {
             native_decode: true,
             dsd_plugin: false,
             label_sv: "PCM (Symphonia)".into(),
-            note_sv: "Avkodas native till f32. Originalfilen rörs inte.".into(),
+            note_sv: if flac {
+                "FLAC: heltals-bitkopia via ASIO när enhetens format rymmer bitdjupet. f32 bara som reserv. Originalfilen rörs inte.".into()
+            } else {
+                "Avkodas native till f32. Originalfilen rörs inte.".into()
+            },
         },
         FormatKind::Dsd => {
             let iso = ext == "iso";

@@ -1,14 +1,16 @@
-//! Decode → buffer → output. f32 pipeline, unity gain, opt-in skip-silence and stretch.
+//! Decode → buffer → output. FLAC on ASIO is an integer bit-copy when the device
+//! format allows it; otherwise the f32 pipeline. Unity gain, opt-in skip-silence and stretch.
 
+use super::asio_host::{AsioPcmDelivery, FlacAsioParams};
 use super::byte_ring::ByteRing;
-use super::decode::{to_stereo, Decoder};
+use super::decode::{to_stereo, to_stereo_i32, Decoder};
 use super::dsd::{self, BitOrder, DsdReader};
 use super::exclusive::ExclusiveStream;
 use super::formats::{self, FormatKind, FormatSupport};
 use super::output::{self, OutputDeviceInfo, SharedStream};
 use super::quality;
 use super::resample::RateConvert;
-use super::ring::FrameRing;
+use super::ring::{FrameRing, IntRing};
 use super::skip::SkipSilence;
 use super::stretch::TimeStretch;
 use super::EngineError;
@@ -281,6 +283,16 @@ impl Handle {
         let playing = Arc::new(AtomicBool::new(false));
         let stop = Arc::new(AtomicBool::new(false));
         let ring = Arc::new(FrameRing::new(2));
+        let flac_asio = if spec.codec == "FLAC" && (1..=32).contains(&spec.bits_per_sample) {
+            Some(FlacAsioParams {
+                bits: spec.bits_per_sample,
+                unity_speed: (speed - 1.0).abs() < 1e-6,
+                skip_silence,
+            })
+        } else {
+            None
+        };
+        let int_ring = flac_asio.map(|_| Arc::new(IntRing::new(2)));
         let hwnd = *self.hwnd.lock().expect("engine hwnd");
 
         {
@@ -306,6 +318,8 @@ impl Handle {
             channels_stereo,
             hwnd,
             ring.clone(),
+            int_ring.clone(),
+            flac_asio,
             playing.clone(),
         )?;
 
@@ -338,7 +352,12 @@ impl Handle {
                 } else {
                     "pcm".into()
                 },
-                output_path_sv: "PCM (f32-kedja)".into(),
+                output_path_sv: pcm_output_path_sv(
+                    opened.pcm_delivery,
+                    &opened.api,
+                    &spec.codec,
+                    &opened.device_name,
+                ),
                 callback_reentries: 0,
                 dsd_diag: opened.dsd_diag.clone(),
                 file_bits: spec.bits_per_sample,
@@ -357,25 +376,49 @@ impl Handle {
         let app = self.app.clone();
         let stop_w = stop.clone();
         let playing_w = playing.clone();
-        let worker = std::thread::Builder::new()
-            .name("hifi-decode".into())
-            .spawn(move || {
-                decode_loop(
-                    decoder,
-                    rx,
-                    ring,
-                    status,
-                    app,
-                    stop_w,
-                    playing_w,
-                    speed,
-                    skip_silence,
-                    spec.sample_rate,
-                    opened.out_rate,
-                    resampled,
-                );
-            })
-            .map_err(|e| EngineError::msg(format!("Avkodningstråd: {e}")))?;
+        let integer = opened.pcm_delivery == AsioPcmDelivery::IntegerBitCopy;
+        let out_rate = opened.out_rate;
+        let source_rate = spec.sample_rate;
+        let worker = if integer {
+            let int_ring = int_ring.ok_or_else(|| {
+                EngineError::msg("FLAC-bitkopia saknar heltalsbuffert. Filen rörs inte.")
+            })?;
+            std::thread::Builder::new()
+                .name("hifi-decode".into())
+                .spawn(move || {
+                    integer_decode_loop(
+                        decoder,
+                        rx,
+                        int_ring,
+                        status,
+                        app,
+                        stop_w,
+                        playing_w,
+                        source_rate,
+                    );
+                })
+                .map_err(|e| EngineError::msg(format!("Avkodningstråd: {e}")))?
+        } else {
+            std::thread::Builder::new()
+                .name("hifi-decode".into())
+                .spawn(move || {
+                    decode_loop(
+                        decoder,
+                        rx,
+                        ring,
+                        status,
+                        app,
+                        stop_w,
+                        playing_w,
+                        speed,
+                        skip_silence,
+                        source_rate,
+                        out_rate,
+                        resampled,
+                    );
+                })
+                .map_err(|e| EngineError::msg(format!("Avkodningstråd: {e}")))?
+        };
 
         *self.session.lock().expect("engine session") = Some(Session {
             cmd: tx,
@@ -443,8 +486,7 @@ impl Handle {
                     }
                     if st.output_quality_sv.is_empty() || st.output_path.is_empty() {
                         st.output_quality_sv = quality::output_pending_sv().into();
-                        st.output_path_sv =
-                            "Öppnar utgång, väntar på enhet.".into();
+                        st.output_path_sv = "Öppnar utgång, väntar på enhet.".into();
                     }
                 }
                 emit_tick(&app, &status);
@@ -613,6 +655,7 @@ struct OpenedOutput {
     dsd_diag: String,
     output_bits: u32,
     output_sample: String,
+    pcm_delivery: AsioPcmDelivery,
 }
 
 fn wasapi_device_name(name: &str) -> Option<&str> {
@@ -659,6 +702,16 @@ fn asio_driver_name(name: &str) -> Option<&str> {
     Some(n)
 }
 
+fn pcm_output_path_sv(delivery: AsioPcmDelivery, api: &str, codec: &str, device: &str) -> String {
+    if delivery == AsioPcmDelivery::IntegerBitCopy {
+        format!("FLAC heltals-bitkopia via ASIO ({device}) — inte f32.")
+    } else if codec == "FLAC" && api == "asio" {
+        "FLAC via f32 (ASIO tog inte heltals-bitkopia).".into()
+    } else {
+        "PCM (f32-kedja)".into()
+    }
+}
+
 fn open_output(
     api: &str,
     device_name: &str,
@@ -666,11 +719,21 @@ fn open_output(
     channels: u16,
     hwnd: Option<usize>,
     ring: Arc<FrameRing>,
+    int_ring: Option<Arc<IntRing>>,
+    flac: Option<FlacAsioParams>,
     playing: Arc<AtomicBool>,
 ) -> Result<OpenedOutput, EngineError> {
     let api = api.trim().to_ascii_lowercase();
     match api.as_str() {
-        "asio" => open_asio(device_name, sample_rate, hwnd, ring, playing),
+        "asio" => open_asio(
+            device_name,
+            sample_rate,
+            hwnd,
+            ring,
+            int_ring,
+            flac,
+            playing,
+        ),
         "wasapi_exclusive" | "exclusive" => {
             open_exclusive(device_name, sample_rate, channels, ring, playing)
         }
@@ -684,6 +747,8 @@ fn open_output(
                 sample_rate,
                 hwnd,
                 ring.clone(),
+                int_ring,
+                flac,
                 playing.clone(),
             ) {
                 Ok(s) => Ok(s),
@@ -710,16 +775,20 @@ fn open_asio(
     sample_rate: u32,
     hwnd: Option<usize>,
     ring: Arc<FrameRing>,
+    int_ring: Option<Arc<IntRing>>,
+    flac: Option<FlacAsioParams>,
     playing: Arc<AtomicBool>,
 ) -> Result<OpenedOutput, EngineError> {
     let name = asio_driver_name(device_name);
-    let stream = super::asio_host::start_asio(name, sample_rate, hwnd, ring, playing)?;
+    let stream =
+        super::asio_host::start_asio(name, sample_rate, hwnd, ring, int_ring, flac, playing)?;
     let out_rate = stream.sample_rate;
     let device_name = stream.driver_name.clone();
     let io_path = stream.io_path.clone();
     let dsd_diag = stream.dsd_diag.clone();
     let output_bits = stream.output_bits;
     let output_sample = stream.output_sample.clone();
+    let pcm_delivery = stream.pcm_delivery;
     Ok(OpenedOutput {
         shared: None,
         exclusive_stream: None,
@@ -732,6 +801,7 @@ fn open_asio(
         dsd_diag,
         output_bits,
         output_sample,
+        pcm_delivery,
     })
 }
 
@@ -759,6 +829,7 @@ fn open_exclusive(
         dsd_diag: String::new(),
         output_bits,
         output_sample,
+        pcm_delivery: AsioPcmDelivery::Float32,
     })
 }
 
@@ -786,6 +857,7 @@ fn open_shared(
         dsd_diag: String::new(),
         output_bits,
         output_sample,
+        pcm_delivery: AsioPcmDelivery::Float32,
     })
 }
 
@@ -905,6 +977,7 @@ fn wrap_asio_dsd(stream: super::asio_host::AsioStream) -> Result<OpenedOutput, E
             dsd_diag,
             output_bits,
             output_sample,
+            pcm_delivery: AsioPcmDelivery::Float32,
         });
     }
     Err(EngineError::msg(
@@ -937,7 +1010,118 @@ fn open_dsd_wasapi_dop(
         dsd_diag: format!("wasapi_exclusive_dop rate={dop_rate}"),
         output_bits,
         output_sample,
+        pcm_delivery: AsioPcmDelivery::Float32,
     })
+}
+
+fn integer_decode_loop(
+    mut decoder: Decoder,
+    rx: Receiver<Cmd>,
+    ring: Arc<IntRing>,
+    status: Arc<Mutex<EngineStatus>>,
+    app: Arc<Mutex<Option<AppHandle>>>,
+    stop: Arc<AtomicBool>,
+    playing: Arc<AtomicBool>,
+    source_rate: u32,
+) {
+    let mut source_consumed: u64 = 0;
+    let mut ended = false;
+    let mut last_emit = std::time::Instant::now();
+    let mut last_underruns = 0u64;
+    let mut warned_speed = false;
+
+    while !stop.load(Ordering::Relaxed) {
+        while let Ok(cmd) = rx.try_recv() {
+            match cmd {
+                Cmd::Play => {
+                    playing.store(true, Ordering::Relaxed);
+                    ended = false;
+                }
+                Cmd::Pause => playing.store(false, Ordering::Relaxed),
+                Cmd::Stop => {
+                    stop.store(true, Ordering::Relaxed);
+                    playing.store(false, Ordering::Relaxed);
+                }
+                Cmd::Speed(s) => {
+                    if (s - 1.0).abs() > 1e-6 && !warned_speed {
+                        warned_speed = true;
+                        if let Ok(mut st) = status.lock() {
+                            st.error = Some(
+                                "FLAC-bitkopia via ASIO är 1×. Hastighet ≠ 1 kräver f32 — stoppa och öppna spåret igen.".into(),
+                            );
+                        }
+                    }
+                }
+                Cmd::SkipSilence(_) => {
+                    if let Ok(mut st) = status.lock() {
+                        st.skip_silence = false;
+                    }
+                }
+                Cmd::Seek(ms) => {
+                    ring.clear();
+                    if let Ok(actual) = decoder.seek_ms(ms) {
+                        source_consumed = actual * source_rate as u64 / 1000;
+                    }
+                    ended = false;
+                }
+            }
+        }
+
+        let high_water = (source_rate as usize) * 2 / 5;
+        if playing.load(Ordering::Relaxed) && ring.len_frames() < high_water && !ended {
+            let channels = decoder.spec().channels;
+            match decoder.read_interleaved_i32((source_rate as usize / 10) * channels as usize) {
+                Ok(raw) if raw.is_empty() => {
+                    ended = decoder.is_eof();
+                    if ended {
+                        playing.store(false, Ordering::Relaxed);
+                        emit_ended(&app, &status);
+                    }
+                }
+                Ok(raw) => {
+                    let stereo = to_stereo_i32(&raw, channels);
+                    let frames = (stereo.len() / 2) as u64;
+                    source_consumed += frames;
+                    if !stereo.is_empty() {
+                        ring.push_interleaved(&stereo);
+                    }
+                }
+                Err(err) => {
+                    if let Ok(mut st) = status.lock() {
+                        st.error = Some(err.to_string());
+                        st.playing = false;
+                    }
+                    playing.store(false, Ordering::Relaxed);
+                }
+            }
+        }
+
+        if last_emit.elapsed() >= Duration::from_millis(80) {
+            last_emit = std::time::Instant::now();
+            let buffered = ring.len_frames() as u64;
+            let audible = source_consumed.saturating_sub(buffered);
+            let pos_ms = audible * 1000 / source_rate.max(1) as u64;
+            let underruns = ring.underrun_count();
+            let reentries = super::asio_host::asio_callback_reentries();
+            if underruns > last_underruns {
+                eprintln!(
+                    "native audio underrun: empty integer ring or try_lock contended (count {underruns}); ASIO re-entry {reentries}"
+                );
+                last_underruns = underruns;
+            }
+            if let Ok(mut st) = status.lock() {
+                st.position_ms = pos_ms;
+                st.playing = playing.load(Ordering::Relaxed);
+                st.ended = ended;
+                st.speed = 1.0;
+                st.underruns = underruns;
+                st.callback_reentries = reentries;
+            }
+            emit_tick(&app, &status);
+        }
+
+        std::thread::sleep(Duration::from_millis(4));
+    }
 }
 
 fn decode_loop(

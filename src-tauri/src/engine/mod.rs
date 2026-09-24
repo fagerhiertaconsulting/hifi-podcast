@@ -1,4 +1,5 @@
-//! Native hi-fi playback engine: Symphonia PCM → f32, DSD bytes → ASIO / WASAPI DoP.
+//! Native hi-fi playback engine: FLAC integer bit-copy on ASIO when the device
+//! format allows it, otherwise Symphonia PCM → f32. DSD bytes → ASIO native / DoP.
 
 mod asio_host;
 mod byte_ring;

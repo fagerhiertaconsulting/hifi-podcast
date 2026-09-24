@@ -1,11 +1,12 @@
-//! Streaming Symphonia decoder. Output is interleaved f32, unity gain, no DSP.
+//! Streaming Symphonia decoder. PCM output is interleaved f32, unity gain, no DSP.
+//! FLAC integer bit-copy reads the decoder's MSB-aligned i32 samples instead.
 
 use super::formats::{classify_magic, FormatKind};
 use super::EngineError;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
-use symphonia::core::audio::{AudioBufferRef, SampleBuffer};
+use symphonia::core::audio::{AudioBufferRef, SampleBuffer, Signal};
 use symphonia::core::codecs::{CodecType, DecoderOptions, CODEC_TYPE_NULL};
 use symphonia::core::errors::Error as SymphoniaError;
 use symphonia::core::formats::{FormatOptions, FormatReader, SeekMode, SeekTo};
@@ -31,6 +32,7 @@ pub struct Decoder {
     spec: AudioSpec,
     sample_buf: Option<SampleBuffer<f32>>,
     leftover: Vec<f32>,
+    leftover_i32: Vec<i32>,
     eof: bool,
 }
 
@@ -104,9 +106,10 @@ impl Decoder {
         if channels == 0 {
             return Err(EngineError::msg("Ljudspåret har noll kanaler."));
         }
-        let duration_ms = track.codec_params.n_frames.map(|frames| {
-            (frames as u128 * 1000 / sample_rate as u128) as u64
-        });
+        let duration_ms = track
+            .codec_params
+            .n_frames
+            .map(|frames| (frames as u128 * 1000 / sample_rate as u128) as u64);
         let codec = codec_label(track.codec_params.codec);
         let bits_per_sample = track
             .codec_params
@@ -129,6 +132,7 @@ impl Decoder {
             },
             sample_buf: None,
             leftover: Vec::new(),
+            leftover_i32: Vec::new(),
             eof: false,
         })
     }
@@ -138,7 +142,7 @@ impl Decoder {
     }
 
     pub fn is_eof(&self) -> bool {
-        self.eof && self.leftover.is_empty()
+        self.eof && self.leftover.is_empty() && self.leftover_i32.is_empty()
     }
 
     /// Interleaved f32, unity. Empty vec means EOF.
@@ -157,6 +161,54 @@ impl Decoder {
                         Ok(decoded) => {
                             let samples = copy_f32(decoded, &mut self.sample_buf);
                             out.extend_from_slice(samples);
+                        }
+                        Err(SymphoniaError::DecodeError(_)) => continue,
+                        Err(SymphoniaError::IoError(err))
+                            if err.kind() == std::io::ErrorKind::UnexpectedEof =>
+                        {
+                            self.eof = true;
+                        }
+                        Err(err) => {
+                            return Err(EngineError::msg(format!("Avkodningsfel: {err}")));
+                        }
+                    }
+                }
+                Err(SymphoniaError::ResetRequired) => {
+                    self.decoder.reset();
+                }
+                Err(SymphoniaError::IoError(err))
+                    if err.kind() == std::io::ErrorKind::UnexpectedEof =>
+                {
+                    self.eof = true;
+                }
+                Err(SymphoniaError::SeekError(_)) => {
+                    self.eof = true;
+                }
+                Err(err) => {
+                    return Err(EngineError::msg(format!("Kunde inte läsa paket: {err}")));
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Interleaved MSB-aligned i32 from the codec (Symphonia FLAC left-aligns to 32-bit).
+    /// Empty vec means EOF. Refuses a non-integer buffer — no silent f32 conversion.
+    pub fn read_interleaved_i32(&mut self, min_samples: usize) -> Result<Vec<i32>, EngineError> {
+        let mut out = Vec::new();
+        if !self.leftover_i32.is_empty() {
+            out.append(&mut self.leftover_i32);
+        }
+        while out.len() < min_samples && !self.eof {
+            match self.format.next_packet() {
+                Ok(packet) => {
+                    if packet.track_id() != self.track_id {
+                        continue;
+                    }
+                    match self.decoder.decode(&packet) {
+                        Ok(decoded) => {
+                            let samples = copy_i32_interleaved(decoded)?;
+                            out.extend_from_slice(&samples);
                         }
                         Err(SymphoniaError::DecodeError(_)) => continue,
                         Err(SymphoniaError::IoError(err))
@@ -210,11 +262,33 @@ impl Decoder {
             .map_err(|err| EngineError::msg(format!("Seek misslyckades: {err}")))?;
         self.decoder.reset();
         self.leftover.clear();
+        self.leftover_i32.clear();
         self.eof = false;
         let rate = self.spec.sample_rate as u128;
         let actual_ms = ts.actual_ts as u128 * 1000 / rate.max(1);
         Ok(actual_ms as u64)
     }
+}
+
+fn copy_i32_interleaved(decoded: AudioBufferRef<'_>) -> Result<Vec<i32>, EngineError> {
+    let AudioBufferRef::S32(buf) = decoded else {
+        return Err(EngineError::msg(
+            "FLAC-bitkopia kräver heltals-PCM (i32) från avkodaren. Ingen tyst omvandling till f32.",
+        ));
+    };
+    let buf = buf.as_ref();
+    let channels = buf.spec().channels.count();
+    let frames = buf.frames();
+    if channels == 0 {
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::with_capacity(frames.saturating_mul(channels));
+    for frame in 0..frames {
+        for ch in 0..channels {
+            out.push(buf.chan(ch)[frame]);
+        }
+    }
+    Ok(out)
 }
 
 fn copy_f32<'a>(
@@ -317,10 +391,14 @@ fn wav_fmt_bits(path: &Path) -> Option<u32> {
                 return None;
             }
             let bits = u16::from_le_bytes(body[14..16].try_into().ok()?);
-            return if bits > 0 { Some(u32::from(bits)) } else { None };
+            return if bits > 0 {
+                Some(u32::from(bits))
+            } else {
+                None
+            };
         }
-                file.seek(SeekFrom::Current(len as i64 + (len % 2) as i64))
-                    .ok()?;
+        file.seek(SeekFrom::Current(len as i64 + (len % 2) as i64))
+            .ok()?;
     }
 }
 
@@ -350,6 +428,29 @@ fn flac_streaminfo_bits(path: &Path) -> Option<u32> {
         }
         if last {
             return None;
+        }
+    }
+}
+
+/// Downmix/upmix to stereo without extra gain. Mono is doubled; >2 channels fold to L/R.
+/// Integer twin of [`to_stereo`]: no scale, the sample bits are copied.
+pub fn to_stereo_i32(interleaved: &[i32], channels: u16) -> Vec<i32> {
+    match channels {
+        0 => Vec::new(),
+        1 => interleaved.iter().flat_map(|s| [*s, *s]).collect(),
+        2 => interleaved.to_vec(),
+        n => {
+            let n = n as usize;
+            let frames = interleaved.len() / n;
+            let mut out = Vec::with_capacity(frames * 2);
+            for frame in 0..frames {
+                let base = frame * n;
+                let l = interleaved[base];
+                let r = if n > 1 { interleaved[base + 1] } else { l };
+                out.push(l);
+                out.push(r);
+            }
+            out
         }
     }
 }
@@ -414,6 +515,14 @@ mod tests {
         let input = vec![1.0, -1.0, 0.5, 0.25];
         let out = to_stereo(&input, 4);
         assert_eq!(out, vec![1.0, -1.0]);
+    }
+
+    #[test]
+    fn stereo_i32_copies_bits_without_scaling() {
+        assert_eq!(to_stereo_i32(&[1, -2, 3], 1), vec![1, 1, -2, -2, 3, 3]);
+        let stereo = [0x0102_0300i32, -256, 20, -20];
+        assert_eq!(to_stereo_i32(&stereo, 2), stereo.to_vec());
+        assert_eq!(to_stereo_i32(&[9, 8, 7, 6], 4), vec![9, 8]);
     }
 
     #[test]

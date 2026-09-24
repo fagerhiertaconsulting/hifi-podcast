@@ -28,7 +28,7 @@ Målet är att **FLAC och vanliga poddformat ska spelas i appen** via Rust, med 
 
 | API | Vad som faktiskt finns i koden | Bit-perfect? |
 |-----|--------------------------------|--------------|
-| **ASIO** | **Ja:** enhetslista från `HKLM\SOFTWARE\ASIO` (och WOW6432Node) + `CoCreateInstance(clsid, …, clsid)` + IASIO `createBuffers`/`start`/`bufferSwitch`. Det är en riktig öppning, inte en etikett. | Närmast Qobuz-kedjan: källans samplingsfrekvens om drivrutinen tar den; intern kedja är **f32** (inte integer-bitkopia från FLAC). Ingen tyst omsampling i ASIO — om FiiO nekar Hz visas fel. |
+| **ASIO** | **Ja:** enhetslista från `HKLM\SOFTWARE\ASIO` (och WOW6432Node) + `CoCreateInstance(clsid, …, clsid)` + IASIO `createBuffers`/`start`/`bufferSwitch`. Det är en riktig öppning, inte en etikett. | Närmast Qobuz-kedjan: källans samplingsfrekvens om drivrutinen tar den. **FLAC** skrivs som heltals-bitkopia (i16/i24/i32) när drivrutinens format rymmer bitdjupet. **f32 bara som reserv** (float-format, för smalt heltal, hastighet ≠ 1, hoppa tystnad, eller annan codec). Native DSD är oförändrad (inte DoP). Ingen tyst omsampling i ASIO — om FiiO nekar Hz visas fel. |
 | **WASAPI exclusive** | Ja (Windows, `wasapi`-låda). Fallback. | Exclusive låser DAC:n; fortfarande f32-kedja. |
 | **WASAPI shared (cpal)** | Ja. Default-fallback om ASIO saknas/nekas i läge **Auto**. | Inte bit-perfect: systemets mixer kan resample:a. |
 | WebView2 `HTMLMediaElement` | Kvar som omkopplare | Chromium-mixer, inte hi-fi-DAC-läge |
@@ -44,7 +44,7 @@ Målet är att **FLAC och vanliga poddformat ska spelas i appen** via Rust, med 
 - Unity-gain, ingen compressor.
 - Hastighet ≠ 1×: WSOLA (tonartsstabil). **ASIO + hastighet ≠ 1 är inte bit-perfect.**
 - Hoppa tystnad: opt-in, hopp i sample-klockan.
-- Intern `f32`. Vid ASIO skrivs till drivrutinens format (typiskt i32/i24/f32 LSB) utan dither-policy utöver clamp.
+- Intern `f32` när DSP eller en reservväg behövs. FLAC via ASIO är heltals-bitkopia när enheten tar formatet; då skalas inte sampel genom f32. Vid f32-reserven skrivs till drivrutinens format (i32/i24/f32 LSB) utan dither-policy utöver clamp.
 
 ## MVP (WebView2, fortfarande valbar)
 
