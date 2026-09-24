@@ -8,7 +8,7 @@
 | **v1** | Lokal ASR, kapitel, reklam-skip | Roadmap |
 | **Musik** | Separat modul, foobar2000-ambition | MVP: `music_*`-tabeller + Musik-flik, delad engine |
 | **Native engine** | Symphonia PCM + DSD (.dsf/.dff) → ASIO (FiiO native/DoP) / WASAPI | PR #4 PCM; DSD native i efterföljande PR |
-| **UPnP** | Media Server mot Onkyo TX-RZ50 | PR #3: SSDP + CDS + HTTP Range; `Music/` stub |
+| **UPnP** | Media Server mot Onkyo TX-RZ50 | SSDP + CDS + HTTP Range. Podcasts och Music (indexerade album/spår, filen på plats) |
 
 ## Process
 

@@ -30,7 +30,7 @@ Blanda aldrig podcast-kö med musikbibliotek. Gemensamt är motor + globala outp
 3. Bläddra album → spår, spela via `engine_open` (samma väg som lokal podd/DSD).
 4. Hoppa tystnad och reklam används **inte** för musik.
 
-UPnP-trädets `Music/` är fortfarande en tom stub (Onkyo-podcastträdet oförändrat).
+UPnP-trädet `Music/` listar indexerade album och spår. Poddträdet är oförändrat. HTTP öppnar den indexerade filen på plats (ingen kopia till appdata, ingen omkodning) efter samma sökvägs-, symlink- och storlekskontroll som lokal uppspelning.
 
 ## Online metadata och omslag
 

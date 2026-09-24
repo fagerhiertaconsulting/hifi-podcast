@@ -2508,9 +2508,10 @@ function UpnpSettingsPanel(props: { onStatus: (s: string) => void }) {
       <h2>UPnP/DLNA-mediaserver</h2>
       <p>
         HIFI podcast är servern. Onkyo TX-RZ50 (eller annan renderer) bläddrar i{" "}
-        <strong>Podcasts</strong> och spelar originalfilerna. Mappen{" "}
-        <strong>Music</strong> i UPnP är fortfarande en tom stub i den här versionen
-        — musik spelas i appens Musik-flik via samma motor. Ingen omkodning.
+        <strong>Podcasts</strong> och <strong>Music</strong> och spelar originalfilerna.
+        Music fylls med indexerade album och spår. Musikfilerna ligger kvar där de
+        importerades — de kopieras inte till appdata och omkodas inte. Poddträdet
+        är oförändrat.
       </p>
       <p className="upnp-warn">
         Servern är bara för ett <strong>betrott hemmanät (LAN)</strong>. SOAP, katalog
@@ -2572,9 +2573,16 @@ function UpnpSettingsPanel(props: { onStatus: (s: string) => void }) {
         {status?.error ? ` Fel: ${status.error}` : ""}
       </p>
       <p className="sidebar-note">
+        På receivern: HIFI podcast → Music → album → spår. Servern öppnar bara den
+        indexerade filen för spår-id:t, med samma spärrar som lokal uppspelning. En
+        annan sökväg i adressen avvisas. Ingen symlink ut, inte utanför den indexerade
+        filen, och högst 2 GB.
+      </p>
+      <p className="sidebar-note">
         Windows-brandvägg: tillåt HIFI podcast för privat nätverk när Windows frågar.
         Öppna TCP-porten (8200) och UDP 1900 (SSDP) om receivern inte ser servern. Inget
-        administratörskonto krävs för att starta servern.
+        administratörskonto krävs för att starta servern. Appen lägger inte till
+        brandväggsregler.
       </p>
     </div>
   );
