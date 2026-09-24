@@ -144,7 +144,10 @@ export function InboxView(props: {
   return (
     <section className="queue">
       <h1>Inkorg</h1>
-      <p className="empty">Nya avsnitt hamnar här tills du köar eller arkiverar dem.</p>
+      <p className="empty">
+        Bara avsnitt publicerade efter prenumerationen hamnar här. De ligger kvar
+        tills du köar eller arkiverar dem.
+      </p>
       {props.items.length === 0 && <p className="empty">Inkorgen är tom.</p>}
       <ol>
         {props.items.map((item) => (

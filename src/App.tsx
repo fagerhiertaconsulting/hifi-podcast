@@ -1591,6 +1591,11 @@ function Library(props: {
                 <div>
                   <h1>{selected.title}</h1>
                   <p>{selected.description ?? "Ingen beskrivning i feeden."}</p>
+                  <p className="empty">
+                    Prenumerationen gäller från {formatDate(selected.subscribed_at)}.
+                    Inkorgen tar bara med avsnitt publicerade efter det. Äldre avsnitt
+                    ligger kvar i listan.
+                  </p>
                 </div>
                 <div className="unsubscribe">
                   {confirmUnsubscribe ? (
