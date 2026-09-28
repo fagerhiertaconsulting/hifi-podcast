@@ -81,7 +81,7 @@ export function TranscriptPane(props: {
     if (job?.state === "error") {
       return `Senaste Whisper-försöket misslyckades: ${job.error_msg ?? "okänt fel"}`;
     }
-    return "Inget transkript ännu. Ladda ner avsnittet och tryck Transkribera.";
+    return "Inget transkript ännu. Transkribering köas när nedladdningen är klar. Knappen Transkribera finns kvar.";
   })();
 
   function adLabel(ad: AdSegment) {
@@ -195,9 +195,10 @@ export function TranscriptPane(props: {
         <>
           <h3>Reklam</h3>
           <p className="empty">
-            Tystnad runt 15, 30 eller 60 sekunder nära start, mitten eller slutet
-            markeras som reklam. Originalfilen behålls. Klippet är en ny fil för
-            privat bruk och kodas inte om.
+            Fraslistan i transkriptet och tystnad runt 15, 30 eller 60 sekunder
+            nära start, mitten eller slutet blir avsnitt som Hoppa reklam hoppar
+            över. Inte reklam hoppas inte över. Originalfilen behålls. Klippet
+            är en ny fil för privat bruk och kodas inte om.
           </p>
           <div className="ad-actions">
             <button

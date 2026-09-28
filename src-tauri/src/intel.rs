@@ -143,55 +143,135 @@ fn json_seconds(v: Option<&serde_json::Value>) -> i64 {
     }
 }
 
+/// Chapters follow pauses in the transcript, not a six-minute clock.
+/// The title is a sentence from that stretch, in the language that was spoken.
 pub fn generate_chapters(segments: &[Segment]) -> Vec<ChapterDraft> {
     if segments.is_empty() {
         return Vec::new();
     }
     let mut chapters = Vec::new();
-    let mut start = segments[0].start_ms;
-    let mut title = title_from(&segments[0].text);
-    let mut last_end = segments[0].end_ms;
-    let mut acc = 0_i64;
-    for pair in segments.windows(2) {
-        let a = &pair[0];
-        let b = &pair[1];
-        let gap = (b.start_ms - a.end_ms).max(0);
-        acc += (a.end_ms - a.start_ms).max(0);
-        if gap >= 2500 || acc >= 6 * 60 * 1000 {
-            chapters.push(ChapterDraft {
-                start_ms: start,
-                end_ms: Some(a.end_ms),
-                title,
-                source: "generated".into(),
-            });
-            start = b.start_ms;
-            title = title_from(&b.text);
-            acc = 0;
+    let mut group: Vec<&Segment> = Vec::new();
+    for (i, seg) in segments.iter().enumerate() {
+        if i > 0 {
+            let prev = &segments[i - 1];
+            let gap = (seg.start_ms - prev.end_ms).max(0);
+            if gap >= 2500 && !group.is_empty() {
+                chapters.push(draft_from_group(&group));
+                group.clear();
+            }
         }
-        last_end = b.end_ms;
+        group.push(seg);
     }
-    chapters.push(ChapterDraft {
-        start_ms: start,
-        end_ms: Some(last_end),
-        title,
-        source: "generated".into(),
-    });
+    if !group.is_empty() {
+        chapters.push(draft_from_group(&group));
+    }
     chapters
 }
 
-fn title_from(text: &str) -> String {
-    let t = text.trim();
-    if t.chars().count() <= 48 {
-        return t.to_string();
+fn draft_from_group(group: &[&Segment]) -> ChapterDraft {
+    let start = group[0].start_ms;
+    let end = group.iter().map(|s| s.end_ms).max().unwrap_or(start);
+    ChapterDraft {
+        start_ms: start,
+        end_ms: Some(end.max(start)),
+        title: chapter_title(group),
+        source: "generated".into(),
     }
-    let mut out = String::new();
-    for (i, ch) in t.chars().enumerate() {
-        if i >= 45 {
-            out.push('…');
+}
+
+fn chapter_title(group: &[&Segment]) -> String {
+    let spoken: Vec<&str> = group
+        .iter()
+        .map(|s| s.text.trim())
+        .filter(|t| !t.is_empty())
+        .filter(|t| !segment_is_ad_phrase(t))
+        .collect();
+    let source = if spoken.is_empty() {
+        group
+            .iter()
+            .map(|s| s.text.trim())
+            .filter(|t| !t.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ")
+    } else {
+        spoken.join(" ")
+    };
+    let title = topic_title(&source);
+    if title.is_empty() {
+        "Innehåll".into()
+    } else {
+        title
+    }
+}
+
+fn segment_is_ad_phrase(text: &str) -> bool {
+    let hay = text.to_lowercase();
+    AD_PHRASES.iter().any(|p| hay.contains(p))
+}
+
+fn topic_title(text: &str) -> String {
+    let mut rest = text.trim().to_string();
+    let mut last = String::new();
+    while !rest.is_empty() {
+        let (sentence, next) = split_first_sentence(&rest);
+        let words = strip_controls(
+            sentence
+                .trim()
+                .trim_end_matches(['.', '!', '?', '。', '！', '？'])
+                .trim(),
+        );
+        let take = words.chars().count() >= 12 && !is_placeholder_title(&words);
+        let done = next.trim().is_empty();
+        last = words;
+        if take {
+            return clip_title(&last, 80);
+        }
+        if done {
             break;
         }
-        out.push(ch);
+        rest = next.to_string();
     }
+    if last.is_empty() || is_placeholder_title(&last) {
+        String::new()
+    } else {
+        clip_title(&last, 80)
+    }
+}
+
+fn split_first_sentence(text: &str) -> (&str, &str) {
+    let mut i = 0;
+    while i < text.len() {
+        let ch = text[i..].chars().next().unwrap_or('\0');
+        let len = ch.len_utf8();
+        if matches!(ch, '.' | '!' | '?' | '。' | '！' | '？') {
+            let end = i + len;
+            return (text[..end].trim(), text[end..].trim());
+        }
+        i += len;
+    }
+    (text.trim(), "")
+}
+
+fn is_placeholder_title(title: &str) -> bool {
+    let t = title
+        .trim()
+        .trim_end_matches(['.', '!', '?'])
+        .trim()
+        .to_lowercase();
+    t.is_empty() || t == "kapitel" || t.starts_with("kapitel ") || t.starts_with("chapter ")
+}
+
+fn strip_controls(text: &str) -> String {
+    text.chars().filter(|c| !c.is_control()).collect()
+}
+
+fn clip_title(text: &str, max_chars: usize) -> String {
+    let t = text.trim();
+    if t.chars().count() <= max_chars {
+        return t.to_string();
+    }
+    let mut out: String = t.chars().take(max_chars.saturating_sub(1)).collect();
+    out.push('…');
     out
 }
 
@@ -395,6 +475,44 @@ pub fn dedupe_ad_drafts(mut ads: Vec<AdDraft>) -> Vec<AdDraft> {
     out
 }
 
+/// A span Hoppa reklam may seek across. `user_label` is `ad`, `not_ad`, or `unset`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkipAd {
+    pub start_ms: i64,
+    pub end_ms: i64,
+    pub enabled: bool,
+    pub user_label: String,
+}
+
+impl SkipAd {
+    pub fn from_draft(ad: &AdDraft) -> Self {
+        Self {
+            start_ms: ad.start_ms,
+            end_ms: ad.end_ms,
+            enabled: true,
+            user_label: "unset".into(),
+        }
+    }
+}
+
+/// Seek target for Hoppa reklam. The spans are the stored ad segments
+/// (transcript phrases and silence blocks). A `not_ad` label is never skipped,
+/// even when `enabled` is still true. The last 200 ms is left alone so the
+/// seek does not fire again at the boundary.
+pub fn skip_ads_seek_ms(position_ms: i64, ads: &[SkipAd]) -> Option<i64> {
+    const TAIL_MS: i64 = 200;
+    for ad in ads {
+        if !ad.enabled || ad.user_label == "not_ad" || ad.end_ms <= ad.start_ms {
+            continue;
+        }
+        let until = ad.end_ms.saturating_sub(TAIL_MS);
+        if position_ms >= ad.start_ms && position_ms < until {
+            return Some(ad.end_ms);
+        }
+    }
+    None
+}
+
 pub fn detect_ads(segments: &[Segment]) -> Vec<AdDraft> {
     let mut ads = Vec::new();
     for (i, seg) in segments.iter().enumerate() {
@@ -521,5 +639,99 @@ mod tests {
         let segs = parse_whisper_json(json).unwrap();
         assert_eq!(segs[0].start_ms, 1500);
         assert_eq!(segs[0].text, "hej");
+    }
+
+    #[test]
+    fn transcript_ad_segments_are_what_skip_ads_seeks() {
+        let segments = vec![
+            Segment {
+                start_ms: 0,
+                end_ms: 4_000,
+                text: "Välkommen tillbaka till samtalet.".into(),
+            },
+            Segment {
+                start_ms: 10_000,
+                end_ms: 22_000,
+                text: "This podcast is sponsored by Acme tools.".into(),
+            },
+            Segment {
+                start_ms: 23_000,
+                end_ms: 30_000,
+                text: "Nu återvänder vi till förstärkaren.".into(),
+            },
+        ];
+        let drafts = detect_ads(&segments);
+        let phrase = drafts
+            .iter()
+            .find(|ad| ad.method == "phrase")
+            .expect("transcript phrase");
+        assert_eq!(phrase.start_ms, 10_000);
+        assert_eq!(phrase.end_ms, 22_000);
+        let ads: Vec<_> = drafts.iter().map(SkipAd::from_draft).collect();
+        let seek = skip_ads_seek_ms(12_000, &ads);
+        assert_eq!(seek, Some(phrase.end_ms));
+        assert_ne!(seek, Some(segments[2].start_ms));
+        assert_eq!(skip_ads_seek_ms(1_000, &ads), None);
+        assert_eq!(skip_ads_seek_ms(24_000, &ads), None);
+    }
+
+    #[test]
+    fn not_ad_label_is_not_skipped() {
+        let mut ad = SkipAd::from_draft(&AdDraft {
+            start_ms: 10_000,
+            end_ms: 22_000,
+            confidence: 0.82,
+            method: "phrase".into(),
+        });
+        ad.user_label = "not_ad".into();
+        ad.enabled = true;
+        assert_eq!(skip_ads_seek_ms(12_000, &[ad.clone()]), None);
+
+        ad.enabled = false;
+        assert_eq!(skip_ads_seek_ms(12_000, &[ad]), None);
+
+        let kept = SkipAd {
+            start_ms: 10_000,
+            end_ms: 22_000,
+            enabled: true,
+            user_label: "unset".into(),
+        };
+        assert_eq!(skip_ads_seek_ms(12_000, &[kept]), Some(22_000));
+    }
+
+    #[test]
+    fn chapter_titles_follow_transcript_not_six_minute_blocks() {
+        let mut segments = vec![Segment {
+            start_ms: 0,
+            end_ms: 4_000,
+            text: "Idag pratar vi om vakuumrör i förstärkare.".into(),
+        }];
+        let mut t = 5_000i64;
+        while t < 8 * 60 * 1000 {
+            segments.push(Segment {
+                start_ms: t,
+                end_ms: t + 4_000,
+                text: "Vi fortsätter med samma förstärkare.".into(),
+            });
+            t += 5_000;
+        }
+        segments.push(Segment {
+            start_ms: t + 3_000,
+            end_ms: t + 8_000,
+            text: "Sedan byter vi till högtalarkablar och kontaktmotstånd.".into(),
+        });
+        assert!(segments.last().unwrap().end_ms > 6 * 60 * 1000);
+        let chapters = generate_chapters(&segments);
+        assert_eq!(chapters.len(), 2, "{chapters:?}");
+        assert!(
+            chapters[0].end_ms.unwrap() > 6 * 60 * 1000,
+            "a pause, not six minutes, ends the chapter: {chapters:?}"
+        );
+        assert!(chapters[0].title.to_lowercase().contains("vakuumrör"));
+        assert!(chapters[1].title.to_lowercase().contains("högtalarkablar"));
+        assert!(chapters
+            .iter()
+            .all(|c| !c.title.to_lowercase().starts_with("kapitel")));
+        assert!(chapters.iter().all(|c| c.source == "generated"));
     }
 }

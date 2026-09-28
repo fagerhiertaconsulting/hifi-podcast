@@ -286,9 +286,7 @@ async fn download_episode_inner(state: &AppState, episode_id: i64) -> AppResult<
                 Some(&mime),
             )?;
             db::set_episode_status(&conn, episode_id, "downloaded")?;
-            if db::podcast_wants_transcribe(&conn, podcast_id).unwrap_or(false) {
-                let _ = db::enqueue_job(&conn, "transcribe", episode_id, 10);
-            }
+            let _ = db::queue_transcription_after_download(&conn, episode_id);
         }
         Err(err) => {
             db::upsert_download_state(

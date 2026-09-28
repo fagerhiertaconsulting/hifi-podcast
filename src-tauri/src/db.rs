@@ -1325,6 +1325,20 @@ fn reindex_queue(conn: &Connection) -> AppResult<()> {
     Ok(())
 }
 
+/// Queues local Whisper when a download is `done`. The Transkribera button
+/// can still enqueue the same job. The old auto_transcribe flag is not required.
+pub fn queue_transcription_after_download(conn: &Connection, episode_id: i64) -> AppResult<i64> {
+    let download = get_download(conn, episode_id)?
+        .ok_or_else(|| crate::error::AppError::msg("Avsnittet är inte nedladdat."))?;
+    if download.state != "done" {
+        return Err(crate::error::AppError::msg(format!(
+            "Avsnittet är inte färdignedladdat (status: {}).",
+            download.state
+        )));
+    }
+    enqueue_job(conn, "transcribe", episode_id, 10)
+}
+
 pub fn enqueue_job(
     conn: &Connection,
     job_type: &str,
@@ -1538,17 +1552,45 @@ pub fn replace_generated_chapters(
     episode_id: i64,
     chapters: &[crate::intel::ChapterDraft],
 ) -> AppResult<()> {
+    let preserved: Vec<(i64, Option<i64>)> = {
+        let mut stmt = conn.prepare(
+            "SELECT start_ms, end_ms FROM chapter WHERE episode_id = ?1 AND source = 'user'",
+        )?;
+        let rows = stmt.query_map(params![episode_id], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
     conn.execute(
         "DELETE FROM chapter WHERE episode_id = ?1 AND source IN ('generated','embedded')",
         params![episode_id],
     )?;
     for ch in chapters {
+        if ch.title.trim().is_empty() {
+            continue;
+        }
+        if preserved
+            .iter()
+            .any(|(start, end)| user_keeps_chapter(*start, *end, ch.start_ms))
+        {
+            continue;
+        }
         conn.execute(
             "INSERT INTO chapter (episode_id, start_ms, end_ms, title, source) VALUES (?1, ?2, ?3, ?4, ?5)",
             params![episode_id, ch.start_ms, ch.end_ms, ch.title, ch.source],
         )?;
     }
     Ok(())
+}
+
+/// A user-edited chapter keeps its span. A new generated title at the same
+/// start is not written over it.
+fn user_keeps_chapter(user_start: i64, user_end: Option<i64>, draft_start: i64) -> bool {
+    if (user_start - draft_start).abs() < 1_500 {
+        return true;
+    }
+    match user_end {
+        Some(end) if draft_start >= user_start && draft_start < end => true,
+        _ => false,
+    }
 }
 
 pub fn list_chapters(conn: &Connection, episode_id: i64) -> AppResult<Vec<Chapter>> {
@@ -2398,39 +2440,11 @@ mod tests {
             Some("sv"),
         )
         .unwrap();
-        let older = upsert_episode(
-            &conn,
-            pid,
-            "guid-older",
-            "Äldre",
-            None,
-            None,
-            None,
-            None,
-        )
-        .unwrap();
-        let newer = upsert_episode(
-            &conn,
-            pid,
-            "guid-newer",
-            "Nyare",
-            None,
-            None,
-            None,
-            None,
-        )
-        .unwrap();
-        let done = upsert_episode(
-            &conn,
-            pid,
-            "guid-done",
-            "Klar",
-            None,
-            None,
-            None,
-            None,
-        )
-        .unwrap();
+        let older =
+            upsert_episode(&conn, pid, "guid-older", "Äldre", None, None, None, None).unwrap();
+        let newer =
+            upsert_episode(&conn, pid, "guid-newer", "Nyare", None, None, None, None).unwrap();
+        let done = upsert_episode(&conn, pid, "guid-done", "Klar", None, None, None, None).unwrap();
         save_playback(
             &conn,
             &PlaybackState {
@@ -4129,6 +4143,174 @@ mod tests {
             .any(|c| c.title == "Ny rubrik" && c.source == "user"));
         assert!(update_chapter_title(&conn, id, "   ").is_err());
         assert!(update_chapter_title(&conn, id, "rad\nbryt").is_err());
+    }
+
+    #[test]
+    fn finished_download_enqueues_transcription_without_a_click() {
+        let conn = open_db();
+        let (pid, eid) = add_show(&conn, "https://whisper.example/feed.xml", "Whisper");
+        assert!(!get_podcast(&conn, pid).unwrap().auto_transcribe);
+        upsert_download_state(
+            &conn,
+            eid,
+            "downloading",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(queue_transcription_after_download(&conn, eid).is_err());
+        assert!(list_jobs(&conn, 10).unwrap().is_empty());
+
+        upsert_download_state(
+            &conn,
+            eid,
+            "done",
+            Some("episode.mp3"),
+            Some(1_000),
+            None,
+            None,
+            Some("t"),
+            Some("audio/mpeg"),
+        )
+        .unwrap();
+        set_episode_status(&conn, eid, "downloaded").unwrap();
+        let job_id = queue_transcription_after_download(&conn, eid).unwrap();
+        assert!(job_id > 0);
+        let jobs = list_jobs(&conn, 10).unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].job_type, "transcribe");
+        assert_eq!(jobs[0].episode_id, eid);
+        assert_eq!(jobs[0].state, "queued");
+        assert!(!get_podcast(&conn, pid).unwrap().auto_transcribe);
+
+        assert!(claim_next_job(&conn, true).unwrap().is_none());
+        assert_eq!(list_jobs(&conn, 10).unwrap()[0].state, "queued");
+        let claimed = claim_next_job(&conn, false).unwrap().unwrap();
+        assert_eq!(claimed.0, job_id);
+        assert_eq!(claimed.1, "transcribe");
+        assert_eq!(claimed.2, eid);
+    }
+
+    #[test]
+    fn generated_chapter_titles_come_from_transcript_and_user_title_is_kept() {
+        let conn = open_db();
+        let (_pid, eid) = add_show(&conn, "https://kapitel.example/feed.xml", "Rubriker");
+        let segments = vec![
+            crate::intel::Segment {
+                start_ms: 0,
+                end_ms: 5_000,
+                text: "Idag pratar vi om vakuumrör i förstärkare.".into(),
+            },
+            crate::intel::Segment {
+                start_ms: 12_000,
+                end_ms: 18_000,
+                text: "Sedan byter vi till högtalarkablar och kontaktmotstånd.".into(),
+            },
+        ];
+        let drafts = crate::intel::generate_chapters(&segments);
+        assert!(drafts[0].title.to_lowercase().contains("vakuumrör"));
+        assert!(drafts
+            .iter()
+            .all(|c| !c.title.to_lowercase().starts_with("kapitel")));
+        replace_generated_chapters(&conn, eid, &drafts).unwrap();
+        let first = list_chapters(&conn, eid)
+            .unwrap()
+            .into_iter()
+            .find(|c| c.start_ms == 0)
+            .unwrap();
+        let edited = update_chapter_title(&conn, first.id, "Min rubrik om rör").unwrap();
+        assert_eq!(edited.source, "user");
+
+        let again = crate::intel::generate_chapters(&[
+            crate::intel::Segment {
+                start_ms: 0,
+                end_ms: 5_000,
+                text: "Nu handlar det om nätdelar och transformatorer.".into(),
+            },
+            crate::intel::Segment {
+                start_ms: 12_000,
+                end_ms: 18_000,
+                text: "Sedan byter vi till högtalarkablar och kontaktmotstånd.".into(),
+            },
+        ]);
+        assert!(again[0].title.to_lowercase().contains("nätdelar"));
+        replace_generated_chapters(&conn, eid, &again).unwrap();
+        let chapters = list_chapters(&conn, eid).unwrap();
+        let kept = chapters.iter().find(|c| c.id == edited.id).unwrap();
+        assert_eq!(kept.title, "Min rubrik om rör");
+        assert_eq!(kept.source, "user");
+        assert!(!chapters
+            .iter()
+            .any(|c| c.title.to_lowercase().contains("nätdelar")));
+        assert!(chapters
+            .iter()
+            .any(|c| c.title.to_lowercase().contains("högtalarkablar")));
+    }
+
+    #[test]
+    fn stored_transcript_ads_are_seeked_unless_marked_not_ad() {
+        let conn = open_db();
+        let (_pid, eid) = add_show(&conn, "https://skip.example/feed.xml", "Hoppa");
+        let segments = vec![
+            crate::intel::Segment {
+                start_ms: 0,
+                end_ms: 4_000,
+                text: "Välkommen tillbaka till samtalet.".into(),
+            },
+            crate::intel::Segment {
+                start_ms: 10_000,
+                end_ms: 22_000,
+                text: "This podcast is sponsored by Acme tools.".into(),
+            },
+            crate::intel::Segment {
+                start_ms: 23_000,
+                end_ms: 30_000,
+                text: "Nu återvänder vi till förstärkaren.".into(),
+            },
+        ];
+        let drafts = crate::intel::detect_ads(&segments);
+        replace_ads(&conn, eid, &drafts).unwrap();
+        let ads = list_ads(&conn, eid).unwrap();
+        let phrase = ads
+            .iter()
+            .find(|ad| ad.method == "phrase" && ad.start_ms == 10_000)
+            .expect("transcript phrase");
+        let skip = ads
+            .iter()
+            .map(|ad| crate::intel::SkipAd {
+                start_ms: ad.start_ms,
+                end_ms: ad.end_ms,
+                enabled: ad.enabled,
+                user_label: ad.user_label.clone(),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            crate::intel::skip_ads_seek_ms(12_000, &skip),
+            Some(phrase.end_ms)
+        );
+        assert_eq!(phrase.user_label, "unset");
+
+        set_ad_feedback(&conn, eid, Some(phrase.id), 0, "not_ad", None).unwrap();
+        let ads = list_ads(&conn, eid).unwrap();
+        let phrase = ads
+            .iter()
+            .find(|ad| ad.method == "phrase" && ad.start_ms == 10_000)
+            .unwrap();
+        assert_eq!(phrase.user_label, "not_ad");
+        let skip = ads
+            .iter()
+            .map(|ad| crate::intel::SkipAd {
+                start_ms: ad.start_ms,
+                end_ms: ad.end_ms,
+                enabled: ad.enabled,
+                user_label: ad.user_label.clone(),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(crate::intel::skip_ads_seek_ms(12_000, &skip), None);
     }
 
     #[test]
