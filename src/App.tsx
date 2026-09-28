@@ -45,6 +45,11 @@ import type {
 
 const SPEEDS = [0.8, 1, 1.2, 1.5, 1.75, 2, 2.5, 3];
 
+/** Same rule as `intel::skip_ads_seek_ms`: enabled spans, never `not_ad`. */
+function adsToSkip(ads: AdSegment[]): AdSegment[] {
+  return ads.filter((ad) => ad.enabled && ad.user_label !== "not_ad");
+}
+
 function formatTime(seconds: number) {
   if (!Number.isFinite(seconds) || seconds < 0) return "0:00";
   const s = Math.floor(seconds % 60)
@@ -388,7 +393,7 @@ export default function App() {
         const nextSpeed = next.playback?.speed || next.podcast.speed || 1;
         setSpeed(nextSpeed);
         setPayload(next);
-        adsRef.current = next.podcast.skip_ads ? next.ads.filter((a) => a.enabled) : [];
+        adsRef.current = next.podcast.skip_ads ? adsToSkip(next.ads) : [];
         void api.smtcNowPlaying(next.episode.title, next.podcast.title, true);
         const useSkip = globalSkipSilence || next.podcast.skip_silence;
         skipModeRef.current = useSkip;
@@ -1296,7 +1301,7 @@ export default function App() {
         onNotice={setStatus}
         onAdsChanged={(next) => {
           if (payloadRef.current?.podcast.skip_ads) {
-            adsRef.current = next.filter((ad) => ad.enabled);
+            adsRef.current = adsToSkip(next);
           }
         }}
       />
@@ -1912,16 +1917,11 @@ function Library(props: {
                   />
                   Hoppa reklam (heuristik)
                 </label>
-                <label className="check">
-                  <input
-                    type="checkbox"
-                    checked={selected.auto_transcribe}
-                    onChange={(e) =>
-                      props.onPatchSelected({ auto_transcribe: e.target.checked })
-                    }
-                  />
-                  Auto-transkribera (av som standard; kräver whisper-cli + modell)
-                </label>
+                <p className="auto-download-note">
+                  Transkribering med ggml-small köas automatiskt när nedladdningen
+                  är klar. Knappen Transkribera finns kvar. Jobbet pausas medan
+                  ljud spelas och fortsätter när uppspelningen stannar.
+                </p>
                 <label>
                   ASR-språk
                   <select
